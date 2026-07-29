@@ -1,0 +1,41 @@
+when:
+  - event: [push, manual, tag]
+    branch: master
+
+steps:
+# ========================================== TEST ==============================================================
+- name: Test
+  image: harbor.app.com/devops-infra/generic-python312:1.0.0
+  environment:
+    CERT_CONTENT:
+      from_secret: cert_path
+    REQUESTS_CA_BUNDLE: /etc/ssl/ca.cert
+    UV_INDEX_PYPI_LOCAL_USERNAME:
+      from_secret: artifactory_user
+    UV_INDEX_PYPI_LOCAL_PASSWORD:
+      from_secret: artifactory_token
+  commands:
+  - echo "$CERT_CONTENT" > /etc/ssl/ca.cert
+  - pip install --upgrade uv
+  # NOTE: this fails until uv.lock is regenerated without the [tool.uv.sources] entry
+  # pointing at ../apis-library — that path is local-dev only and does not exist here.
+  # See the "Package index" section of the README.
+  - uv sync --frozen --group dev
+  - uv run pytest -v
+  depends_on: []
+
+# ========================================== BUILD & PUSH ==============================================================
+- name: Build image and push
+  image: artifactory.app.com/woodpecker/plugins/kaniko:latest
+  settings:
+    registry: artifactory.app.com
+    username: svc_dev_admin
+    password:
+      from_secret: artifactory_token
+    repo: docker-dev-local/vault-api
+    tags: ${CI_COMMIT_TAG}
+    build_args:
+      APP_VERSION: ${CI_COMMIT_TAG}
+  depends_on: [Test]
+  when:
+    event: tag

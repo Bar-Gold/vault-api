@@ -1,0 +1,19 @@
+system-certs = true
+
+# The pinned dev tools (pytest==7.4.3, …) are only on the secondary `pypi` index,
+# not the default `pypi-local`. Both are the same trusted Artifactory, so let uv pick
+# the best match across indexes instead of only considering the first.
+index-strategy = "unsafe-best-match"
+
+[[index]]
+name = "pypi-local"
+url = "https://user:token@artifactory.app.iaf/artifactory/api/pypi/pypi-local/simple"
+default = true
+
+[[index]]
+name = "pypi"
+url = "https://user:token@artifactory.app.iaf/artifactory/api/pypi/pypi/simple"
+
+[pip]
+index-url = "https://user:token@artifactory.app.iaf/artifactory/api/pypi/pypi-local/simple"
+extra-index-url = ["https://user:token@artifactory.app.iaf/artifactory/api/pypi/pypi/simple"]

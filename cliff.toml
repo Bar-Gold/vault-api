@@ -1,0 +1,60 @@
+# git-cliff configuration — Keep a Changelog output from Conventional Commits.
+# Used by the GitHub Actions release workflows (and runnable locally via `uvx git-cliff`).
+
+[changelog]
+# Keep a Changelog header.
+header = """
+# Changelog
+
+All notable changes to this project are documented here. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). The version is derived from git tags by
+setuptools-scm.
+
+"""
+# One version block per release. `version`/`previous` are set by --bump / --tag.
+body = """
+{% if version %}\
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | split(pat=">") | last | trim }}
+
+{% for commit in commits %}\
+- {{ commit.message | upper_first | trim }}
+{% endfor %}\
+{% endfor %}"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+# Group conventional commit types into Keep a Changelog sections (order = `<n>` prefix).
+commit_parsers = [
+  { message = "^feat", group = "<1>Added" },
+  { message = "^fix", group = "<2>Fixed" },
+  { message = "^refactor", group = "<3>Changed" },
+  { message = "^perf", group = "<3>Changed" },
+  { message = "^docs", group = "<4>Documentation" },
+  { message = "^revert", group = "<5>Reverted" },
+  # `build` can change dependencies/packaging (ships), so it stays a releasing type;
+  # `ci` only touches CI config (never shipped), so it's shown but doesn't release --
+  # the release-pr gate excludes it, same as `docs`.
+  { message = "^build", group = "<6>Build" },
+  { message = "^ci", group = "<7>CI" },
+  # Housekeeping that shouldn't appear in user-facing release notes.
+  { message = "^(chore|style|test)", skip = true },
+  { body = ".*security", group = "<0>Security" },
+]
+protect_breaking_commits = true
+tag_pattern = "v[0-9]*"
+sort_commits = "oldest"
+
+[bump]
+# No tags exist yet — start the project at v0.0.0 (first auto-release is v0.0.0;
+# subsequent merges bump from there, e.g. a feat -> v0.1.0).
+initial_tag = "v0.0.0"
+features_always_bump_minor = true
+breaking_always_bump_major = true
