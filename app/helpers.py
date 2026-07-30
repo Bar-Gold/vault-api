@@ -1,35 +1,18 @@
-"""Pure helpers for the Vault GitOps flow.
+"""Pure helpers for the GitOps flow.
 
-Everything here is side-effect free: given a request payload it produces the mount path,
-the policy names/HCL, the values-file path and the YAML body that gets committed. Keeping
-it pure means the naming convention and the rendered artefact are unit-testable without
-touching Bitbucket, Woodpecker or Vault.
+Everything here is side-effect free: given a request it produces the committed file's path,
+body and any edit applied to it. Keeping it pure means the artefact this service writes is
+unit-testable without touching Bitbucket or Woodpecker.
+
+Note what is *not* here: nothing models a Vault mount, an engine version or a policy. This
+service writes a file and watches the pipelines; what the file means is the deploy
+pipeline's business.
 """
 
 import copy
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
-
-
-def build_mount_path(app_name: str) -> str:
-    """The KV mount path in Vault — whatever the caller asked for, verbatim.
-
-    Callers name their own mounts, so there is no derived ``{team}/{environment}/{app}``
-    prefix. Two consequences worth knowing:
-
-    * **Nothing namespaces mounts for you.** Include the team and/or environment in the
-      name yourself if you want them separated — ``payments/prod/secrets`` is a name like
-      any other, it is just not imposed.
-    * **The environment is not part of the path.** The values *file* is still per
-      environment (``kv/prod/x.yaml`` vs ``kv/dev/x.yaml``), so the same name in two
-      environments produces two files pointing at one Vault mount. Encode the environment
-      in the name if the mounts should be distinct.
-
-    The slug pattern on `app_name` guarantees this is a safe relative path: no leading or
-    trailing slash, no empty segments, no ``..``.
-    """
-    return app_name.strip("/")
 
 
 def slugify_mount_path(mount_path: str) -> str:
@@ -41,112 +24,28 @@ def slugify_mount_path(mount_path: str) -> str:
     return mount_path.strip("/").replace("/", "-")
 
 
-def build_policy_name(mount_path: str, capability: str) -> str:
-    """Vault policy name, e.g. ``payments-vault-secrets-read``."""
-    return f"{slugify_mount_path(mount_path)}-{capability}"
+def build_branch_name(kv_name: str, suffix: str, prefix: str) -> str:
+    """Short-lived branch the file is committed to before the PR is opened.
 
-
-def build_branch_name(environment: str, app_name: str, suffix: str, prefix: str) -> str:
-    """Short-lived branch the values file is committed to before the PR is opened.
-
-    The name is flattened: a slash in `app_name` would nest the ref, and git cannot hold
-    both ``vault-kv/prod-payments`` and ``vault-kv/prod-payments/secrets-abc``.
+    The name is flattened: a slash in `kv_name` would nest the ref, and git cannot hold
+    both ``vault-kv/payments`` and ``vault-kv/payments/secrets-abc``.
     """
-    return f"{prefix}/{environment}-{slugify_mount_path(app_name)}-{suffix}"
+    return f"{prefix}/{slugify_mount_path(kv_name)}-{suffix}"
 
 
-def values_file_path(values_dir: str, environment: str, app_name: str) -> str:
-    """Repo-relative path of the values file, e.g. ``kv/prod/myapp.yaml``."""
-    return f"{values_dir.strip('/')}/{environment}/{app_name}.yaml"
+def values_file_path(values_dir: str, kv_name: str) -> str:
+    """Repo-relative path of the committed file, e.g. ``kv/myapp.yaml``."""
+    return f"{values_dir.strip('/')}/{kv_name.strip('/')}.yaml"
 
 
-def _kv_paths(mount_path: str, kv_version: int) -> Tuple[str, str]:
-    """The (data, metadata) policy path globs for a KV mount.
+def build_kv_values(kv_name: str, kv_description: str) -> Dict[str, Any]:
+    """The committed document: the name and what it is for.
 
-    KV v2 splits the API surface into ``<mount>/data/*`` and ``<mount>/metadata/*``;
-    KV v1 has a single flat ``<mount>/*``.
+    This is the contract with the deploy pipeline. Everything the KV means in Vault - the
+    mount, the engine version, the policies - is the pipeline's business, not this
+    service's, so none of it is written here. Change this dict and the pipeline together.
     """
-    if kv_version == 2:
-        return f"{mount_path}/data/*", f"{mount_path}/metadata/*"
-    return f"{mount_path}/*", ""
-
-
-def _policy_stanza(path: str, capabilities: List[str]) -> str:
-    caps = ", ".join(f'"{c}"' for c in capabilities)
-    return f'path "{path}" {{\n  capabilities = [{caps}]\n}}\n'
-
-
-def render_read_policy(mount_path: str, kv_version: int) -> str:
-    """HCL granting read-only access to the mount."""
-    data_path, metadata_path = _kv_paths(mount_path, kv_version)
-    policy = _policy_stanza(data_path, ["read", "list"])
-    if metadata_path:
-        policy += "\n" + _policy_stanza(metadata_path, ["read", "list"])
-    return policy
-
-
-def render_write_policy(mount_path: str, kv_version: int) -> str:
-    """HCL granting full read/write access to the mount (including soft-delete)."""
-    data_path, metadata_path = _kv_paths(mount_path, kv_version)
-    policy = _policy_stanza(data_path, ["create", "read", "update", "delete", "list"])
-    if metadata_path:
-        policy += "\n" + _policy_stanza(metadata_path, ["read", "list", "delete"])
-    return policy
-
-
-def build_values_data(
-    payload,
-    team: str,
-    environment: str,
-) -> Tuple[str, Dict[str, Any]]:
-    """Turn a validated request into ``(mount_path, values_dict)``.
-
-    The dict is the contract with the downstream pipeline — the deploy pipeline reads this
-    file and applies the mount and the two policies to Vault. Change it in lockstep with
-    the pipeline.
-    """
-    spec = payload.spec
-    mount_path = build_mount_path(spec.app_name)
-    kv_version = int(spec.kv_version)
-
-    mount: Dict[str, Any] = {
-        "path": mount_path,
-        "type": "kv",
-        "options": {"version": str(kv_version)},
-        "description": spec.description or f"KV store for {spec.app_name} ({environment})",
-    }
-
-    # KV v2 is the only version with versioned-secret tuning knobs.
-    if kv_version == 2:
-        config: Dict[str, Any] = {"max_versions": spec.max_versions}
-        if spec.delete_version_after:
-            config["delete_version_after"] = spec.delete_version_after
-        mount["config"] = config
-
-    policies = [
-        {
-            "name": build_policy_name(mount_path, "read"),
-            "rules": render_read_policy(mount_path, kv_version),
-            "entities": list(spec.readers),
-        },
-        {
-            "name": build_policy_name(mount_path, "write"),
-            "rules": render_write_policy(mount_path, kv_version),
-            "entities": list(spec.writers),
-        },
-    ]
-
-    values = {
-        "mount": mount,
-        "policies": policies,
-        "metadata": {
-            "app": spec.app_name,
-            "team": team,
-            "environment": environment,
-            "owner": spec.owner,
-        },
-    }
-    return mount_path, values
+    return {"kvname": kv_name, "description": kv_description}
 
 
 class _BlockStyleDumper(yaml.SafeDumper):
@@ -200,34 +99,33 @@ def yaml_data_equals(yaml_data_1, yaml_data_2) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# edits to an existing values file
+# edits to an existing file
 #
-# All of these take the parsed values dict and return a *new* one, leaving the input
-# alone so the caller can compare the two with `yaml_data_equals` and skip a no-op
-# commit. None of them touch the mount path or the policy names: renaming a Vault mount
-# is a data migration, not an edit.
+# All of these take the parsed document and return a *new* one, leaving the input alone so
+# the caller can compare the two with `yaml_data_equals` and skip a no-op commit. None of
+# them touch `kvname`: renaming means migrating the secrets in Vault, not editing a field.
 # --------------------------------------------------------------------------- #
 class ValuesEditError(ValueError):
-    """The requested edit does not apply to this values file."""
+    """The requested edit does not apply to this file."""
 
 
-def update_mount_metadata(
+def update_kv_metadata(
     values: Dict[str, Any],
     description: Optional[str] = None,
     owner: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Replace the mount description and/or the recorded owner."""
+    """Replace the description and/or the recorded owner."""
     updated = copy.deepcopy(values)
     if description is not None:
-        updated.setdefault("mount", {})["description"] = description
+        updated["description"] = description
     if owner is not None:
-        updated.setdefault("metadata", {})["owner"] = owner
+        updated["owner"] = owner
     return updated
 
 
-def build_kubernetes_role_name(mount_path: str) -> str:
+def build_kubernetes_role_name(kv_name: str) -> str:
     """Default Vault Kubernetes auth role name, e.g. ``payments-vault-secrets``."""
-    return slugify_mount_path(mount_path)
+    return slugify_mount_path(kv_name)
 
 
 def find_policy_name(values: Dict[str, Any], capability: str) -> str:

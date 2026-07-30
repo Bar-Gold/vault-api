@@ -1,31 +1,14 @@
 import pytest
 from fastapi.testclient import TestClient
-from tashtiot_apis_library.fastapi_template.config_api import InfraMetadata
 
-from app.v1.vault.schemas import VaultKVCreate, VaultKVCreateSpec
+from app.v1.vault.schemas import VaultKVCreate
 from tests.fakes import FakeBitbucket, FakeWoodpecker, make_pipeline
 
 
 @pytest.fixture
-def metadata():
-    return InfraMetadata(
-        project="payments", network="net", region="kirya", space="net", environment="prod"
-    )
-
-
-@pytest.fixture
-def create_spec():
-    return VaultKVCreateSpec(
-        app_name="myapp",
-        owner="team-dl@example.com",
-        readers=["group/readers"],
-        writers=["group/writers"],
-    )
-
-
-@pytest.fixture
-def payload(metadata, create_spec):
-    return VaultKVCreate(spec=create_spec, metadata=metadata)
+def payload():
+    """The whole create request: a name, and what the KV is for."""
+    return VaultKVCreate(kv_name="myapp", kv_description="payments secrets")
 
 
 @pytest.fixture

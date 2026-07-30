@@ -1,12 +1,16 @@
 # vault-api
 
-A FastAPI service that creates **HashiCorp Vault KV mounts and their policies through GitOps**,
-built on the internal **`tashtiot-apis-library`** and following the patterns in the reference
-`example-api`.
+A FastAPI service that **writes a file to a Bitbucket repo and watches the Woodpecker
+pipelines that act on it**, built on the internal **`tashtiot-apis-library`** and following
+the patterns in the reference `example-api`.
 
-A create request is not a direct write to Vault. It opens a pull request against the Vault
-values repo, waits for CI to validate it, merges it, and waits for the deploy pipeline that
-applies the change — then answers `Successful creation of <mount path>`.
+A create request is not a direct write to Vault. It opens a pull request against the values
+repo, waits for CI to validate it, merges it, and waits for the deploy pipeline that applies
+the change — then answers `Successful creation of <kv name>`.
+
+**The service knows nothing about Vault.** It commits a two-key document and reports what the
+pipelines did with it; mounts, engine versions and policies are the deploy pipeline's
+business.
 
 ---
 
@@ -80,15 +84,15 @@ The index URLs embed a `user:token`, so **`uv.toml` is gitignored** — keep it 
 POST /api/vault/v1/kv/
   │
   ├─ 0. reject if the values file already exists on the base branch        -> 409
-  ├─ 1. create branch  vault-kv/<env>-<app>-<rand>
-  ├─ 2. commit         kv/<env>/<app>.yaml
+  ├─ 1. create branch  vault-kv/<kv-name>-<rand>
+  ├─ 2. commit         kv/<kv-name>.yaml
   ├─ 3. open pull request -> base branch
   ├─ 4. WAIT for the Woodpecker `pull_request` pipeline  ── fails ──> decline PR + delete branch -> 502
   │                                                      ── times out ─> decline PR + delete branch -> 504
   ├─ 5. merge the pull request                           ── fails ──> leave PR open              -> 502
   ├─ 6. WAIT for the Woodpecker `push` pipeline          ── fails ──> report (already merged)    -> 502
   │                                                      ── times out ─> report (already merged) -> 504
-  └─ 200/201 {"status":"Succeeded","message":"Successful creation of kingmagen/prod/myapp", ...}
+  └─ 201 {"status":"Succeeded","message":"Successful creation of myapp", ...}
 ```
 
 **The request blocks for the whole chain.** That is deliberate (the endpoint's contract is the
@@ -105,111 +109,64 @@ final answer, not a job handle), but it has two consequences:
 ```jsonc
 POST /api/vault/v1/kv/
 {
-  "metadata": {                    // the six infra coordinates (InfraOperationRequest)
-    "space": "net", "network": "net", "region": "kirya",
-    "environment": "prod", "project": "payments"
-  },
-  "spec": {
-    "app_name": "myapp",           // ^[a-z0-9]+(-[a-z0-9]+)*$, <=40 chars
-    "owner": "team-dl@example.com",
-    "kv_version": 2,               // 1 or 2, default 2
-    "max_versions": 10,            // KV v2 only
-    "delete_version_after": "720h",// KV v2 only, optional
-    "readers": ["group/app-readers"],
-    "writers": ["group/app-writers"]
-  }
+  "kv_name": "myapp",              // ^[a-z0-9]+(-[a-z0-9]+)*(/...)*$, <=128 chars
+  "kv_description": "payments secrets"
 }
 ```
 
-`spec.app_name` **is** the Vault mount path, used verbatim — nothing is prefixed for you. It
-may be a multi-segment path, so `payments/vault-secrets` is a valid name and produces the
-policies `payments-vault-secrets-read` / `-write` (policy names cannot contain slashes, so
-they are flattened).
+Two fields, and that is the whole request. `kv_name` is used verbatim and may be a
+multi-segment path (`payments/vault-secrets`), which nests the committed file to match. The
+pattern also blocks `..`, so a name can never escape the values directory.
 
-Two things to know:
+### The committed file (`kv/myapp.yaml`)
 
-- **Nothing namespaces mounts for you.** Include the team and/or environment in the name if
-  you want them separated.
-- **The environment is not part of the mount path**, but the values *file* is per environment.
-  The same name in `prod` and `dev` gives two files pointing at one Vault mount — encode the
-  environment in the name if the mounts should be distinct.
-
-Names are lowercase alphanumeric segments separated by dashes, joined by single slashes
-(`^[a-z0-9]+(-[a-z0-9]+)*(/...)*$`, max 128 chars). That also blocks `..`, so a name can never
-escape the values directory.
-
-### The committed values file (`kv/prod/myapp.yaml`)
-
-This is the contract with the deploy pipeline — **change it in lockstep with the pipeline that
-consumes it**:
+This is the contract with the deploy pipeline — **change it in lockstep with the pipeline
+that consumes it**:
 
 ```yaml
-mount:
-  path: kingmagen/prod/myapp
-  type: kv
-  options: {version: '2'}
-  description: KV store for myapp (prod)
-  config: {max_versions: 10}
-policies:
-  - name: kingmagen-prod-myapp-read
-    rules: |
-      path "kingmagen/prod/myapp/data/*" { capabilities = ["read", "list"] }
-      path "kingmagen/prod/myapp/metadata/*" { capabilities = ["read", "list"] }
-    entities: [group/app-readers]
-  - name: kingmagen-prod-myapp-write
-    rules: |
-      ...
-    entities: [group/app-writers]
-metadata: {app: myapp, team: kingmagen, environment: prod, owner: team-dl@example.com}
+kvname: myapp
+description: payments secrets
 ```
 
 ### Other routes
 
 | Route | Purpose |
 |-------|---------|
-| `GET /api/vault/v1/kv/{app_name}?environment=prod` | the committed values file for a mount (404 if absent) |
-| `PATCH /api/vault/v1/kv/{app_name}` | change the mount's `description` and/or `owner` |
-| `POST /api/vault/v1/kv/{app_name}/kubernetes-auth` | bind Kubernetes service accounts to the read or write policy |
-| `POST /api/vault/v1/kv/{app_name}/groups` | grant an AD group the read or write policy |
+| `GET /api/vault/v1/kv/{kv_name}` | the committed file (404 if absent) |
+| `PATCH /api/vault/v1/kv/{kv_name}` | change `description` and/or `owner` |
+| `POST /api/vault/v1/kv/{kv_name}/kubernetes-auth` | bind Kubernetes service accounts to a policy |
+| `POST /api/vault/v1/kv/{kv_name}/groups` | grant an AD group a policy |
 
 The three edit routes run the **same** pull request → CI → merge → CI chain as a create, and
 answer `200`. Two behaviours worth relying on:
 
-- **An edit that changes nothing opens no pull request.** Re-adding a group that is already
-  bound, or an identical Kubernetes role, returns `Succeeded` with
-  `"No changes required for <mount>"` and `pull_request: null`.
-- **`PATCH` cannot rename.** The mount path and policy names are fixed at creation, because
-  renaming a Vault mount means migrating its secrets, not editing a field.
+- **An edit that changes nothing opens no pull request.** Re-applying the same change returns
+  `Succeeded` with `"No changes required for <kv name>"` and `pull_request: null`.
+- **`PATCH` cannot rename.** The name is fixed at creation, because renaming means migrating
+  the secrets in Vault, not editing a field.
 
 ```jsonc
-// POST /api/vault/v1/kv/payments/vault-secrets/kubernetes-auth
-{
-  "metadata": { /* the infra coordinates, as above */ },
-  "spec": {
-    "role": "payments-api",            // optional; defaults to the flattened mount path
-    "service_accounts": ["payments-api"],
-    "namespaces": ["payments-prod"],
-    "capability": "write",             // "read" (default) or "write"
-    "ttl": "24h"                       // optional
-  }
-}
-
-// POST /api/vault/v1/kv/payments/vault-secrets/groups
-{
-  "metadata": { /* ... */ },
-  "spec": {"group": "AD\\payments-readers", "capability": "read"}
-}
+// PATCH /api/vault/v1/kv/myapp
+{"kv_description": "new text"}          // and/or {"owner": "team-dl@example.com"}
 ```
 
-Which append to the values file:
+> ⚠️ **`kubernetes-auth` and `groups` act on a `policies` list that a create does not write.**
+> Against a file this service produced they return `422` (`no 'read' policy found`). They are
+> there for a file whose pipeline-managed shape has grown policies. If that is not where you
+> are heading, delete them rather than reintroducing policy generation in this service.
 
-```yaml
-kubernetes_auth:
-  - role: payments-api
-    service_accounts: [payments-api]
-    namespaces: [payments-prod]
-    policies: [payments-vault-secrets-write]
-    ttl: 24h
+```jsonc
+// POST /api/vault/v1/kv/myapp/kubernetes-auth
+{
+  "role": "payments-api",            // optional; defaults to the flattened kv name
+  "service_accounts": ["payments-api"],
+  "namespaces": ["payments-prod"],
+  "capability": "write",             // "read" (default) or "write"
+  "ttl": "24h"                       // optional
+}
+
+// POST /api/vault/v1/kv/myapp/groups
+{"group": "AD\payments-readers", "capability": "read"}
 ```
 
 ---
@@ -247,7 +204,7 @@ a 502 — the same failure contract the reference API uses. `BaseAPI` defaults `
 | File | Responsibility |
 |------|----------------|
 | `conf.py` | the module's `BaseSettings` + `config` singleton |
-| `schemas.py` | pydantic request/response models (`VaultKVCreate` subclasses the library's `InfraOperationRequest`) |
+| `schemas.py` | pydantic request/response models (`VaultKVCreate` is a flat two-field body) |
 | `operations.py` | the create chain, the rollbacks and the pipeline matchers; receives connectors as arguments |
 | `routes.py` | `get_v1_vault_router(bitbucket, woodpecker) -> APIRouter`, prefixed with `config.API_PREFIX` |
 

@@ -4,12 +4,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A FastAPI service that creates HashiCorp **Vault KV mounts + their policies via GitOps**: a
-create request opens a Bitbucket pull request, waits for the validating Woodpecker pipeline,
-merges the PR, waits for the deploying Woodpecker pipeline, and returns
-`Successful creation of <mount path>`. It is built on the internal `tashtiot-apis-library`
-(base app, `BaseAPI`, `ExternalServiceError`, `InfraOperationRequest`) and follows the patterns
-of the reference `example-api` (sibling repo).
+A FastAPI service that **writes a file to a Bitbucket repo and watches the Woodpecker
+pipelines that act on it**. A create request opens a pull request, waits for the validating
+pipeline, merges, waits for the deploying pipeline, and returns
+`Successful creation of <kv name>`.
+
+**Scope boundary — read this first.** The service deliberately knows nothing about Vault. It
+commits a two-key document:
+
+```yaml
+kvname: myapp
+description: payments secrets
+```
+
+Mounts, KV engine versions, policies, HCL — none of it is modelled here. That is the deploy
+pipeline's business. `VAULT_URL` / `VAULT_TOKEN` are required settings that **no code reads**.
+Resist adding Vault semantics: an earlier version generated mounts and policy HCL, and it was
+removed on purpose.
+
+Built on the internal `tashtiot-apis-library` (base app, `BaseAPI`, `ExternalServiceError`)
+and follows the patterns of the reference `example-api` (sibling repo).
 
 ## Commands
 
@@ -33,32 +47,37 @@ tests need no `@pytest.mark.asyncio`. There is no linter/formatter configured.
 
 ## Routes
 
-| Route | Notes |
-|-------|-------|
-| `POST /api/vault/v1/kv/` | the create chain below; blocks until the deploy pipeline ends |
-| `GET /api/vault/v1/kv/{app_name}?environment=prod` | the committed values file, parsed YAML returned as-is (not a schema) |
-| `PATCH /api/vault/v1/kv/{app_name}` | mount description and/or owner |
-| `POST /api/vault/v1/kv/{app_name}/kubernetes-auth` | add a Vault Kubernetes auth role |
-| `POST /api/vault/v1/kv/{app_name}/groups` | bind an AD group to the read or write policy |
+| Route | Body | Notes |
+|-------|------|-------|
+| `POST /api/vault/v1/kv/` | `{kv_name, kv_description}` | the chain below; blocks until the deploy pipeline ends |
+| `GET /api/vault/v1/kv/{kv_name}` | — | the committed file, parsed YAML returned as-is (not a schema) |
+| `PATCH /api/vault/v1/kv/{kv_name}` | `{kv_description?, owner?}` | edits those two keys in place |
+| `POST /api/vault/v1/kv/{kv_name}/kubernetes-auth` | role/service accounts/namespaces | needs the file to carry `policies` |
+| `POST /api/vault/v1/kv/{kv_name}/groups` | `{group, capability}` | needs the file to carry `policies` |
 
 `API_PREFIX` (default `/api/vault/v1/kv`) comes from `app/v1/vault/conf.py`.
 
-**`app_name` is the mount path, verbatim.** Callers name their own mounts — nothing is
-prefixed for them — and a name may be multi-segment (`payments/vault-secrets`). Consequences:
+**The create request is exactly two fields**, and `test_create_takes_exactly_two_fields`
+pins that. There is no environment and no infra-coordinates `metadata` block; the name alone
+identifies the KV, and the file lands at `{VAULT_VALUES_DIR}/{kv_name}.yaml`.
 
-- Every `{app_name}` route uses a **`:path` converter**, so a slash in the name does not end
-  the segment. The suffixed routes (`/groups`, `/kubernetes-auth`) still bind correctly
-  because the converter backtracks to the anchored suffix.
-- `APP_NAME_PATTERN` (segments of `[a-z0-9]`/dashes joined by single slashes) is the
-  **path-traversal guard**, not just a style rule: the name lands in the values file path.
-  No leading/trailing slash, no empty segment, `..` cannot match.
-- **Environment is not in the mount path.** The values *file* is per environment
-  (`kv/prod/x.yaml` vs `kv/dev/x.yaml`), so the same name in two environments yields two
-  files pointing at one Vault mount. Encoding the environment is the caller's job.
-- Policy and Kubernetes role names cannot contain slashes, so they use
-  `slugify_mount_path` (`payments/vault-secrets` → `payments-vault-secrets`). Branch names
-  are flattened the same way — git cannot hold both `vault-kv/prod-a` and
-  `vault-kv/prod-a/b-suffix`.
+**`kv_name` is used verbatim** and may be multi-segment (`payments/vault-secrets`):
+
+- Every `{kv_name}` route uses a **`:path` converter**, so a slash does not end the segment.
+  The suffixed routes (`/groups`, `/kubernetes-auth`) still bind because the converter
+  backtracks to the anchored suffix — a KV literally named `team/groups` resolves under
+  `/team/groups/groups`, and there is a test for it.
+- `KV_NAME_PATTERN` (segments of `[a-z0-9]`/dashes joined by single slashes) is the
+  **path-traversal guard**, not just a style rule: the name lands in the file path. No
+  leading/trailing slash, no empty segment, `..` cannot match.
+- Kubernetes role names and branch names cannot contain slashes, so they go through
+  `slugify_mount_path` (`payments/vault-secrets` → `payments-vault-secrets`). Branches
+  especially: git cannot hold both `vault-kv/a` and `vault-kv/a/b-suffix`.
+
+**`kubernetes-auth` and `groups` act on a `policies` list that a plain create does not
+write.** Against a file this service created they return a clean 422 (`no 'read' policy
+found`). They exist for a file whose pipeline-managed shape has grown policies. If that never
+happens, they are dead weight — delete them rather than reintroducing policy generation here.
 
 ## Architecture
 
@@ -101,17 +120,19 @@ is load-bearing: `routes.py` keys off `external_error.status_code == 504` to ans
 of 502. Each client passes its own `detail_from_response` (Bitbucket digs through
 `{"errors": [{"message": ...}]}`); `default_detail` is the fallback.
 
-**Shared helpers (`app/helpers.py`)** are pure: `build_mount_path` (the name verbatim),
-`slugify_mount_path`, `build_policy_name`, `build_branch_name`, `values_file_path`,
-`render_read_policy` / `render_write_policy` (KV v2 splits `data/*` and `metadata/*`; v1 is
-flat), `build_values_data` and `render_values_yaml`.
+**Shared helpers (`app/helpers.py`)** are pure: `build_kv_values` (the committed document),
+`slugify_mount_path`, `build_branch_name`, `values_file_path` and `render_values_yaml`.
 
-The **edit** helpers — `update_mount_metadata`, `add_kubernetes_auth`, `add_group_binding`,
-`find_policy_name` — each take the parsed values dict and return a **new** one, never
-mutating the input. That is what lets `_edit_values_operation` diff old against new with
+The **edit** helpers — `update_kv_metadata`, `add_kubernetes_auth`, `add_group_binding`,
+`find_policy_name` — each take the parsed document and return a **new** one, never mutating
+the input. That is what lets `_edit_values_operation` diff old against new with
 `yaml_data_equals` and skip a no-op commit. `find_policy_name` reads the policy name out of
-the committed document rather than rebuilding it, so an edit can never bind to a policy that
-is not there; a miss raises `ValuesEditError`, which the operation turns into a 422.
+the committed file rather than deriving it, so an edit can never bind to a policy that is not
+there; a miss raises `ValuesEditError`, which the operation turns into a 422.
+
+`render_values_yaml` uses a `SafeDumper` subclass that writes multi-line strings as `|`
+blocks — the default representer emits one escaped, width-wrapped scalar, which is
+unreadable in the pull request diff a human is supposed to review.
 
 ## The create chain — read this before editing `operations.py`
 
@@ -214,8 +235,8 @@ hangs until the timeout. Only `success` counts as success.
   `status_code=201` and `response_model=` describe the success path only — FastAPI does not
   validate or document the failure bodies. Adding a field to `VaultKVOperationResponse` means
   the failure path silently omits it unless `to_response()` is updated too.
-- The committed YAML shape (`mount` / `policies` / `metadata`) is the contract with the deploy
-  pipeline — change `build_values_data` and the pipeline together.
+- The committed document (`kvname` / `description`) is the contract with the deploy
+  pipeline — change `build_kv_values` and the pipeline together.
 - Tests: `tests/test_helpers.py` (pure, no library import), `tests/clients/` (both clients plus
   `http.py`'s error mapping, against their real REST shapes via respx), `tests/v1/vault/` (schemas,
   the chain + rollbacks with duck-typed fakes from `tests/fakes.py`, and routes end-to-end through

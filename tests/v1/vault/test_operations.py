@@ -18,9 +18,9 @@ from app.v1.vault.operations import (
 from app.v1.vault.schemas import OperationStatus
 from tests.fakes import FakeBitbucket, FakeWoodpecker, make_pipeline
 
-MOUNT_PATH = "myapp"
-VALUES_PATH = "kv/prod/myapp.yaml"
-BRANCH = "vault-kv/prod-myapp-abc123"
+KV = "myapp"
+VALUES_PATH = "kv/myapp.yaml"
+BRANCH = "vault-kv/myapp-abc123"
 
 
 async def _create(bitbucket, woodpecker, payload):
@@ -36,8 +36,8 @@ async def test_happy_path_returns_the_success_message(payload, bitbucket, woodpe
     response = await _create(bitbucket, woodpecker, payload)
 
     assert response.status == OperationStatus.SUCCEEDED
-    assert response.message == f"Successful creation of {MOUNT_PATH}"
-    assert response.mount_path == MOUNT_PATH
+    assert response.message == f"Successful creation of {KV}"
+    assert response.kv_name == KV
     assert response.error is None
 
 
@@ -48,10 +48,9 @@ async def test_happy_path_reports_pull_request_and_both_pipelines(payload, bitbu
     assert response.pull_request.state == "MERGED"
     assert response.validation_pipeline.number == 2
     assert response.deploy_pipeline.number == 3
-    assert response.policies == [
-        "myapp-read",
-        "myapp-write",
-    ]
+    # The committed file carries no policies: this service writes a name and a
+    # description, and leaves Vault's structure to the deploy pipeline.
+    assert response.policies == []
 
 
 async def test_happy_path_call_order(payload, bitbucket, woodpecker):
@@ -74,12 +73,7 @@ async def test_committed_file_is_the_rendered_values_yaml(payload, bitbucket, wo
     await _create(bitbucket, woodpecker, payload)
 
     committed = yaml.safe_load(bitbucket.committed[VALUES_PATH])
-    assert committed["mount"]["path"] == MOUNT_PATH
-    assert committed["mount"]["options"] == {"version": "2"}
-    assert [p["name"] for p in committed["policies"]] == [
-        "myapp-read",
-        "myapp-write",
-    ]
+    assert committed == {"kvname": KV, "description": payload.kv_description}
 
 
 async def test_merge_uses_the_freshly_read_version(payload, bitbucket, woodpecker):
@@ -99,7 +93,7 @@ async def test_existing_mount_is_rejected_before_anything_is_created(payload, wo
         await _create(bitbucket, woodpecker, payload)
 
     assert exc_info.value.status_code == 409
-    assert MOUNT_PATH in exc_info.value.message
+    assert KV in exc_info.value.message
     assert bitbucket.calls == ["get_file_content"]
 
 
@@ -315,7 +309,7 @@ async def test_operation_error_renders_a_failed_response(payload, bitbucket):
 
     response = exc_info.value.to_response()
     assert response.status == OperationStatus.FAILED
-    assert response.mount_path == MOUNT_PATH
+    assert response.kv_name == KV
     assert response.error == response.message
     assert response.deploy_pipeline is None
 
@@ -413,12 +407,12 @@ async def test_watermark_excludes_pipelines_that_existed_before_the_request(payl
 # --------------------------------------------------------------------------- #
 async def test_get_mount_reads_the_values_file_from_the_base_branch():
     bitbucket = FakeBitbucket(
-        existing_files={VALUES_PATH: yaml.safe_dump({"mount": {"path": MOUNT_PATH}})}
+        existing_files={VALUES_PATH: yaml.safe_dump({"mount": {"path": KV}})}
     )
 
-    data = await get_kv_mount_operation(bitbucket, "prod", "myapp")
+    data = await get_kv_mount_operation(bitbucket, "myapp")
 
-    assert data["mount"]["path"] == MOUNT_PATH
+    assert data["mount"]["path"] == KV
 
 
 async def test_get_mount_reports_a_corrupt_values_file():
@@ -426,16 +420,16 @@ async def test_get_mount_reports_a_corrupt_values_file():
     bitbucket = FakeBitbucket(existing_files={VALUES_PATH: "mount: [unclosed\n  ::: bad"})
 
     with pytest.raises(VaultOperationError) as exc_info:
-        await get_kv_mount_operation(bitbucket, "prod", "myapp")
+        await get_kv_mount_operation(bitbucket, "myapp")
 
     assert "not valid YAML" in exc_info.value.message
-    assert exc_info.value.mount_path == MOUNT_PATH
+    assert exc_info.value.kv_name == KV
 
 
 async def test_get_mount_propagates_not_found():
     bitbucket = FakeBitbucket()
 
     with pytest.raises(ExternalServiceError) as exc_info:
-        await get_kv_mount_operation(bitbucket, "prod", "nope")
+        await get_kv_mount_operation(bitbucket, "nope")
 
     assert exc_info.value.status_code == 404

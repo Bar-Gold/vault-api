@@ -1,9 +1,7 @@
-"""Naming convention, policy rendering and values-file shape.
+"""Naming, the committed document, and the edits applied to it.
 
-These are pure functions, so the payload is duck-typed — no library import needed.
+These are pure functions, so nothing here imports the library or touches HTTP.
 """
-import types
-
 import pytest
 import yaml
 
@@ -13,156 +11,88 @@ from app.helpers import (
     add_kubernetes_auth,
     build_branch_name,
     build_kubernetes_role_name,
-    build_mount_path,
-    build_policy_name,
-    build_values_data,
+    build_kv_values,
     find_policy_name,
-    render_read_policy,
     render_values_yaml,
-    render_write_policy,
     slugify_mount_path,
-    update_mount_metadata,
+    update_kv_metadata,
     values_file_path,
     yaml_data_equals,
 )
-
-
-def _payload(**overrides):
-    spec = {
-        "app_name": "myapp",
-        "owner": "team-dl@example.com",
-        "kv_version": 2,
-        "description": None,
-        "max_versions": 10,
-        "delete_version_after": None,
-        "readers": ["group/readers"],
-        "writers": ["group/writers"],
-    }
-    spec.update(overrides)
-    return types.SimpleNamespace(spec=types.SimpleNamespace(**spec))
 
 
 # --------------------------------------------------------------------------- #
 # naming
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
-    "app_name",
-    ["myapp", "payments/vault-secrets", "payments/prod/api-secrets"],
-)
-def test_mount_path_is_the_name_verbatim(app_name):
-    """Callers name their own mounts — nothing is prefixed for them."""
-    assert build_mount_path(app_name) == app_name
-
-
-def test_mount_path_strips_stray_slashes():
-    assert build_mount_path("/payments/secrets/") == "payments/secrets"
-
-
-@pytest.mark.parametrize(
-    "mount_path,expected",
+    "kv_name,expected",
     [
         ("myapp", "myapp"),
         ("payments/vault-secrets", "payments-vault-secrets"),
         ("a/b/c", "a-b-c"),
+        ("/leading/", "leading"),
     ],
 )
-def test_slugify_flattens_slashes(mount_path, expected):
-    assert slugify_mount_path(mount_path) == expected
+def test_slugify_flattens_slashes(kv_name, expected):
+    assert slugify_mount_path(kv_name) == expected
 
 
-def test_policy_name_includes_capability():
-    assert build_policy_name("myapp", "read") == "myapp-read"
+def test_branch_name_is_prefixed():
+    assert build_branch_name("myapp", "ab12cd34", "vault-kv") == "vault-kv/myapp-ab12cd34"
 
 
-def test_policy_name_flattens_a_multi_segment_mount():
-    """Vault policy names cannot contain slashes."""
-    assert build_policy_name("payments/vault-secrets", "write") == (
-        "payments-vault-secrets-write"
-    )
+def test_branch_name_flattens_a_multi_segment_kv():
+    """A slash would nest the ref, and git cannot hold both a/b and a/b/c."""
+    branch = build_branch_name("payments/vault-secrets", "ab12cd34", "vault-kv")
+
+    assert branch == "vault-kv/payments-vault-secrets-ab12cd34"
+    assert branch.count("/") == 1
 
 
-def test_branch_name_is_prefixed_and_unique():
-    assert build_branch_name("prod", "myapp", "ab12cd34", "vault-kv") == "vault-kv/prod-myapp-ab12cd34"
+@pytest.mark.parametrize(
+    "kv_name,expected",
+    [
+        ("myapp", "kv/myapp.yaml"),
+        ("payments/vault-secrets", "kv/payments/vault-secrets.yaml"),
+    ],
+)
+def test_values_file_path(kv_name, expected):
+    assert values_file_path("kv", kv_name) == expected
 
 
 def test_values_file_path_strips_stray_slashes():
-    assert values_file_path("/kv/", "prod", "myapp") == "kv/prod/myapp.yaml"
+    assert values_file_path("/kv/", "myapp") == "kv/myapp.yaml"
+
+
+def test_kubernetes_role_name_defaults_to_the_flattened_name():
+    assert build_kubernetes_role_name("payments/vault-secrets") == "payments-vault-secrets"
 
 
 # --------------------------------------------------------------------------- #
-# policy rendering
+# the committed document
 # --------------------------------------------------------------------------- #
-def test_read_policy_v2_covers_data_and_metadata():
-    policy = render_read_policy("myapp", 2)
-    assert 'path "myapp/data/*"' in policy
-    assert 'path "myapp/metadata/*"' in policy
-    assert '"read", "list"' in policy
-    # Read-only must never grant mutation.
-    assert "create" not in policy
-    assert "update" not in policy
-    assert "delete" not in policy
-
-
-def test_write_policy_v2_grants_mutation_on_data():
-    policy = render_write_policy("myapp", 2)
-    assert '"create", "read", "update", "delete", "list"' in policy
-    assert 'path "myapp/metadata/*"' in policy
-
-
-def test_kv_v1_policy_uses_flat_path():
-    policy = render_read_policy("myapp", 1)
-    assert 'path "myapp/*"' in policy
-    assert "/data/" not in policy
-    assert "/metadata/" not in policy
-
-
-# --------------------------------------------------------------------------- #
-# values file
-# --------------------------------------------------------------------------- #
-def test_build_values_data_shape():
-    mount_path, values = build_values_data(_payload(), "kingmagen", "prod")
-
-    assert mount_path == "myapp"
-    assert values["mount"]["path"] == "myapp"
-    assert values["mount"]["type"] == "kv"
-    assert values["mount"]["options"] == {"version": "2"}
-    assert values["mount"]["config"]["max_versions"] == 10
-    assert [policy["name"] for policy in values["policies"]] == [
-        "myapp-read",
-        "myapp-write",
-    ]
-    assert values["policies"][0]["entities"] == ["group/readers"]
-    assert values["policies"][1]["entities"] == ["group/writers"]
-    assert values["metadata"] == {
-        "app": "myapp",
-        "team": "kingmagen",
-        "environment": "prod",
-        "owner": "team-dl@example.com",
+def test_build_kv_values_is_just_the_name_and_description():
+    """This service writes a file and watches pipelines; it models nothing about Vault."""
+    assert build_kv_values("myapp", "payments secrets") == {
+        "kvname": "myapp",
+        "description": "payments secrets",
     }
 
 
-def test_build_values_data_defaults_the_description():
-    _, values = build_values_data(_payload(), "kingmagen", "prod")
-    assert values["mount"]["description"] == "KV store for myapp (prod)"
-
-
-def test_build_values_data_includes_delete_version_after_when_set():
-    _, values = build_values_data(_payload(delete_version_after="720h"), "kingmagen", "prod")
-    assert values["mount"]["config"]["delete_version_after"] == "720h"
-
-
-def test_kv_v1_has_no_versioning_config():
-    _, values = build_values_data(_payload(kv_version=1), "kingmagen", "prod")
-    assert values["mount"]["options"] == {"version": "1"}
-    assert "config" not in values["mount"]
-
-
 def test_rendered_yaml_round_trips():
-    _, values = build_values_data(_payload(), "kingmagen", "prod")
+    values = build_kv_values("myapp", "payments secrets")
     rendered = render_values_yaml(values)
+
     assert yaml.safe_load(rendered) == values
-    # Key order is preserved so review diffs stay readable.
-    assert rendered.index("mount:") < rendered.index("policies:")
+    assert rendered == "kvname: myapp\ndescription: payments secrets\n"
+
+
+def test_multi_line_strings_render_as_block_scalars():
+    """Quoted-and-escaped multi-line scalars are unreadable in a pull request diff."""
+    rendered = render_values_yaml({"rules": 'path "a/b" {\n  capabilities = ["read"]\n}\n'})
+
+    assert "rules: |" in rendered
+    assert "\\n" not in rendered
 
 
 # --------------------------------------------------------------------------- #
@@ -177,59 +107,70 @@ def test_yaml_data_equals_detects_difference():
 
 
 # --------------------------------------------------------------------------- #
-# edits to an existing values file
+# edits
 #
 # Every edit must leave its input alone, so the caller can diff old against new and skip
 # a no-op commit.
 # --------------------------------------------------------------------------- #
-def _values():
+def _simple():
+    return {"kvname": "myapp", "description": "old"}
+
+
+def _with_policies():
+    """A file whose shape has grown policies — what the k8s/group edits need."""
     return {
-        "mount": {"path": "myapp", "description": "old"},
+        "kvname": "myapp",
+        "description": "old",
         "policies": [
             {"name": "myapp-read", "entities": ["group/r"]},
             {"name": "myapp-write", "entities": ["group/w"]},
         ],
-        "metadata": {"owner": "old@example.com"},
     }
 
 
-def test_update_mount_metadata_replaces_description_and_owner():
-    updated = update_mount_metadata(_values(), description="new", owner="new@example.com")
+def test_update_replaces_description_and_owner():
+    updated = update_kv_metadata(_simple(), description="new", owner="new@example.com")
 
-    assert updated["mount"]["description"] == "new"
-    assert updated["metadata"]["owner"] == "new@example.com"
-
-
-def test_update_mount_metadata_leaves_omitted_fields_alone():
-    updated = update_mount_metadata(_values(), description="new")
-
-    assert updated["metadata"]["owner"] == "old@example.com"
+    assert updated["description"] == "new"
+    assert updated["owner"] == "new@example.com"
 
 
-def test_update_mount_metadata_does_not_mutate_its_input():
-    original = _values()
-    update_mount_metadata(original, description="new")
+def test_update_leaves_omitted_fields_alone():
+    updated = update_kv_metadata(_simple(), description="new")
 
-    assert original["mount"]["description"] == "old"
+    assert "owner" not in updated
+    assert updated["kvname"] == "myapp"
 
 
-def test_build_kubernetes_role_name():
-    assert build_kubernetes_role_name("myapp") == "myapp"
+def test_update_never_touches_the_name():
+    """Renaming means migrating secrets in Vault, not editing a field."""
+    assert update_kv_metadata(_simple(), description="new")["kvname"] == "myapp"
+
+
+def test_update_does_not_mutate_its_input():
+    original = _simple()
+    update_kv_metadata(original, description="new")
+
+    assert original["description"] == "old"
 
 
 def test_find_policy_name_picks_the_capability():
-    assert find_policy_name(_values(), "read") == "myapp-read"
-    assert find_policy_name(_values(), "write") == "myapp-write"
+    assert find_policy_name(_with_policies(), "read") == "myapp-read"
+    assert find_policy_name(_with_policies(), "write") == "myapp-write"
 
 
-def test_find_policy_name_raises_when_absent():
+def test_find_policy_name_raises_on_a_file_without_policies():
     with pytest.raises(ValuesEditError):
-        find_policy_name({"policies": [{"name": "unrelated"}]}, "read")
+        find_policy_name(_simple(), "read")
 
 
 def test_add_kubernetes_auth_binds_the_named_policy():
     updated = add_kubernetes_auth(
-        _values(), role="r", service_accounts=["sa"], namespaces=["ns"], capability="write"
+        _with_policies(),
+        role="r",
+        service_accounts=["sa"],
+        namespaces=["ns"],
+        capability="write",
     )
 
     assert updated["kubernetes_auth"] == [
@@ -244,11 +185,12 @@ def test_add_kubernetes_auth_binds_the_named_policy():
 
 def test_add_kubernetes_auth_includes_ttl_only_when_given():
     with_ttl = add_kubernetes_auth(
-        _values(), role="r", service_accounts=["sa"], namespaces=["ns"],
+        _with_policies(), role="r", service_accounts=["sa"], namespaces=["ns"],
         capability="read", ttl="24h",
     )
     without = add_kubernetes_auth(
-        _values(), role="r", service_accounts=["sa"], namespaces=["ns"], capability="read"
+        _with_policies(), role="r", service_accounts=["sa"], namespaces=["ns"],
+        capability="read",
     )
 
     assert with_ttl["kubernetes_auth"][0]["ttl"] == "24h"
@@ -257,7 +199,8 @@ def test_add_kubernetes_auth_includes_ttl_only_when_given():
 
 def test_add_kubernetes_auth_replaces_a_role_of_the_same_name():
     once = add_kubernetes_auth(
-        _values(), role="r", service_accounts=["old"], namespaces=["ns"], capability="read"
+        _with_policies(), role="r", service_accounts=["old"], namespaces=["ns"],
+        capability="read",
     )
     twice = add_kubernetes_auth(
         once, role="r", service_accounts=["new"], namespaces=["ns"], capability="read"
@@ -269,7 +212,8 @@ def test_add_kubernetes_auth_replaces_a_role_of_the_same_name():
 
 def test_add_kubernetes_auth_appends_a_different_role():
     once = add_kubernetes_auth(
-        _values(), role="a", service_accounts=["sa"], namespaces=["ns"], capability="read"
+        _with_policies(), role="a", service_accounts=["sa"], namespaces=["ns"],
+        capability="read",
     )
     twice = add_kubernetes_auth(
         once, role="b", service_accounts=["sa"], namespaces=["ns"], capability="read"
@@ -278,30 +222,35 @@ def test_add_kubernetes_auth_appends_a_different_role():
     assert [role["role"] for role in twice["kubernetes_auth"]] == ["a", "b"]
 
 
+def test_add_kubernetes_auth_needs_a_policy_to_bind():
+    with pytest.raises(ValuesEditError):
+        add_kubernetes_auth(
+            _simple(), role="r", service_accounts=["sa"], namespaces=["ns"],
+            capability="read",
+        )
+
+
 def test_add_group_binding_appends_to_the_right_policy():
-    updated = add_group_binding(_values(), group=r"AD\payments-ro", capability="read")
+    updated = add_group_binding(_with_policies(), group=r"AD\payments-ro", capability="read")
 
     policies = {p["name"]: p for p in updated["policies"]}
-    assert policies["myapp-read"]["entities"] == [
-        "group/r",
-        r"AD\payments-ro",
-    ]
+    assert policies["myapp-read"]["entities"] == ["group/r", r"AD\payments-ro"]
     assert policies["myapp-write"]["entities"] == ["group/w"]
 
 
 def test_add_group_binding_is_idempotent():
-    updated = add_group_binding(_values(), group="group/r", capability="read")
+    updated = add_group_binding(_with_policies(), group="group/r", capability="read")
 
-    assert yaml_data_equals(updated, _values())
+    assert yaml_data_equals(updated, _with_policies())
 
 
 def test_add_group_binding_does_not_mutate_its_input():
-    original = _values()
+    original = _with_policies()
     add_group_binding(original, group=r"AD\payments-ro", capability="read")
 
     assert original["policies"][0]["entities"] == ["group/r"]
 
 
-def test_add_group_binding_raises_without_the_policy():
+def test_add_group_binding_needs_a_policy():
     with pytest.raises(ValuesEditError):
-        add_group_binding({"policies": [{"name": "unrelated"}]}, group="g", capability="read")
+        add_group_binding(_simple(), group="g", capability="read")

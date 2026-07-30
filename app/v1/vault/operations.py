@@ -33,11 +33,10 @@ from ...helpers import (
     add_group_binding,
     add_kubernetes_auth,
     build_kubernetes_role_name,
-    build_mount_path,
-    build_values_data,
+    build_kv_values,
     render_values_yaml,
     build_branch_name,
-    update_mount_metadata,
+    update_kv_metadata,
     values_file_path,
     yaml_data_equals,
 )
@@ -64,7 +63,7 @@ class VaultOperationError(Exception):
     def __init__(
         self,
         message: str,
-        mount_path: str,
+        kv_name: str,
         status_code: int = 502,
         policies: Optional[List[str]] = None,
         pull_request: Optional[PullRequest] = None,
@@ -73,7 +72,7 @@ class VaultOperationError(Exception):
     ) -> None:
         super().__init__(message)
         self.message = message
-        self.mount_path = mount_path
+        self.kv_name = kv_name
         self.status_code = status_code
         self.policies = policies or []
         self.pull_request = pull_request
@@ -85,7 +84,7 @@ class VaultOperationError(Exception):
         return VaultKVOperationResponse(
             status=OperationStatus.FAILED,
             message=self.message,
-            mount_path=self.mount_path,
+            kv_name=self.kv_name,
             policies=self.policies,
             pull_request=_pull_request_info(self.pull_request),
             validation_pipeline=_pipeline_info(self.validation_pipeline),
@@ -191,7 +190,7 @@ async def _decline_and_cleanup(bitbucket: Any, pull_request: PullRequest, branch
     await _delete_branch_quietly(bitbucket, branch)
 
 
-async def _assert_absent(bitbucket: Any, path: str, mount_path: str) -> None:
+async def _assert_absent(bitbucket: Any, path: str, kv_name: str) -> None:
     """Reject a create for a mount that is already defined on the base branch."""
     try:
         await bitbucket.get_file_content(path, at=config.VAULT_VALUES_REPO_BASE_BRANCH)
@@ -200,9 +199,9 @@ async def _assert_absent(bitbucket: Any, path: str, mount_path: str) -> None:
             return
         raise
     raise VaultOperationError(
-        f"{mount_path} already exists ({path} is already on "
+        f"{kv_name} already exists ({path} is already on "
         f"{config.VAULT_VALUES_REPO_BASE_BRANCH})",
-        mount_path=mount_path,
+        kv_name=kv_name,
         status_code=409,
     )
 
@@ -219,7 +218,7 @@ async def _commit_via_pull_request(
     branch: str,
     summary: str,
     description: str,
-    mount_path: str,
+    kv_name: str,
     policies: List[str],
     source_commit_id: Optional[str] = None,
 ) -> Tuple[PullRequest, Pipeline, Pipeline]:
@@ -264,7 +263,7 @@ async def _commit_via_pull_request(
         await _delete_branch_quietly(bitbucket, branch)
         raise
 
-    logger.info(f"Opened pull request {pull_request.id} for {mount_path}")
+    logger.info(f"Opened pull request {pull_request.id} for {kv_name}")
 
     # ---- 3. validation pipeline (blocks the merge) ------------------------- #
     try:
@@ -275,7 +274,7 @@ async def _commit_via_pull_request(
         await _decline_and_cleanup(bitbucket, pull_request, branch)
         raise VaultOperationError(
             f"Validation pipeline did not complete: {timeout_error.message}",
-            mount_path=mount_path,
+            kv_name=kv_name,
             status_code=504,
             policies=policies,
             pull_request=pull_request,
@@ -286,7 +285,7 @@ async def _commit_via_pull_request(
         await _decline_and_cleanup(bitbucket, pull_request, branch)
         raise VaultOperationError(
             _pipeline_failure("Validation", validation),
-            mount_path=mount_path,
+            kv_name=kv_name,
             policies=policies,
             pull_request=pull_request,
             validation_pipeline=validation,
@@ -303,13 +302,13 @@ async def _commit_via_pull_request(
         raise VaultOperationError(
             f"Pull request {pull_request.id} passed validation but could not be merged: "
             f"{merge_error.detail}",
-            mount_path=mount_path,
+            kv_name=kv_name,
             policies=policies,
             pull_request=pull_request,
             validation_pipeline=validation,
         ) from merge_error
 
-    logger.info(f"Merged pull request {merged.id} for {mount_path}")
+    logger.info(f"Merged pull request {merged.id} for {kv_name}")
 
     # ---- 5. deploy pipeline ------------------------------------------------ #
     try:
@@ -320,7 +319,7 @@ async def _commit_via_pull_request(
         raise VaultOperationError(
             f"Deploy pipeline did not complete: {timeout_error.message}. "
             f"The change is already merged to {base_branch}.",
-            mount_path=mount_path,
+            kv_name=kv_name,
             status_code=504,
             policies=policies,
             pull_request=merged,
@@ -332,7 +331,7 @@ async def _commit_via_pull_request(
         raise VaultOperationError(
             f"{_pipeline_failure('Deploy', deploy)}. "
             f"The change is already merged to {base_branch} and needs a revert.",
-            mount_path=mount_path,
+            kv_name=kv_name,
             policies=policies,
             pull_request=merged,
             validation_pipeline=validation,
@@ -348,41 +347,33 @@ async def create_kv_mount_operation(
     payload: VaultKVCreate,
     branch_suffix: Optional[str] = None,
 ) -> VaultKVOperationResponse:
-    """Run the full PR -> CI -> merge -> CI chain, blocking until the deploy pipeline ends."""
-    environment = payload.metadata.environment
-    team = global_config.TEAM_NAME
-    app_name = payload.spec.app_name
+    """Commit the file, then block until both pipelines have finished with it."""
+    kv_name = payload.kv_name
+    values = build_kv_values(kv_name, payload.kv_description)
+    path = values_file_path(config.VAULT_VALUES_DIR, kv_name)
 
-    mount_path, values = build_values_data(payload, team, environment)
-    policies = [policy["name"] for policy in values["policies"]]
-    path = values_file_path(config.VAULT_VALUES_DIR, environment, app_name)
-    branch = _branch_for(environment, app_name, branch_suffix)
-
-    await _assert_absent(bitbucket, path, mount_path)
+    await _assert_absent(bitbucket, path, kv_name)
 
     merged, validation, deploy = await _commit_via_pull_request(
         bitbucket,
         woodpecker,
         path=path,
         content=render_values_yaml(values),
-        branch=branch,
-        summary=f"Create Vault KV mount {mount_path}",
+        branch=_branch_for(kv_name, branch_suffix),
+        summary=f"Create KV {kv_name}",
         description=(
             f"Automated by vault-api.\n\n"
-            f"- mount: `{mount_path}` (KV v{int(payload.spec.kv_version)})\n"
-            f"- policies: {', '.join(policies)}\n"
-            f"- owner: {payload.spec.owner}\n"
-            f"- environment: {environment}\n"
+            f"- kv: `{kv_name}`\n"
+            f"- description: {payload.kv_description}\n"
         ),
-        mount_path=mount_path,
-        policies=policies,
+        kv_name=kv_name,
+        policies=[],
     )
 
     return VaultKVOperationResponse(
         status=OperationStatus.SUCCEEDED,
-        message=f"Successful creation of {mount_path}",
-        mount_path=mount_path,
-        policies=policies,
+        message=f"Successful creation of {kv_name}",
+        kv_name=kv_name,
         pull_request=_pull_request_info(merged),
         validation_pipeline=_pipeline_info(validation),
         deploy_pipeline=_pipeline_info(deploy),
@@ -390,24 +381,24 @@ async def create_kv_mount_operation(
 
 
 # --------------------------------------------------------------------------- #
-# edits to an existing mount
+# edits to an existing KV
 # --------------------------------------------------------------------------- #
-def _branch_for(environment: str, app_name: str, branch_suffix: Optional[str]) -> str:
+def _branch_for(kv_name: str, branch_suffix: Optional[str]) -> str:
     return build_branch_name(
-        environment, app_name, branch_suffix or uuid.uuid4().hex[:8], config.BRANCH_PREFIX
+        kv_name, branch_suffix or uuid.uuid4().hex[:8], config.BRANCH_PREFIX
     )
 
 
-async def _read_values(bitbucket: Any, path: str, mount_path: str) -> Dict[str, Any]:
-    """The committed values document, or a 404 if the mount was never created."""
+async def _read_values(bitbucket: Any, path: str, kv_name: str) -> Dict[str, Any]:
+    """The committed document, or a 404 if the KV was never created."""
     base_branch = config.VAULT_VALUES_REPO_BASE_BRANCH
     try:
         raw = await bitbucket.get_file_content(path, at=base_branch)
     except ExternalServiceError as exc:
         if exc.status_code == 404:
             raise VaultOperationError(
-                f"{mount_path} does not exist ({path} is not on {base_branch})",
-                mount_path=mount_path,
+                f"{kv_name} does not exist ({path} is not on {base_branch})",
+                kv_name=kv_name,
                 status_code=404,
             ) from exc
         raise
@@ -417,13 +408,13 @@ async def _read_values(bitbucket: Any, path: str, mount_path: str) -> Dict[str, 
     except yaml.YAMLError as parse_error:
         raise VaultOperationError(
             f"{path} exists on {base_branch} but is not valid YAML: {parse_error}",
-            mount_path=mount_path,
+            kv_name=kv_name,
         ) from parse_error
 
     if not isinstance(parsed, dict):
         raise VaultOperationError(
             f"{path} exists on {base_branch} but is not a YAML mapping",
-            mount_path=mount_path,
+            kv_name=kv_name,
         )
     return parsed
 
@@ -432,8 +423,7 @@ async def _edit_values_operation(
     bitbucket: Any,
     woodpecker: Any,
     *,
-    environment: str,
-    app_name: str,
+    kv_name: str,
     mutate: Callable[[Dict[str, Any]], Dict[str, Any]],
     summary: str,
     description: str,
@@ -446,29 +436,28 @@ async def _edit_values_operation(
     reason `yaml_data_equals` exists. That keeps repeat requests (re-adding the same group,
     the same Kubernetes role) from filling the values repo with empty pull requests.
     """
-    mount_path = build_mount_path(app_name)
-    path = values_file_path(config.VAULT_VALUES_DIR, environment, app_name)
+    path = values_file_path(config.VAULT_VALUES_DIR, kv_name)
 
-    current = await _read_values(bitbucket, path, mount_path)
+    current = await _read_values(bitbucket, path, kv_name)
 
     try:
         updated = mutate(current)
     except ValuesEditError as edit_error:
         # The document does not support the edit (e.g. no write policy to bind to).
         raise VaultOperationError(
-            f"Cannot edit {mount_path}: {edit_error}",
-            mount_path=mount_path,
+            f"Cannot edit {kv_name}: {edit_error}",
+            kv_name=kv_name,
             status_code=422,
         ) from edit_error
 
     policies = [policy.get("name", "") for policy in updated.get("policies") or []]
 
     if yaml_data_equals(current, updated):
-        logger.info(f"No change required for {mount_path}; skipping the pull request")
+        logger.info(f"No change required for {kv_name}; skipping the pull request")
         return VaultKVOperationResponse(
             status=OperationStatus.SUCCEEDED,
-            message=f"No changes required for {mount_path}",
-            mount_path=mount_path,
+            message=f"No changes required for {kv_name}",
+            kv_name=kv_name,
             policies=policies,
         )
 
@@ -482,10 +471,10 @@ async def _edit_values_operation(
         woodpecker,
         path=path,
         content=render_values_yaml(updated),
-        branch=_branch_for(environment, app_name, branch_suffix),
+        branch=_branch_for(kv_name, branch_suffix),
         summary=summary,
         description=description,
-        mount_path=mount_path,
+        kv_name=kv_name,
         policies=policies,
         source_commit_id=source_commit_id,
     )
@@ -493,7 +482,7 @@ async def _edit_values_operation(
     return VaultKVOperationResponse(
         status=OperationStatus.SUCCEEDED,
         message=success_message,
-        mount_path=mount_path,
+        kv_name=kv_name,
         policies=policies,
         pull_request=_pull_request_info(merged),
         validation_pipeline=_pipeline_info(validation),
@@ -504,38 +493,34 @@ async def _edit_values_operation(
 async def update_kv_mount_operation(
     bitbucket: Any,
     woodpecker: Any,
-    app_name: str,
+    kv_name: str,
     payload: VaultKVUpdate,
     branch_suffix: Optional[str] = None,
 ) -> VaultKVOperationResponse:
-    """Edit the mount's description and/or recorded owner. The mount path never changes."""
-    environment = payload.metadata.environment
-    spec = payload.spec
+    """Edit the description and/or recorded owner. The name never changes."""
     changes = ", ".join(
         part
         for part in (
-            f"description: {spec.description!r}" if spec.description is not None else "",
-            f"owner: {spec.owner}" if spec.owner is not None else "",
+            f"description: {payload.kv_description!r}"
+            if payload.kv_description is not None
+            else "",
+            f"owner: {payload.owner}" if payload.owner is not None else "",
         )
         if part
     )
-    mount_path = build_mount_path(app_name)
 
     return await _edit_values_operation(
         bitbucket,
         woodpecker,
-        environment=environment,
-        app_name=app_name,
-        mutate=lambda values: update_mount_metadata(
-            values, description=spec.description, owner=spec.owner
+        kv_name=kv_name,
+        mutate=lambda values: update_kv_metadata(
+            values, description=payload.kv_description, owner=payload.owner
         ),
-        summary=f"Update Vault KV mount {mount_path}",
+        summary=f"Update KV {kv_name}",
         description=(
-            f"Automated by vault-api.\n\n"
-            f"- mount: `{mount_path}`\n"
-            f"- changes: {changes}\n"
+            f"Automated by vault-api.\n\n- kv: `{kv_name}`\n- changes: {changes}\n"
         ),
-        success_message=f"Successful update of {mount_path}",
+        success_message=f"Successful update of {kv_name}",
         branch_suffix=branch_suffix,
     )
 
@@ -543,38 +528,34 @@ async def update_kv_mount_operation(
 async def add_kubernetes_auth_operation(
     bitbucket: Any,
     woodpecker: Any,
-    app_name: str,
+    kv_name: str,
     payload: VaultKVKubernetesAuth,
     branch_suffix: Optional[str] = None,
 ) -> VaultKVOperationResponse:
-    """Bind a Kubernetes service account to one of the mount's policies."""
-    environment = payload.metadata.environment
-    spec = payload.spec
-    mount_path = build_mount_path(app_name)
-    role = spec.role or build_kubernetes_role_name(mount_path)
+    """Bind a Kubernetes service account to one of the KV's policies."""
+    role = payload.role or build_kubernetes_role_name(kv_name)
 
     return await _edit_values_operation(
         bitbucket,
         woodpecker,
-        environment=environment,
-        app_name=app_name,
+        kv_name=kv_name,
         mutate=lambda values: add_kubernetes_auth(
             values,
             role=role,
-            service_accounts=spec.service_accounts,
-            namespaces=spec.namespaces,
-            capability=spec.capability.value,
-            ttl=spec.ttl,
+            service_accounts=payload.service_accounts,
+            namespaces=payload.namespaces,
+            capability=payload.capability.value,
+            ttl=payload.ttl,
         ),
-        summary=f"Add Kubernetes auth role {role} to {mount_path}",
+        summary=f"Add Kubernetes auth role {role} to {kv_name}",
         description=(
             f"Automated by vault-api.\n\n"
-            f"- mount: `{mount_path}`\n"
-            f"- role: `{role}` ({spec.capability.value})\n"
-            f"- service accounts: {', '.join(spec.service_accounts)}\n"
-            f"- namespaces: {', '.join(spec.namespaces)}\n"
+            f"- kv: `{kv_name}`\n"
+            f"- role: `{role}` ({payload.capability.value})\n"
+            f"- service accounts: {', '.join(payload.service_accounts)}\n"
+            f"- namespaces: {', '.join(payload.namespaces)}\n"
         ),
-        success_message=f"Successful addition of Kubernetes auth role {role} to {mount_path}",
+        success_message=f"Successful addition of Kubernetes auth role {role} to {kv_name}",
         branch_suffix=branch_suffix,
     )
 
@@ -582,40 +563,35 @@ async def add_kubernetes_auth_operation(
 async def add_group_binding_operation(
     bitbucket: Any,
     woodpecker: Any,
-    app_name: str,
+    kv_name: str,
     payload: VaultKVGroupBinding,
     branch_suffix: Optional[str] = None,
 ) -> VaultKVOperationResponse:
-    """Grant an AD group the mount's read or write policy."""
-    environment = payload.metadata.environment
-    spec = payload.spec
-    mount_path = build_mount_path(app_name)
-
+    """Grant an AD group one of the KV's policies."""
     return await _edit_values_operation(
         bitbucket,
         woodpecker,
-        environment=environment,
-        app_name=app_name,
+        kv_name=kv_name,
         mutate=lambda values: add_group_binding(
-            values, group=spec.group, capability=spec.capability.value
+            values, group=payload.group, capability=payload.capability.value
         ),
-        summary=f"Grant {spec.group} {spec.capability.value} access to {mount_path}",
+        summary=f"Grant {payload.group} {payload.capability.value} access to {kv_name}",
         description=(
             f"Automated by vault-api.\n\n"
-            f"- mount: `{mount_path}`\n"
-            f"- group: `{spec.group}`\n"
-            f"- capability: {spec.capability.value}\n"
+            f"- kv: `{kv_name}`\n"
+            f"- group: `{payload.group}`\n"
+            f"- capability: {payload.capability.value}\n"
         ),
         success_message=(
-            f"Successful addition of {spec.group} ({spec.capability.value}) to {mount_path}"
+            f"Successful addition of {payload.group} ({payload.capability.value}) to {kv_name}"
         ),
         branch_suffix=branch_suffix,
     )
 
 
-async def get_kv_mount_operation(bitbucket: Any, environment: str, app_name: str) -> Dict[str, Any]:
-    """Read the committed values file for a mount from the base branch."""
-    path = values_file_path(config.VAULT_VALUES_DIR, environment, app_name)
+async def get_kv_mount_operation(bitbucket: Any, kv_name: str) -> Dict[str, Any]:
+    """Read the committed file for a KV from the base branch."""
+    path = values_file_path(config.VAULT_VALUES_DIR, kv_name)
     content = await bitbucket.get_file_content(
         path, at=config.VAULT_VALUES_REPO_BASE_BRANCH
     )
@@ -627,5 +603,5 @@ async def get_kv_mount_operation(bitbucket: Any, environment: str, app_name: str
         raise VaultOperationError(
             f"{path} exists on {config.VAULT_VALUES_REPO_BASE_BRANCH} but is not valid YAML: "
             f"{parse_error}",
-            mount_path=build_mount_path(app_name),
+            kv_name=kv_name,
         ) from parse_error

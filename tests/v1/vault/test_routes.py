@@ -11,8 +11,8 @@ from app.v1.vault.conf import config
 from tests.fakes import make_pipeline
 
 CREATE_URL = f"{config.API_PREFIX}/"
-MOUNT_PATH = "myapp"
-VALUES_PATH = "kv/prod/myapp.yaml"
+KV = "myapp"
+VALUES_PATH = "kv/myapp.yaml"
 
 
 def _body(payload):
@@ -34,7 +34,7 @@ def test_create_rejects_a_bad_token(client, payload):
 
 
 def test_read_requires_a_token(client):
-    assert client.get(f"{config.API_PREFIX}/myapp?environment=prod").status_code == 401
+    assert client.get(f"{config.API_PREFIX}/myapp").status_code == 401
 
 
 # --------------------------------------------------------------------------- #
@@ -46,8 +46,8 @@ def test_create_returns_201_and_the_success_message(client, payload, auth_header
     assert response.status_code == 201
     body = response.json()
     assert body["status"] == "Succeeded"
-    assert body["message"] == f"Successful creation of {MOUNT_PATH}"
-    assert body["mount_path"] == MOUNT_PATH
+    assert body["message"] == f"Successful creation of {KV}"
+    assert body["kv_name"] == KV
     assert body["pull_request"]["id"] == 101
     assert body["validation_pipeline"]["status"] == "success"
     assert body["deploy_pipeline"]["status"] == "success"
@@ -75,7 +75,7 @@ def test_failed_validation_pipeline_returns_502_with_the_error(
     body = response.json()
     assert body["status"] == "Failed"
     assert "Validation pipeline #2 finished with status 'failure'" in body["error"]
-    assert body["mount_path"] == MOUNT_PATH
+    assert body["kv_name"] == KV
     assert "decline_pull_request" in bitbucket.calls
 
 
@@ -144,11 +144,11 @@ def test_bitbucket_outage_returns_502(client, payload, auth_headers, bitbucket):
 # --------------------------------------------------------------------------- #
 # create — validation
 # --------------------------------------------------------------------------- #
-def test_invalid_app_name_is_rejected_before_any_call(
+def test_invalid_kv_name_is_rejected_before_any_call(
     client, payload, auth_headers, bitbucket
 ):
     body = _body(payload)
-    body["spec"]["app_name"] = "Not_A_Valid_Name"
+    body["kv_name"] = "Not_A_Valid_Name"
 
     response = client.post(CREATE_URL, json=body, headers=auth_headers)
 
@@ -156,38 +156,50 @@ def test_invalid_app_name_is_rejected_before_any_call(
     assert bitbucket.calls == []
 
 
-def test_missing_spec_is_rejected(client, payload, auth_headers):
+def test_missing_description_is_rejected(client, payload, auth_headers):
     body = _body(payload)
-    body.pop("spec")
+    body.pop("kv_description")
 
     assert client.post(CREATE_URL, json=body, headers=auth_headers).status_code == 422
+
+
+def test_traversal_in_the_name_is_rejected(client, payload, auth_headers, bitbucket):
+    """The name reaches a file path, so '..' must never get through."""
+    body = _body(payload)
+    body["kv_name"] = "../../etc/passwd"
+
+    assert client.post(CREATE_URL, json=body, headers=auth_headers).status_code == 422
+    assert bitbucket.calls == []
 
 
 # --------------------------------------------------------------------------- #
 # read
 # --------------------------------------------------------------------------- #
 def test_read_returns_the_committed_values(client, auth_headers, bitbucket):
-    bitbucket.existing_files[VALUES_PATH] = yaml.safe_dump({"mount": {"path": MOUNT_PATH}})
+    bitbucket.existing_files[VALUES_PATH] = yaml.safe_dump({"mount": {"path": KV}})
 
-    response = client.get(f"{config.API_PREFIX}/myapp?environment=prod", headers=auth_headers)
+    response = client.get(f"{config.API_PREFIX}/myapp", headers=auth_headers)
 
     assert response.status_code == 200
-    assert response.json()["mount"]["path"] == MOUNT_PATH
+    assert response.json()["mount"]["path"] == KV
 
 
 def test_read_corrupt_values_file_returns_502_not_500(client, auth_headers, bitbucket):
     bitbucket.existing_files[VALUES_PATH] = "mount: [unclosed\n  ::: bad"
 
-    response = client.get(f"{config.API_PREFIX}/myapp?environment=prod", headers=auth_headers)
+    response = client.get(f"{config.API_PREFIX}/myapp", headers=auth_headers)
 
     assert response.status_code == 502
     assert "not valid YAML" in response.json()["error"]
 
 
 def test_read_unknown_mount_returns_404(client, auth_headers):
-    response = client.get(f"{config.API_PREFIX}/nope?environment=prod", headers=auth_headers)
+    response = client.get(f"{config.API_PREFIX}/nope", headers=auth_headers)
     assert response.status_code == 404
 
 
-def test_read_requires_the_environment_query_param(client, auth_headers):
-    assert client.get(f"{config.API_PREFIX}/myapp", headers=auth_headers).status_code == 422
+def test_read_takes_no_query_parameters(client, auth_headers, bitbucket):
+    """The name alone identifies the KV — there is no environment to disambiguate."""
+    bitbucket.existing_files[VALUES_PATH] = yaml.safe_dump({"kvname": KV})
+
+    assert client.get(f"{config.API_PREFIX}/myapp", headers=auth_headers).status_code == 200

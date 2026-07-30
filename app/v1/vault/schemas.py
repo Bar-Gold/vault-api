@@ -2,19 +2,16 @@ from enum import Enum
 from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
-from tashtiot_apis_library import InfraOperationRequest
-
-from .conf import config
 
 # A single name segment: lowercase alphanumerics separated by single dashes.
 _SEGMENT = r"[a-z0-9]+(?:-[a-z0-9]+)*"
 
-# Callers name their own mounts, so a name may be a multi-segment path such as
+# Callers name their own KVs, so a name may be a multi-segment path such as
 # `payments/vault-secrets`. Built from _SEGMENT joined by single slashes, which makes this
 # the path-traversal guard as well as a style rule: no leading or trailing slash, no empty
 # segment, and `..` cannot match. That matters because the name lands in the values file
 # path and in the request URL.
-APP_NAME_PATTERN = rf"^{_SEGMENT}(?:/{_SEGMENT})*$"
+KV_NAME_PATTERN = rf"^{_SEGMENT}(?:/{_SEGMENT})*$"
 
 # Vault role names cannot contain slashes, so they stay a single segment.
 ROLE_NAME_PATTERN = rf"^{_SEGMENT}$"
@@ -23,93 +20,51 @@ ROLE_NAME_PATTERN = rf"^{_SEGMENT}$"
 DURATION_PATTERN = r"^[0-9]+(s|m|h|d)$"
 
 
-class KVVersion(int, Enum):
-    V1 = 1
-    V2 = 2
-
-
 class OperationStatus(str, Enum):
     SUCCEEDED = "Succeeded"
     FAILED = "Failed"
 
 
-class VaultKVCreateSpec(BaseModel):
-    app_name: str = Field(
+class VaultKVCreate(BaseModel):
+    """A create request: the name and what it is for. Nothing else.
+
+    This service writes a file to the values repo and reports what the pipelines did with
+    it. What the KV *means* — mounts, policies, engine version — is the deploy pipeline's
+    business, so none of it is modelled here.
+    """
+
+    kv_name: str = Field(
         ...,
         max_length=128,
-        pattern=APP_NAME_PATTERN,
+        pattern=KV_NAME_PATTERN,
         description=(
-            "The KV mount's name, used verbatim as the Vault mount path. May be a "
-            "multi-segment path, e.g. 'myapp' or 'payments/vault-secrets'. Nothing is "
-            "prefixed for you, so include the team and/or environment yourself if you "
-            "want mounts namespaced by them."
+            "Name of the KV. Used verbatim, and may be a multi-segment path such as "
+            "'payments/vault-secrets'. Becomes the committed file name."
         ),
     )
 
-    owner: str = Field(
+    kv_description: str = Field(
         ...,
-        max_length=128,
-        description="Owner of the mount (team distribution list or user), recorded in the values file.",
-    )
-
-    kv_version: KVVersion = Field(
-        default=KVVersion.V2,
-        description="KV secrets engine version. v2 (versioned) unless you have a reason not to.",
-    )
-
-    description: Optional[str] = Field(
-        default=None,
+        min_length=1,
         max_length=256,
-        description="Free-text description applied to the Vault mount.",
+        description="What this KV is for. Recorded in the committed file.",
     )
 
-    max_versions: int = Field(
-        default=config.DEFAULT_KV_MAX_VERSIONS,
-        ge=1,
-        le=100,
-        description="KV-v2 only: how many versions of a secret Vault retains.",
-    )
-
-    delete_version_after: Optional[str] = Field(
-        default=config.DEFAULT_DELETE_VERSION_AFTER,
-        pattern=DURATION_PATTERN,
-        description="KV-v2 only: Vault duration string after which a version is deleted, e.g. '720h'.",
-    )
-
-    readers: List[str] = Field(
-        default_factory=list,
-        description="Identities/groups granted the generated read policy.",
-    )
-
-    writers: List[str] = Field(
-        default_factory=list,
-        description="Identities/groups granted the generated read/write policy.",
-    )
-
-    @field_validator("readers", "writers")
+    @field_validator("kv_description")
     @classmethod
-    def no_blank_entities(cls, v: List[str]) -> List[str]:
-        """Blank entries would render an empty binding into the policy file."""
-        cleaned = [item.strip() for item in v if item and item.strip()]
-        if len(cleaned) != len(v):
-            raise ValueError("entity lists must not contain empty values")
-        return cleaned
-
-
-class VaultKVCreate(InfraOperationRequest):
-    """`metadata` (the six infra coordinates) comes from InfraOperationRequest."""
-
-    spec: VaultKVCreateSpec
+    def not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("kv_description must not be blank")
+        return v.strip()
 
 
 # --------------------------------------------------------------------------- #
-# edits to an existing mount
+# edits to an existing KV
 #
-# `app_name` comes from the URL path on these; the body carries the infra coordinates
-# (for `metadata.environment`) plus the change itself.
+# `kv_name` comes from the URL path on these; the body carries only the change.
 # --------------------------------------------------------------------------- #
 class PolicyCapability(str, Enum):
-    """Which of the mount's two generated policies an edit refers to."""
+    """Which of a KV's two policies an edit refers to, when the file has policies."""
 
     READ = "read"
     WRITE = "write"
@@ -122,44 +77,37 @@ def _clean_entries(values: List[str], label: str) -> List[str]:
     return cleaned
 
 
-class VaultKVUpdateSpec(BaseModel):
-    """Editable labels. The mount path and policy names are deliberately not editable."""
+class VaultKVUpdate(BaseModel):
+    """Editable fields. The name is not one of them — renaming is a Vault migration."""
 
-    description: Optional[str] = Field(
+    kv_description: Optional[str] = Field(
         default=None,
         max_length=256,
-        description="Replacement free-text description for the Vault mount.",
+        description="Replacement description.",
     )
 
     owner: Optional[str] = Field(
         default=None,
         max_length=128,
-        description="Replacement owner recorded in the values file's metadata.",
+        description="Owner recorded in the file, if the file carries one.",
     )
 
     @model_validator(mode="after")
-    def at_least_one_field(self) -> "VaultKVUpdateSpec":
+    def at_least_one_field(self) -> "VaultKVUpdate":
         """An empty edit would open a pull request that changes nothing."""
-        if self.description is None and self.owner is None:
-            raise ValueError("provide at least one of 'description' or 'owner'")
+        if self.kv_description is None and self.owner is None:
+            raise ValueError("provide at least one of 'kv_description' or 'owner'")
         return self
 
 
-class VaultKVUpdate(InfraOperationRequest):
-    spec: VaultKVUpdateSpec
-
-
-class VaultKVKubernetesAuthSpec(BaseModel):
-    """A Vault Kubernetes auth role bound to one of the mount's policies."""
+class VaultKVKubernetesAuth(BaseModel):
+    """A Vault Kubernetes auth role bound to one of the KV's policies."""
 
     role: Optional[str] = Field(
         default=None,
         max_length=128,
         pattern=ROLE_NAME_PATTERN,
-        description=(
-            "Role name. Defaults to the mount path flattened to a single token, e.g. "
-            "'payments-vault-secrets'."
-        ),
+        description="Role name. Defaults to the KV name flattened to a single token.",
     )
 
     service_accounts: List[str] = Field(
@@ -176,7 +124,7 @@ class VaultKVKubernetesAuthSpec(BaseModel):
 
     capability: PolicyCapability = Field(
         default=PolicyCapability.READ,
-        description="Whether the role gets the mount's read or write policy.",
+        description="Whether the role gets the read or the write policy.",
     )
 
     ttl: Optional[str] = Field(
@@ -191,12 +139,8 @@ class VaultKVKubernetesAuthSpec(BaseModel):
         return _clean_entries(v, "service_accounts/namespaces")
 
 
-class VaultKVKubernetesAuth(InfraOperationRequest):
-    spec: VaultKVKubernetesAuthSpec
-
-
-class VaultKVGroupBindingSpec(BaseModel):
-    """An AD group granted one of the mount's two policies."""
+class VaultKVGroupBinding(BaseModel):
+    """An AD group granted one of the KV's policies."""
 
     group: str = Field(
         ...,
@@ -213,16 +157,15 @@ class VaultKVGroupBindingSpec(BaseModel):
     @field_validator("group")
     @classmethod
     def not_blank(cls, v: str) -> str:
-        """A whitespace-only group would render an empty binding into the policy file."""
+        """A whitespace-only group would render an empty binding into the file."""
         if not v.strip():
             raise ValueError("group must not be blank")
         return v.strip()
 
 
-class VaultKVGroupBinding(InfraOperationRequest):
-    spec: VaultKVGroupBindingSpec
-
-
+# --------------------------------------------------------------------------- #
+# responses
+# --------------------------------------------------------------------------- #
 class PullRequestInfo(BaseModel):
     id: int = Field(..., description="Bitbucket pull-request id.")
     url: Optional[str] = Field(default=None, description="Browser link to the pull request.")
@@ -236,19 +179,20 @@ class PipelineInfo(BaseModel):
 
 
 class VaultKVOperationResponse(BaseModel):
-    """Outcome of the full create flow: PR -> validation CI -> merge -> deploy CI."""
+    """Outcome of the chain: pull request -> validation CI -> merge -> deploy CI."""
 
     status: OperationStatus = Field(..., description="Succeeded or Failed.")
 
     message: str = Field(
         ...,
-        description="Human-readable outcome, e.g. 'Successful creation of kingmagen/prod/myapp'.",
+        description="Human-readable outcome, e.g. 'Successful creation of myapp'.",
     )
 
-    mount_path: str = Field(..., description="The Vault KV mount path this request creates.")
+    kv_name: str = Field(..., description="The KV this request acted on.")
 
     policies: List[str] = Field(
-        default_factory=list, description="Names of the Vault policies created alongside the mount."
+        default_factory=list,
+        description="Policy names found in the committed file, when it has any.",
     )
 
     pull_request: Optional[PullRequestInfo] = Field(
@@ -260,7 +204,7 @@ class VaultKVOperationResponse(BaseModel):
     )
 
     deploy_pipeline: Optional[PipelineInfo] = Field(
-        default=None, description="The post-merge pipeline that applies the change to Vault."
+        default=None, description="The post-merge pipeline that applies the change."
     )
 
     error: Optional[str] = Field(
