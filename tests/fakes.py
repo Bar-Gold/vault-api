@@ -33,6 +33,11 @@ class FakeBitbucket:
         self.merge_commit = merge_commit
         self.pull_requests: Dict[int, PullRequest] = {}
         self.committed: Dict[str, str] = {}
+        self.commit_messages: List[str] = []
+        # What put_file received as sourceCommitId, so the edit flow's optimistic-lock
+        # handling can be asserted on.
+        self.source_commit_ids: List[Optional[str]] = []
+        self.last_commit_id: Optional[str] = "file-commit-sha"
         self._next_id = 101
 
     def _record(self, name: str) -> None:
@@ -55,9 +60,23 @@ class FakeBitbucket:
     async def delete_branch(self, name: str) -> None:
         self._record("delete_branch")
 
-    async def put_file(self, path: str, branch: str, content: str, message: str, **kwargs) -> Dict[str, Any]:
+    async def get_last_commit(self, path: str, at: Optional[str] = None) -> Optional[str]:
+        self._record("get_last_commit")
+        return self.last_commit_id
+
+    async def put_file(
+        self,
+        path: str,
+        branch: str,
+        content: str,
+        message: str,
+        source_commit_id: Optional[str] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
         self._record("put_file")
         self.committed[path] = content
+        self.commit_messages.append(message)
+        self.source_commit_ids.append(source_commit_id)
         return {"id": "commit-sha"}
 
     async def create_pull_request(

@@ -267,3 +267,54 @@ def test_pull_request_parsing_tolerates_missing_optional_fields():
     assert pull_request.url is None
     assert pull_request.merge_commit is None
     assert pull_request.state == "OPEN"
+
+
+# --------------------------------------------------------------------------- #
+# last commit (the optimistic-lock token for edits)
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_get_last_commit_returns_the_newest_id(bitbucket):
+    route = respx.get(f"{API}/commits").mock(
+        return_value=httpx.Response(
+            200, json={"values": [{"id": "abc123"}, {"id": "older"}]}
+        )
+    )
+
+    assert await bitbucket.get_last_commit("kv/prod/myapp.yaml", at="master") == "abc123"
+
+    request = route.calls[0].request
+    assert request.url.params["path"] == "kv/prod/myapp.yaml"
+    assert request.url.params["until"] == "master"
+    assert request.url.params["limit"] == "1"
+
+
+@respx.mock
+async def test_get_last_commit_omits_until_without_a_ref(bitbucket):
+    route = respx.get(f"{API}/commits").mock(
+        return_value=httpx.Response(200, json={"values": [{"id": "abc123"}]})
+    )
+
+    await bitbucket.get_last_commit("kv/prod/myapp.yaml")
+
+    assert "until" not in route.calls[0].request.url.params
+
+
+@respx.mock
+async def test_get_last_commit_is_none_for_a_path_with_no_history(bitbucket):
+    """No history means the write is a create, not an edit — the caller sends no token."""
+    respx.get(f"{API}/commits").mock(return_value=httpx.Response(200, json={"values": []}))
+
+    assert await bitbucket.get_last_commit("kv/prod/new.yaml", at="master") is None
+
+
+@respx.mock
+async def test_get_last_commit_maps_a_failure(bitbucket):
+    respx.get(f"{API}/commits").mock(
+        return_value=httpx.Response(404, json={"errors": [{"message": "Repo not found"}]})
+    )
+
+    with pytest.raises(ExternalServiceError) as error:
+        await bitbucket.get_last_commit("kv/prod/myapp.yaml", at="master")
+
+    assert error.value.status_code == 404
+    assert "Repo not found" in error.value.detail

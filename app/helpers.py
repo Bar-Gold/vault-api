@@ -6,7 +6,8 @@ it pure means the naming convention and the rendered artefact are unit-testable 
 touching Bitbucket, Woodpecker or Vault.
 """
 
-from typing import Any, Dict, List, Tuple
+import copy
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -178,3 +179,100 @@ def yaml_data_equals(yaml_data_1, yaml_data_2) -> bool:
     if isinstance(yaml_data_2, str):
         yaml_data_2 = yaml.safe_load(yaml_data_2)
     return _normalize(yaml_data_1) == _normalize(yaml_data_2)
+
+
+# --------------------------------------------------------------------------- #
+# edits to an existing values file
+#
+# All of these take the parsed values dict and return a *new* one, leaving the input
+# alone so the caller can compare the two with `yaml_data_equals` and skip a no-op
+# commit. None of them touch the mount path or the policy names: renaming a Vault mount
+# is a data migration, not an edit.
+# --------------------------------------------------------------------------- #
+class ValuesEditError(ValueError):
+    """The requested edit does not apply to this values file."""
+
+
+def update_mount_metadata(
+    values: Dict[str, Any],
+    description: Optional[str] = None,
+    owner: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Replace the mount description and/or the recorded owner."""
+    updated = copy.deepcopy(values)
+    if description is not None:
+        updated.setdefault("mount", {})["description"] = description
+    if owner is not None:
+        updated.setdefault("metadata", {})["owner"] = owner
+    return updated
+
+
+def build_kubernetes_role_name(team: str, environment: str, app_name: str) -> str:
+    """Default Vault Kubernetes auth role name, e.g. ``kingmagen-prod-myapp``."""
+    return f"{team}-{environment}-{app_name}"
+
+
+def find_policy_name(values: Dict[str, Any], capability: str) -> str:
+    """The read or write policy name recorded in the file.
+
+    Read out of the file rather than rebuilt from the coordinates, so an edit can never
+    invent a policy name that does not exist in the committed document.
+    """
+    for policy in values.get("policies") or []:
+        name = policy.get("name", "")
+        if name.endswith(f"-{capability}"):
+            return name
+    raise ValuesEditError(f"no '{capability}' policy found in the values file")
+
+
+def add_kubernetes_auth(
+    values: Dict[str, Any],
+    role: str,
+    service_accounts: List[str],
+    namespaces: List[str],
+    capability: str,
+    ttl: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Add (or replace) a Kubernetes auth role bound to one of the mount's policies.
+
+    Upsert rather than append-only: re-adding an identical role leaves the document
+    untouched, so the caller's no-op check turns a repeat request into "nothing to do"
+    instead of a duplicate entry.
+    """
+    updated = copy.deepcopy(values)
+    role_entry: Dict[str, Any] = {
+        "role": role,
+        "service_accounts": list(service_accounts),
+        "namespaces": list(namespaces),
+        "policies": [find_policy_name(values, capability)],
+    }
+    if ttl:
+        role_entry["ttl"] = ttl
+
+    roles = updated.setdefault("kubernetes_auth", [])
+    for index, existing in enumerate(roles):
+        if existing.get("role") == role:
+            roles[index] = role_entry
+            break
+    else:
+        roles.append(role_entry)
+    return updated
+
+
+def add_group_binding(
+    values: Dict[str, Any], group: str, capability: str
+) -> Dict[str, Any]:
+    """Grant an AD group the mount's read or write policy.
+
+    Adding a group that is already bound leaves the document untouched.
+    """
+    updated = copy.deepcopy(values)
+    policy_name = find_policy_name(values, capability)
+    for policy in updated["policies"]:
+        if policy["name"] != policy_name:
+            continue
+        entities = policy.setdefault("entities", [])
+        if group not in entities:
+            entities.append(group)
+        return updated
+    raise ValuesEditError(f"policy {policy_name} disappeared while editing")

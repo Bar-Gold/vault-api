@@ -146,6 +146,20 @@ class BitbucketClient:
         )
         return response.json()
 
+    async def get_last_commit(self, path: str, at: Optional[str] = None) -> Optional[str]:
+        """Id of the newest commit touching `path`, for `put_file`'s `source_commit_id`.
+
+        Editing an existing file requires Bitbucket's optimistic-locking token; without it
+        the browse endpoint rejects the PUT as an attempted create. Returns `None` when the
+        path has no history, which is the caller's signal to treat the write as a create.
+        """
+        params: Dict[str, Any] = {"path": path, "limit": 1}
+        if at:
+            params["until"] = at
+        response = await self._request("GET", f"{self._api}/commits", params=params)
+        values = response.json().get("values") or []
+        return values[0].get("id") if values else None
+
     async def get_file_content(self, path: str, at: Optional[str] = None) -> str:
         """Raw file content at a ref (defaults to the repo's default branch)."""
         params = {"at": at} if at else None

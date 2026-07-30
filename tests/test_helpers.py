@@ -4,17 +4,24 @@ These are pure functions, so the payload is duck-typed — no library import nee
 """
 import types
 
+import pytest
 import yaml
 
 from app.helpers import (
+    ValuesEditError,
+    add_group_binding,
+    add_kubernetes_auth,
     build_branch_name,
+    build_kubernetes_role_name,
     build_mount_path,
     build_policy_name,
     build_values_data,
     break_mount_path,
+    find_policy_name,
     render_read_policy,
     render_values_yaml,
     render_write_policy,
+    update_mount_metadata,
     values_file_path,
     yaml_data_equals,
 )
@@ -143,3 +150,134 @@ def test_yaml_data_equals_ignores_ordering():
 
 def test_yaml_data_equals_detects_difference():
     assert not yaml_data_equals("a: 1\n", "a: 2\n")
+
+
+# --------------------------------------------------------------------------- #
+# edits to an existing values file
+#
+# Every edit must leave its input alone, so the caller can diff old against new and skip
+# a no-op commit.
+# --------------------------------------------------------------------------- #
+def _values():
+    return {
+        "mount": {"path": "kingmagen/prod/myapp", "description": "old"},
+        "policies": [
+            {"name": "kingmagen-prod-myapp-read", "entities": ["group/r"]},
+            {"name": "kingmagen-prod-myapp-write", "entities": ["group/w"]},
+        ],
+        "metadata": {"owner": "old@example.com"},
+    }
+
+
+def test_update_mount_metadata_replaces_description_and_owner():
+    updated = update_mount_metadata(_values(), description="new", owner="new@example.com")
+
+    assert updated["mount"]["description"] == "new"
+    assert updated["metadata"]["owner"] == "new@example.com"
+
+
+def test_update_mount_metadata_leaves_omitted_fields_alone():
+    updated = update_mount_metadata(_values(), description="new")
+
+    assert updated["metadata"]["owner"] == "old@example.com"
+
+
+def test_update_mount_metadata_does_not_mutate_its_input():
+    original = _values()
+    update_mount_metadata(original, description="new")
+
+    assert original["mount"]["description"] == "old"
+
+
+def test_build_kubernetes_role_name():
+    assert build_kubernetes_role_name("kingmagen", "prod", "myapp") == "kingmagen-prod-myapp"
+
+
+def test_find_policy_name_picks_the_capability():
+    assert find_policy_name(_values(), "read") == "kingmagen-prod-myapp-read"
+    assert find_policy_name(_values(), "write") == "kingmagen-prod-myapp-write"
+
+
+def test_find_policy_name_raises_when_absent():
+    with pytest.raises(ValuesEditError):
+        find_policy_name({"policies": [{"name": "unrelated"}]}, "read")
+
+
+def test_add_kubernetes_auth_binds_the_named_policy():
+    updated = add_kubernetes_auth(
+        _values(), role="r", service_accounts=["sa"], namespaces=["ns"], capability="write"
+    )
+
+    assert updated["kubernetes_auth"] == [
+        {
+            "role": "r",
+            "service_accounts": ["sa"],
+            "namespaces": ["ns"],
+            "policies": ["kingmagen-prod-myapp-write"],
+        }
+    ]
+
+
+def test_add_kubernetes_auth_includes_ttl_only_when_given():
+    with_ttl = add_kubernetes_auth(
+        _values(), role="r", service_accounts=["sa"], namespaces=["ns"],
+        capability="read", ttl="24h",
+    )
+    without = add_kubernetes_auth(
+        _values(), role="r", service_accounts=["sa"], namespaces=["ns"], capability="read"
+    )
+
+    assert with_ttl["kubernetes_auth"][0]["ttl"] == "24h"
+    assert "ttl" not in without["kubernetes_auth"][0]
+
+
+def test_add_kubernetes_auth_replaces_a_role_of_the_same_name():
+    once = add_kubernetes_auth(
+        _values(), role="r", service_accounts=["old"], namespaces=["ns"], capability="read"
+    )
+    twice = add_kubernetes_auth(
+        once, role="r", service_accounts=["new"], namespaces=["ns"], capability="read"
+    )
+
+    assert len(twice["kubernetes_auth"]) == 1
+    assert twice["kubernetes_auth"][0]["service_accounts"] == ["new"]
+
+
+def test_add_kubernetes_auth_appends_a_different_role():
+    once = add_kubernetes_auth(
+        _values(), role="a", service_accounts=["sa"], namespaces=["ns"], capability="read"
+    )
+    twice = add_kubernetes_auth(
+        once, role="b", service_accounts=["sa"], namespaces=["ns"], capability="read"
+    )
+
+    assert [role["role"] for role in twice["kubernetes_auth"]] == ["a", "b"]
+
+
+def test_add_group_binding_appends_to_the_right_policy():
+    updated = add_group_binding(_values(), group=r"AD\payments-ro", capability="read")
+
+    policies = {p["name"]: p for p in updated["policies"]}
+    assert policies["kingmagen-prod-myapp-read"]["entities"] == [
+        "group/r",
+        r"AD\payments-ro",
+    ]
+    assert policies["kingmagen-prod-myapp-write"]["entities"] == ["group/w"]
+
+
+def test_add_group_binding_is_idempotent():
+    updated = add_group_binding(_values(), group="group/r", capability="read")
+
+    assert yaml_data_equals(updated, _values())
+
+
+def test_add_group_binding_does_not_mutate_its_input():
+    original = _values()
+    add_group_binding(original, group=r"AD\payments-ro", capability="read")
+
+    assert original["policies"][0]["entities"] == ["group/r"]
+
+
+def test_add_group_binding_raises_without_the_policy():
+    with pytest.raises(ValuesEditError):
+        add_group_binding({"policies": [{"name": "unrelated"}]}, group="g", capability="read")
