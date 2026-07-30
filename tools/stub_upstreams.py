@@ -236,9 +236,26 @@ async def put_file(key: str, slug: str, path: str, request: Request):
         return _error(404, f"Branch {branch} does not exist")
     state.files.setdefault(branch, {})[path] = fields.get("content", "")
     state.commits.append(
-        {"branch": branch, "path": path, "message": fields.get("message", "")}
+        {
+            "branch": branch,
+            "path": path,
+            "message": fields.get("message", ""),
+            # Present on edits, absent on creates — worth seeing in /__state.
+            "source_commit_id": fields.get("sourceCommitId", ""),
+        }
     )
     return {"id": f"commit-{branch}", "message": fields.get("message", "")}
+
+
+@app.get("/rest/api/1.0/projects/{key}/repos/{slug}/commits")
+async def list_commits(
+    key: str, slug: str, path: Optional[str] = None, until: Optional[str] = None, limit: int = 25
+):
+    """History for a path — the edit flow reads the newest id as its optimistic-lock token."""
+    ref = (until or BASE_BRANCH).replace("refs/heads/", "")
+    if path and path not in state.files.get(ref, {}):
+        return {"values": [], "size": 0}
+    return {"values": [{"id": f"commit-{ref}-{len(state.commits)}"}], "size": 1}
 
 
 @app.get("/rest/api/1.0/projects/{key}/repos/{slug}/raw/{path:path}")
