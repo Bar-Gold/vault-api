@@ -11,7 +11,7 @@ from app.v1.vault.conf import config
 from tests.fakes import make_pipeline
 
 CREATE_URL = f"{config.API_PREFIX}/"
-MOUNT_PATH = "kingmagen/prod/myapp"
+MOUNT_PATH = "myapp"
 VALUES_PATH = "kv/prod/myapp.yaml"
 
 

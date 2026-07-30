@@ -12,29 +12,47 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 
 
-def build_mount_path(team: str, environment: str, app_name: str) -> str:
-    """The KV mount path in Vault: ``{team}/{environment}/{app}``.
+def build_mount_path(app_name: str) -> str:
+    """The KV mount path in Vault — whatever the caller asked for, verbatim.
 
-    `TEAM_NAME` is the team's mount prefix, so every mount this API creates is namespaced
-    under the owning team and then per environment.
+    Callers name their own mounts, so there is no derived ``{team}/{environment}/{app}``
+    prefix. Two consequences worth knowing:
+
+    * **Nothing namespaces mounts for you.** Include the team and/or environment in the
+      name yourself if you want them separated — ``payments/prod/secrets`` is a name like
+      any other, it is just not imposed.
+    * **The environment is not part of the path.** The values *file* is still per
+      environment (``kv/prod/x.yaml`` vs ``kv/dev/x.yaml``), so the same name in two
+      environments produces two files pointing at one Vault mount. Encode the environment
+      in the name if the mounts should be distinct.
+
+    The slug pattern on `app_name` guarantees this is a safe relative path: no leading or
+    trailing slash, no empty segments, no ``..``.
     """
-    return f"{team}/{environment}/{app_name}"
+    return app_name.strip("/")
 
 
-def break_mount_path(mount_path: str) -> Tuple[str, str, str]:
-    """Inverse of :func:`build_mount_path` -> ``(team, environment, app_name)``."""
-    team, environment, app_name = mount_path.split("/", 2)
-    return team, environment, app_name
+def slugify_mount_path(mount_path: str) -> str:
+    """Flatten a mount path into a single dash-separated token.
+
+    Policy names and Kubernetes role names cannot contain slashes, so a mount path of
+    ``payments/vault-secrets`` becomes ``payments-vault-secrets``.
+    """
+    return mount_path.strip("/").replace("/", "-")
 
 
-def build_policy_name(team: str, environment: str, app_name: str, capability: str) -> str:
-    """Vault policy name, e.g. ``kingmagen-prod-myapp-read``."""
-    return f"{team}-{environment}-{app_name}-{capability}"
+def build_policy_name(mount_path: str, capability: str) -> str:
+    """Vault policy name, e.g. ``payments-vault-secrets-read``."""
+    return f"{slugify_mount_path(mount_path)}-{capability}"
 
 
 def build_branch_name(environment: str, app_name: str, suffix: str, prefix: str) -> str:
-    """Short-lived branch the values file is committed to before the PR is opened."""
-    return f"{prefix}/{environment}-{app_name}-{suffix}"
+    """Short-lived branch the values file is committed to before the PR is opened.
+
+    The name is flattened: a slash in `app_name` would nest the ref, and git cannot hold
+    both ``vault-kv/prod-payments`` and ``vault-kv/prod-payments/secrets-abc``.
+    """
+    return f"{prefix}/{environment}-{slugify_mount_path(app_name)}-{suffix}"
 
 
 def values_file_path(values_dir: str, environment: str, app_name: str) -> str:
@@ -88,7 +106,7 @@ def build_values_data(
     the pipeline.
     """
     spec = payload.spec
-    mount_path = build_mount_path(team, environment, spec.app_name)
+    mount_path = build_mount_path(spec.app_name)
     kv_version = int(spec.kv_version)
 
     mount: Dict[str, Any] = {
@@ -107,12 +125,12 @@ def build_values_data(
 
     policies = [
         {
-            "name": build_policy_name(team, environment, spec.app_name, "read"),
+            "name": build_policy_name(mount_path, "read"),
             "rules": render_read_policy(mount_path, kv_version),
             "entities": list(spec.readers),
         },
         {
-            "name": build_policy_name(team, environment, spec.app_name, "write"),
+            "name": build_policy_name(mount_path, "write"),
             "rules": render_write_policy(mount_path, kv_version),
             "entities": list(spec.writers),
         },
@@ -207,9 +225,9 @@ def update_mount_metadata(
     return updated
 
 
-def build_kubernetes_role_name(team: str, environment: str, app_name: str) -> str:
-    """Default Vault Kubernetes auth role name, e.g. ``kingmagen-prod-myapp``."""
-    return f"{team}-{environment}-{app_name}"
+def build_kubernetes_role_name(mount_path: str) -> str:
+    """Default Vault Kubernetes auth role name, e.g. ``payments-vault-secrets``."""
+    return slugify_mount_path(mount_path)
 
 
 def find_policy_name(values: Dict[str, Any], capability: str) -> str:

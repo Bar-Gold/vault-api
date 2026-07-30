@@ -6,9 +6,18 @@ from tashtiot_apis_library import InfraOperationRequest
 
 from .conf import config
 
-# Vault mount paths and policy names end up in HCL and in URLs, so keep them to a
-# conservative slug: lowercase alphanumerics separated by single dashes.
-APP_NAME_PATTERN = r"^[a-z0-9]+(-[a-z0-9]+)*$"
+# A single name segment: lowercase alphanumerics separated by single dashes.
+_SEGMENT = r"[a-z0-9]+(?:-[a-z0-9]+)*"
+
+# Callers name their own mounts, so a name may be a multi-segment path such as
+# `payments/vault-secrets`. Built from _SEGMENT joined by single slashes, which makes this
+# the path-traversal guard as well as a style rule: no leading or trailing slash, no empty
+# segment, and `..` cannot match. That matters because the name lands in the values file
+# path and in the request URL.
+APP_NAME_PATTERN = rf"^{_SEGMENT}(?:/{_SEGMENT})*$"
+
+# Vault role names cannot contain slashes, so they stay a single segment.
+ROLE_NAME_PATTERN = rf"^{_SEGMENT}$"
 
 # Vault duration strings, e.g. "720h", "30m", "10d".
 DURATION_PATTERN = r"^[0-9]+(s|m|h|d)$"
@@ -27,9 +36,14 @@ class OperationStatus(str, Enum):
 class VaultKVCreateSpec(BaseModel):
     app_name: str = Field(
         ...,
-        max_length=40,
+        max_length=128,
         pattern=APP_NAME_PATTERN,
-        description="The application the KV mount belongs to. Becomes the last segment of the mount path.",
+        description=(
+            "The KV mount's name, used verbatim as the Vault mount path. May be a "
+            "multi-segment path, e.g. 'myapp' or 'payments/vault-secrets'. Nothing is "
+            "prefixed for you, so include the team and/or environment yourself if you "
+            "want mounts namespaced by them."
+        ),
     )
 
     owner: str = Field(
@@ -141,8 +155,11 @@ class VaultKVKubernetesAuthSpec(BaseModel):
     role: Optional[str] = Field(
         default=None,
         max_length=128,
-        pattern=APP_NAME_PATTERN,
-        description="Role name. Defaults to '{team}-{environment}-{app}'.",
+        pattern=ROLE_NAME_PATTERN,
+        description=(
+            "Role name. Defaults to the mount path flattened to a single token, e.g. "
+            "'payments-vault-secrets'."
+        ),
     )
 
     service_accounts: List[str] = Field(

@@ -28,9 +28,9 @@ from app.v1.vault.schemas import (
 from tests.fakes import make_pipeline
 
 VALUES_PATH = "kv/prod/myapp.yaml"
-MOUNT_PATH = "kingmagen/prod/myapp"
-READ_POLICY = "kingmagen-prod-myapp-read"
-WRITE_POLICY = "kingmagen-prod-myapp-write"
+MOUNT_PATH = "myapp"
+READ_POLICY = "myapp-read"
+WRITE_POLICY = "myapp-write"
 
 
 @pytest.fixture
@@ -210,7 +210,7 @@ async def test_kubernetes_auth_is_added(existing, bitbucket, woodpecker, metadat
     roles = _committed(bitbucket)["kubernetes_auth"]
     assert roles == [
         {
-            "role": "kingmagen-prod-myapp",
+            "role": "myapp",
             "service_accounts": ["myapp"],
             "namespaces": ["payments-prod"],
             "policies": [READ_POLICY],
@@ -229,7 +229,7 @@ async def test_kubernetes_auth_defaults_the_role_name(
         _k8s(metadata, service_accounts=["sa"], namespaces=["ns"]),
     )
 
-    assert _committed(bitbucket)["kubernetes_auth"][0]["role"] == "kingmagen-prod-myapp"
+    assert _committed(bitbucket)["kubernetes_auth"][0]["role"] == "myapp"
 
 
 async def test_kubernetes_auth_can_bind_the_write_policy(

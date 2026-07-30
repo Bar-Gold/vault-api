@@ -84,7 +84,7 @@ def get_v1_vault_router(bitbucket: Any, woodpecker: Any) -> APIRouter:
         return await _execute(create_kv_mount_operation(bitbucket, woodpecker, payload))
 
     @router.patch(
-        "/{app_name}",
+        "/{app_name:path}",
         response_model=VaultKVOperationResponse,
         summary="Update a Vault KV mount's description or owner",
         description=(
@@ -103,7 +103,7 @@ def get_v1_vault_router(bitbucket: Any, woodpecker: Any) -> APIRouter:
         )
 
     @router.post(
-        "/{app_name}/kubernetes-auth",
+        "/{app_name:path}/kubernetes-auth",
         response_model=VaultKVOperationResponse,
         summary="Add a Kubernetes auth role to a Vault KV mount",
         description=(
@@ -121,7 +121,7 @@ def get_v1_vault_router(bitbucket: Any, woodpecker: Any) -> APIRouter:
         )
 
     @router.post(
-        "/{app_name}/groups",
+        "/{app_name:path}/groups",
         response_model=VaultKVOperationResponse,
         summary="Grant an AD group access to a Vault KV mount",
         description=(
@@ -139,7 +139,7 @@ def get_v1_vault_router(bitbucket: Any, woodpecker: Any) -> APIRouter:
         )
 
     @router.get(
-        "/{app_name}",
+        "/{app_name:path}",
         summary="Read a Vault KV mount definition",
         description="Returns the committed values file for the app's KV mount in an environment.",
     )

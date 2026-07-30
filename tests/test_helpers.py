@@ -16,11 +16,11 @@ from app.helpers import (
     build_mount_path,
     build_policy_name,
     build_values_data,
-    break_mount_path,
     find_policy_name,
     render_read_policy,
     render_values_yaml,
     render_write_policy,
+    slugify_mount_path,
     update_mount_metadata,
     values_file_path,
     yaml_data_equals,
@@ -45,16 +45,40 @@ def _payload(**overrides):
 # --------------------------------------------------------------------------- #
 # naming
 # --------------------------------------------------------------------------- #
-def test_mount_path_is_team_environment_app():
-    assert build_mount_path("kingmagen", "prod", "myapp") == "kingmagen/prod/myapp"
+@pytest.mark.parametrize(
+    "app_name",
+    ["myapp", "payments/vault-secrets", "payments/prod/api-secrets"],
+)
+def test_mount_path_is_the_name_verbatim(app_name):
+    """Callers name their own mounts — nothing is prefixed for them."""
+    assert build_mount_path(app_name) == app_name
 
 
-def test_break_mount_path_round_trips():
-    assert break_mount_path("kingmagen/prod/myapp") == ("kingmagen", "prod", "myapp")
+def test_mount_path_strips_stray_slashes():
+    assert build_mount_path("/payments/secrets/") == "payments/secrets"
+
+
+@pytest.mark.parametrize(
+    "mount_path,expected",
+    [
+        ("myapp", "myapp"),
+        ("payments/vault-secrets", "payments-vault-secrets"),
+        ("a/b/c", "a-b-c"),
+    ],
+)
+def test_slugify_flattens_slashes(mount_path, expected):
+    assert slugify_mount_path(mount_path) == expected
 
 
 def test_policy_name_includes_capability():
-    assert build_policy_name("kingmagen", "prod", "myapp", "read") == "kingmagen-prod-myapp-read"
+    assert build_policy_name("myapp", "read") == "myapp-read"
+
+
+def test_policy_name_flattens_a_multi_segment_mount():
+    """Vault policy names cannot contain slashes."""
+    assert build_policy_name("payments/vault-secrets", "write") == (
+        "payments-vault-secrets-write"
+    )
 
 
 def test_branch_name_is_prefixed_and_unique():
@@ -69,9 +93,9 @@ def test_values_file_path_strips_stray_slashes():
 # policy rendering
 # --------------------------------------------------------------------------- #
 def test_read_policy_v2_covers_data_and_metadata():
-    policy = render_read_policy("kingmagen/prod/myapp", 2)
-    assert 'path "kingmagen/prod/myapp/data/*"' in policy
-    assert 'path "kingmagen/prod/myapp/metadata/*"' in policy
+    policy = render_read_policy("myapp", 2)
+    assert 'path "myapp/data/*"' in policy
+    assert 'path "myapp/metadata/*"' in policy
     assert '"read", "list"' in policy
     # Read-only must never grant mutation.
     assert "create" not in policy
@@ -80,14 +104,14 @@ def test_read_policy_v2_covers_data_and_metadata():
 
 
 def test_write_policy_v2_grants_mutation_on_data():
-    policy = render_write_policy("kingmagen/prod/myapp", 2)
+    policy = render_write_policy("myapp", 2)
     assert '"create", "read", "update", "delete", "list"' in policy
-    assert 'path "kingmagen/prod/myapp/metadata/*"' in policy
+    assert 'path "myapp/metadata/*"' in policy
 
 
 def test_kv_v1_policy_uses_flat_path():
-    policy = render_read_policy("kingmagen/prod/myapp", 1)
-    assert 'path "kingmagen/prod/myapp/*"' in policy
+    policy = render_read_policy("myapp", 1)
+    assert 'path "myapp/*"' in policy
     assert "/data/" not in policy
     assert "/metadata/" not in policy
 
@@ -98,14 +122,14 @@ def test_kv_v1_policy_uses_flat_path():
 def test_build_values_data_shape():
     mount_path, values = build_values_data(_payload(), "kingmagen", "prod")
 
-    assert mount_path == "kingmagen/prod/myapp"
-    assert values["mount"]["path"] == "kingmagen/prod/myapp"
+    assert mount_path == "myapp"
+    assert values["mount"]["path"] == "myapp"
     assert values["mount"]["type"] == "kv"
     assert values["mount"]["options"] == {"version": "2"}
     assert values["mount"]["config"]["max_versions"] == 10
     assert [policy["name"] for policy in values["policies"]] == [
-        "kingmagen-prod-myapp-read",
-        "kingmagen-prod-myapp-write",
+        "myapp-read",
+        "myapp-write",
     ]
     assert values["policies"][0]["entities"] == ["group/readers"]
     assert values["policies"][1]["entities"] == ["group/writers"]
@@ -160,10 +184,10 @@ def test_yaml_data_equals_detects_difference():
 # --------------------------------------------------------------------------- #
 def _values():
     return {
-        "mount": {"path": "kingmagen/prod/myapp", "description": "old"},
+        "mount": {"path": "myapp", "description": "old"},
         "policies": [
-            {"name": "kingmagen-prod-myapp-read", "entities": ["group/r"]},
-            {"name": "kingmagen-prod-myapp-write", "entities": ["group/w"]},
+            {"name": "myapp-read", "entities": ["group/r"]},
+            {"name": "myapp-write", "entities": ["group/w"]},
         ],
         "metadata": {"owner": "old@example.com"},
     }
@@ -190,12 +214,12 @@ def test_update_mount_metadata_does_not_mutate_its_input():
 
 
 def test_build_kubernetes_role_name():
-    assert build_kubernetes_role_name("kingmagen", "prod", "myapp") == "kingmagen-prod-myapp"
+    assert build_kubernetes_role_name("myapp") == "myapp"
 
 
 def test_find_policy_name_picks_the_capability():
-    assert find_policy_name(_values(), "read") == "kingmagen-prod-myapp-read"
-    assert find_policy_name(_values(), "write") == "kingmagen-prod-myapp-write"
+    assert find_policy_name(_values(), "read") == "myapp-read"
+    assert find_policy_name(_values(), "write") == "myapp-write"
 
 
 def test_find_policy_name_raises_when_absent():
@@ -213,7 +237,7 @@ def test_add_kubernetes_auth_binds_the_named_policy():
             "role": "r",
             "service_accounts": ["sa"],
             "namespaces": ["ns"],
-            "policies": ["kingmagen-prod-myapp-write"],
+            "policies": ["myapp-write"],
         }
     ]
 
@@ -258,11 +282,11 @@ def test_add_group_binding_appends_to_the_right_policy():
     updated = add_group_binding(_values(), group=r"AD\payments-ro", capability="read")
 
     policies = {p["name"]: p for p in updated["policies"]}
-    assert policies["kingmagen-prod-myapp-read"]["entities"] == [
+    assert policies["myapp-read"]["entities"] == [
         "group/r",
         r"AD\payments-ro",
     ]
-    assert policies["kingmagen-prod-myapp-write"]["entities"] == ["group/w"]
+    assert policies["myapp-write"]["entities"] == ["group/w"]
 
 
 def test_add_group_binding_is_idempotent():

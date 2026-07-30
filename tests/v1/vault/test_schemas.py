@@ -15,7 +15,19 @@ def _spec(**overrides):
 # --------------------------------------------------------------------------- #
 # app_name — it becomes a Vault path segment and a policy name
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("app_name", ["myapp", "my-app", "my-app-1", "a1"])
+@pytest.mark.parametrize(
+    "app_name",
+    [
+        "myapp",
+        "my-app",
+        "my-app-1",
+        "a1",
+        # Callers name their own mounts, so a name may be a multi-segment path.
+        "payments/secrets",
+        "payments/prod/api-secrets",
+        "a/b/c/d",
+    ],
+)
 def test_valid_app_names(app_name):
     assert _spec(app_name=app_name).app_name == app_name
 
@@ -29,8 +41,16 @@ def test_valid_app_names(app_name):
         "myapp-",  # trailing dash
         "my--app",  # doubled dash
         "my app",  # space
-        "my/app",  # path separator would forge a deeper mount
         "",  # empty
+        # The name lands in a file path, so traversal and empty segments must not pass.
+        "/myapp",  # leading slash
+        "myapp/",  # trailing slash
+        "my//app",  # empty segment
+        "../etc/passwd",  # traversal
+        "payments/../../etc",  # traversal mid-path
+        ".",
+        "..",
+        "payments/./secrets",
     ],
 )
 def test_rejected_app_names(app_name):
@@ -40,7 +60,7 @@ def test_rejected_app_names(app_name):
 
 def test_app_name_length_is_capped():
     with pytest.raises(ValidationError):
-        _spec(app_name="a" * 41)
+        _spec(app_name="a" * 129)
 
 
 # --------------------------------------------------------------------------- #

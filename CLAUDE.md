@@ -37,8 +37,28 @@ tests need no `@pytest.mark.asyncio`. There is no linter/formatter configured.
 |-------|-------|
 | `POST /api/vault/v1/kv/` | the create chain below; blocks until the deploy pipeline ends |
 | `GET /api/vault/v1/kv/{app_name}?environment=prod` | the committed values file, parsed YAML returned as-is (not a schema) |
+| `PATCH /api/vault/v1/kv/{app_name}` | mount description and/or owner |
+| `POST /api/vault/v1/kv/{app_name}/kubernetes-auth` | add a Vault Kubernetes auth role |
+| `POST /api/vault/v1/kv/{app_name}/groups` | bind an AD group to the read or write policy |
 
 `API_PREFIX` (default `/api/vault/v1/kv`) comes from `app/v1/vault/conf.py`.
+
+**`app_name` is the mount path, verbatim.** Callers name their own mounts — nothing is
+prefixed for them — and a name may be multi-segment (`payments/vault-secrets`). Consequences:
+
+- Every `{app_name}` route uses a **`:path` converter**, so a slash in the name does not end
+  the segment. The suffixed routes (`/groups`, `/kubernetes-auth`) still bind correctly
+  because the converter backtracks to the anchored suffix.
+- `APP_NAME_PATTERN` (segments of `[a-z0-9]`/dashes joined by single slashes) is the
+  **path-traversal guard**, not just a style rule: the name lands in the values file path.
+  No leading/trailing slash, no empty segment, `..` cannot match.
+- **Environment is not in the mount path.** The values *file* is per environment
+  (`kv/prod/x.yaml` vs `kv/dev/x.yaml`), so the same name in two environments yields two
+  files pointing at one Vault mount. Encoding the environment is the caller's job.
+- Policy and Kubernetes role names cannot contain slashes, so they use
+  `slugify_mount_path` (`payments/vault-secrets` → `payments-vault-secrets`). Branch names
+  are flattened the same way — git cannot hold both `vault-kv/prod-a` and
+  `vault-kv/prod-a/b-suffix`.
 
 ## Architecture
 
@@ -81,13 +101,27 @@ is load-bearing: `routes.py` keys off `external_error.status_code == 504` to ans
 of 502. Each client passes its own `detail_from_response` (Bitbucket digs through
 `{"errors": [{"message": ...}]}`); `default_detail` is the fallback.
 
-**Shared helpers (`app/helpers.py`)** are pure: `build_mount_path` (`{team}/{env}/{app}`),
-`build_policy_name`, `build_branch_name`, `values_file_path`, `render_read_policy` /
-`render_write_policy` (KV v2 splits `data/*` and `metadata/*`; v1 is flat), `build_values_data`
-and `render_values_yaml`. `break_mount_path` and `yaml_data_equals` are tested but **unused by
-the app** — they exist for the update flow (skip a no-op commit); leave them.
+**Shared helpers (`app/helpers.py`)** are pure: `build_mount_path` (the name verbatim),
+`slugify_mount_path`, `build_policy_name`, `build_branch_name`, `values_file_path`,
+`render_read_policy` / `render_write_policy` (KV v2 splits `data/*` and `metadata/*`; v1 is
+flat), `build_values_data` and `render_values_yaml`.
+
+The **edit** helpers — `update_mount_metadata`, `add_kubernetes_auth`, `add_group_binding`,
+`find_policy_name` — each take the parsed values dict and return a **new** one, never
+mutating the input. That is what lets `_edit_values_operation` diff old against new with
+`yaml_data_equals` and skip a no-op commit. `find_policy_name` reads the policy name out of
+the committed document rather than rebuilding it, so an edit can never bind to a policy that
+is not there; a miss raises `ValuesEditError`, which the operation turns into a 422.
 
 ## The create chain — read this before editing `operations.py`
+
+**One chain, four callers.** `_commit_via_pull_request` owns steps 2-6 below and is shared by
+create and all three edits, so the rollback asymmetry cannot drift apart between operations.
+Create adds the duplicate guard in front; the edits go through `_edit_values_operation`, which
+reads the committed file, applies a pure mutation, and **short-circuits when nothing changed**
+— returning success with `pull_request: null` rather than opening an empty PR. Edits also pass
+a `source_commit_id` from `get_last_commit`; without that optimistic-lock token Bitbucket
+rejects an edit to an existing path as an attempted create.
 
 `create_kv_mount_operation` runs, in order:
 
@@ -171,9 +205,11 @@ hangs until the timeout. Only `success` counts as success.
 
 - The create endpoint **blocks** for the whole chain. Any proxy in front needs a read timeout
   above `CI_PIPELINE_START_TIMEOUT_SECONDS + 2 × CI_PIPELINE_TIMEOUT_SECONDS`.
-- Status codes: 201 success, 409 duplicate, 502 pipeline/transport failure, 504 pipeline or
-  upstream timeout, 422 validation; the GET also answers 404 when Bitbucket 404s. Failures reuse
-  `VaultKVOperationResponse` via `VaultOperationError.to_response()`.
+- Status codes: 201 create, 200 edits and reads, 409 duplicate, 404 unknown mount, 502
+  pipeline/transport failure, 504 pipeline or upstream timeout, 422 validation and
+  inapplicable edits. Failures reuse `VaultKVOperationResponse` via
+  `VaultOperationError.to_response()`; every mutating route funnels through `_execute` in
+  `routes.py`, which is the single place that mapping lives.
 - **Failures are `return`ed as a `JSONResponse`, not raised.** So the POST decorator's
   `status_code=201` and `response_model=` describe the success path only — FastAPI does not
   validate or document the failure bodies. Adding a field to `VaultKVOperationResponse` means
@@ -192,9 +228,12 @@ hangs until the timeout. Only `success` counts as success.
   - `tests/v1/vault/conftest.py`'s `client` fixture monkeypatches `app.main.BitbucketClient` and
     `app.main.WoodpeckerClient` — the classes, not instances. That works only because
     `create_app()` is the sole construction site; keep it that way.
-- Only **create** and **read** exist. Update/delete would be the same chain with a different
-  step 2 (`put_file(..., source_commit_id=...)` for update, a file removal for delete) — keep the
-  rollback shape.
+- **Delete** is the only operation still missing. It is the same chain with a file removal as
+  step 2 — keep the rollback shape and reuse `_commit_via_pull_request`.
+- The **`kubernetes_auth`** section and the AD groups appended to `policies[].entities` are a
+  proposed shape, not one dictated by the deploy pipeline. If the pipeline wants different
+  field names, change `add_kubernetes_auth` / `add_group_binding` in `app/helpers.py` and the
+  pipeline together — same lockstep rule as `build_values_data`.
 - Commits are expected to be **Conventional Commits**: `cliff.toml` drives changelog generation
   (`uvx git-cliff`) and skips `chore`/`style`/`test`. Its header text mentions GitHub Actions and
   setuptools-scm, neither of which exists here (CI is Woodpecker; the version is a literal in

@@ -11,9 +11,9 @@ from app.v1.vault.conf import config
 from tests.fakes import make_pipeline
 
 VALUES_PATH = "kv/prod/myapp.yaml"
-MOUNT_PATH = "kingmagen/prod/myapp"
-READ_POLICY = "kingmagen-prod-myapp-read"
-WRITE_POLICY = "kingmagen-prod-myapp-write"
+MOUNT_PATH = "myapp"
+READ_POLICY = "myapp-read"
+WRITE_POLICY = "myapp-write"
 
 UPDATE_URL = f"{config.API_PREFIX}/myapp"
 K8S_URL = f"{config.API_PREFIX}/myapp/kubernetes-auth"
@@ -139,7 +139,7 @@ def test_kubernetes_auth_returns_200_and_commits_the_role(
     )
 
     assert response.status_code == 200
-    assert "kingmagen-prod-myapp" in response.json()["message"]
+    assert "myapp" in response.json()["message"]
     role = yaml.safe_load(bitbucket.committed[VALUES_PATH])["kubernetes_auth"][0]
     assert role["policies"] == [WRITE_POLICY]
     assert role["namespaces"] == ["payments-prod"]

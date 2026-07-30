@@ -18,7 +18,7 @@ from app.v1.vault.operations import (
 from app.v1.vault.schemas import OperationStatus
 from tests.fakes import FakeBitbucket, FakeWoodpecker, make_pipeline
 
-MOUNT_PATH = "kingmagen/prod/myapp"
+MOUNT_PATH = "myapp"
 VALUES_PATH = "kv/prod/myapp.yaml"
 BRANCH = "vault-kv/prod-myapp-abc123"
 
@@ -49,8 +49,8 @@ async def test_happy_path_reports_pull_request_and_both_pipelines(payload, bitbu
     assert response.validation_pipeline.number == 2
     assert response.deploy_pipeline.number == 3
     assert response.policies == [
-        "kingmagen-prod-myapp-read",
-        "kingmagen-prod-myapp-write",
+        "myapp-read",
+        "myapp-write",
     ]
 
 
@@ -77,8 +77,8 @@ async def test_committed_file_is_the_rendered_values_yaml(payload, bitbucket, wo
     assert committed["mount"]["path"] == MOUNT_PATH
     assert committed["mount"]["options"] == {"version": "2"}
     assert [p["name"] for p in committed["policies"]] == [
-        "kingmagen-prod-myapp-read",
-        "kingmagen-prod-myapp-write",
+        "myapp-read",
+        "myapp-write",
     ]
 
 

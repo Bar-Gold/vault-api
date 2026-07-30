@@ -446,8 +446,7 @@ async def _edit_values_operation(
     reason `yaml_data_equals` exists. That keeps repeat requests (re-adding the same group,
     the same Kubernetes role) from filling the values repo with empty pull requests.
     """
-    team = global_config.TEAM_NAME
-    mount_path = build_mount_path(team, environment, app_name)
+    mount_path = build_mount_path(app_name)
     path = values_file_path(config.VAULT_VALUES_DIR, environment, app_name)
 
     current = await _read_values(bitbucket, path, mount_path)
@@ -520,7 +519,7 @@ async def update_kv_mount_operation(
         )
         if part
     )
-    mount_path = build_mount_path(global_config.TEAM_NAME, environment, app_name)
+    mount_path = build_mount_path(app_name)
 
     return await _edit_values_operation(
         bitbucket,
@@ -550,10 +549,9 @@ async def add_kubernetes_auth_operation(
 ) -> VaultKVOperationResponse:
     """Bind a Kubernetes service account to one of the mount's policies."""
     environment = payload.metadata.environment
-    team = global_config.TEAM_NAME
     spec = payload.spec
-    mount_path = build_mount_path(team, environment, app_name)
-    role = spec.role or build_kubernetes_role_name(team, environment, app_name)
+    mount_path = build_mount_path(app_name)
+    role = spec.role or build_kubernetes_role_name(mount_path)
 
     return await _edit_values_operation(
         bitbucket,
@@ -591,7 +589,7 @@ async def add_group_binding_operation(
     """Grant an AD group the mount's read or write policy."""
     environment = payload.metadata.environment
     spec = payload.spec
-    mount_path = build_mount_path(global_config.TEAM_NAME, environment, app_name)
+    mount_path = build_mount_path(app_name)
 
     return await _edit_values_operation(
         bitbucket,
@@ -629,5 +627,5 @@ async def get_kv_mount_operation(bitbucket: Any, environment: str, app_name: str
         raise VaultOperationError(
             f"{path} exists on {config.VAULT_VALUES_REPO_BASE_BRANCH} but is not valid YAML: "
             f"{parse_error}",
-            mount_path=build_mount_path(global_config.TEAM_NAME, environment, app_name),
+            mount_path=build_mount_path(app_name),
         ) from parse_error

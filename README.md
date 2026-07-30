@@ -121,8 +121,22 @@ POST /api/vault/v1/kv/
 }
 ```
 
-`TEAM_NAME` + `metadata.environment` + `spec.app_name` produce the mount path
-`kingmagen/prod/myapp` and the policies `kingmagen-prod-myapp-read` / `-write`.
+`spec.app_name` **is** the Vault mount path, used verbatim — nothing is prefixed for you. It
+may be a multi-segment path, so `payments/vault-secrets` is a valid name and produces the
+policies `payments-vault-secrets-read` / `-write` (policy names cannot contain slashes, so
+they are flattened).
+
+Two things to know:
+
+- **Nothing namespaces mounts for you.** Include the team and/or environment in the name if
+  you want them separated.
+- **The environment is not part of the mount path**, but the values *file* is per environment.
+  The same name in `prod` and `dev` gives two files pointing at one Vault mount — encode the
+  environment in the name if the mounts should be distinct.
+
+Names are lowercase alphanumeric segments separated by dashes, joined by single slashes
+(`^[a-z0-9]+(-[a-z0-9]+)*(/...)*$`, max 128 chars). That also blocks `..`, so a name can never
+escape the values directory.
 
 ### The committed values file (`kv/prod/myapp.yaml`)
 
@@ -154,6 +168,49 @@ metadata: {app: myapp, team: kingmagen, environment: prod, owner: team-dl@exampl
 | Route | Purpose |
 |-------|---------|
 | `GET /api/vault/v1/kv/{app_name}?environment=prod` | the committed values file for a mount (404 if absent) |
+| `PATCH /api/vault/v1/kv/{app_name}` | change the mount's `description` and/or `owner` |
+| `POST /api/vault/v1/kv/{app_name}/kubernetes-auth` | bind Kubernetes service accounts to the read or write policy |
+| `POST /api/vault/v1/kv/{app_name}/groups` | grant an AD group the read or write policy |
+
+The three edit routes run the **same** pull request → CI → merge → CI chain as a create, and
+answer `200`. Two behaviours worth relying on:
+
+- **An edit that changes nothing opens no pull request.** Re-adding a group that is already
+  bound, or an identical Kubernetes role, returns `Succeeded` with
+  `"No changes required for <mount>"` and `pull_request: null`.
+- **`PATCH` cannot rename.** The mount path and policy names are fixed at creation, because
+  renaming a Vault mount means migrating its secrets, not editing a field.
+
+```jsonc
+// POST /api/vault/v1/kv/payments/vault-secrets/kubernetes-auth
+{
+  "metadata": { /* the infra coordinates, as above */ },
+  "spec": {
+    "role": "payments-api",            // optional; defaults to the flattened mount path
+    "service_accounts": ["payments-api"],
+    "namespaces": ["payments-prod"],
+    "capability": "write",             // "read" (default) or "write"
+    "ttl": "24h"                       // optional
+  }
+}
+
+// POST /api/vault/v1/kv/payments/vault-secrets/groups
+{
+  "metadata": { /* ... */ },
+  "spec": {"group": "AD\\payments-readers", "capability": "read"}
+}
+```
+
+Which append to the values file:
+
+```yaml
+kubernetes_auth:
+  - role: payments-api
+    service_accounts: [payments-api]
+    namespaces: [payments-prod]
+    policies: [payments-vault-secrets-write]
+    ttl: 24h
+```
 
 ---
 
@@ -237,9 +294,8 @@ Requires `tashtiot-apis-library >= 1.1.0`.
   the coordinates already in the request). Add it exactly as `example-api` does — guard on
   `CONFIG_API_URL`, call `enable_remote_config_api`, and pass the provider into the router
   factory — if you later need, say, a different values repo per environment.
-- **Update / delete.** Only create and read exist today. An update is the same chain with
-  `put_file(..., source_commit_id=...)` instead of a create; a delete is the same chain with a
-  file removal. Both must keep the same rollback shape.
+- **Delete.** The only operation still missing. It is the same chain with a file removal as the
+  commit step — reuse `_commit_via_pull_request` and keep the rollback shape.
 
 ## Docker
 
