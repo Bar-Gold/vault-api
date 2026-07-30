@@ -130,9 +130,37 @@ def build_values_data(
     return mount_path, values
 
 
+class _BlockStyleDumper(yaml.SafeDumper):
+    """SafeDumper that writes multi-line strings as block scalars."""
+
+
+def _represent_str(dumper: yaml.Dumper, data: str) -> Any:
+    """Render multi-line strings as ``|`` blocks, everything else normally.
+
+    The policy HCL is multi-line. Left to the default representer it becomes a single
+    escaped, width-wrapped double-quoted scalar (``"path \\"…\\" {\\n  capabilities…"``),
+    which parses fine but is unreadable in a pull request diff — and a human reviewing
+    that diff is the whole point of the GitOps flow.
+    """
+    if "\n" in data:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+
+_BlockStyleDumper.add_representer(str, _represent_str)
+
+
 def render_values_yaml(values: Dict[str, Any]) -> str:
     """Serialise the values dict for committing. Key order is preserved for readable diffs."""
-    return yaml.safe_dump(values, sort_keys=False, default_flow_style=False)
+    # width: PyYAML wraps at 80 columns by default, which splits long policy paths
+    # mid-token and undoes the readability the block style buys.
+    return yaml.dump(
+        values,
+        Dumper=_BlockStyleDumper,
+        sort_keys=False,
+        default_flow_style=False,
+        width=4096,
+    )
 
 
 def _normalize(data):
