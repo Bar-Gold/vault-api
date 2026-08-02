@@ -1,4 +1,7 @@
-system-certs = true
+# Trust the OS certificate store, so Artifactory's internal CA works without pointing at a
+# bundle by hand. The field is `native-tls` — uv rejects unknown keys outright, so a wrong
+# name here makes *every* uv command fail, not just the networked ones.
+native-tls = true
 
 # The pinned dev tools (pytest==7.4.3, …) are only on the secondary `pypi` index,
 # not the default `pypi-local`. Both are the same trusted Artifactory, so let uv pick
