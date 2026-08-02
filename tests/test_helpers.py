@@ -6,13 +6,8 @@ import pytest
 import yaml
 
 from app.helpers import (
-    ValuesEditError,
-    add_group_binding,
-    add_kubernetes_auth,
     build_branch_name,
-    build_kubernetes_role_name,
     build_kv_values,
-    find_policy_name,
     render_values_yaml,
     slugify_mount_path,
     update_kv_metadata,
@@ -64,10 +59,6 @@ def test_values_file_path_strips_stray_slashes():
     assert values_file_path("/kv/", "myapp") == "kv/myapp.yaml"
 
 
-def test_kubernetes_role_name_defaults_to_the_flattened_name():
-    assert build_kubernetes_role_name("payments/vault-secrets") == "payments-vault-secrets"
-
-
 # --------------------------------------------------------------------------- #
 # the committed document
 # --------------------------------------------------------------------------- #
@@ -89,9 +80,11 @@ def test_rendered_yaml_round_trips():
 
 def test_multi_line_strings_render_as_block_scalars():
     """Quoted-and-escaped multi-line scalars are unreadable in a pull request diff."""
-    rendered = render_values_yaml({"rules": 'path "a/b" {\n  capabilities = ["read"]\n}\n'})
+    rendered = render_values_yaml(
+        build_kv_values("myapp", "payments secrets\nowned by the payments team\n")
+    )
 
-    assert "rules: |" in rendered
+    assert "description: |" in rendered
     assert "\\n" not in rendered
 
 
@@ -109,23 +102,11 @@ def test_yaml_data_equals_detects_difference():
 # --------------------------------------------------------------------------- #
 # edits
 #
-# Every edit must leave its input alone, so the caller can diff old against new and skip
-# a no-op commit.
+# The edit must leave its input alone, so the caller can diff old against new and skip a
+# no-op commit.
 # --------------------------------------------------------------------------- #
 def _simple():
     return {"kvname": "myapp", "description": "old"}
-
-
-def _with_policies():
-    """A file whose shape has grown policies — what the k8s/group edits need."""
-    return {
-        "kvname": "myapp",
-        "description": "old",
-        "policies": [
-            {"name": "myapp-read", "entities": ["group/r"]},
-            {"name": "myapp-write", "entities": ["group/w"]},
-        ],
-    }
 
 
 def test_update_replaces_description_and_owner():
@@ -152,105 +133,3 @@ def test_update_does_not_mutate_its_input():
     update_kv_metadata(original, description="new")
 
     assert original["description"] == "old"
-
-
-def test_find_policy_name_picks_the_capability():
-    assert find_policy_name(_with_policies(), "read") == "myapp-read"
-    assert find_policy_name(_with_policies(), "write") == "myapp-write"
-
-
-def test_find_policy_name_raises_on_a_file_without_policies():
-    with pytest.raises(ValuesEditError):
-        find_policy_name(_simple(), "read")
-
-
-def test_add_kubernetes_auth_binds_the_named_policy():
-    updated = add_kubernetes_auth(
-        _with_policies(),
-        role="r",
-        service_accounts=["sa"],
-        namespaces=["ns"],
-        capability="write",
-    )
-
-    assert updated["kubernetes_auth"] == [
-        {
-            "role": "r",
-            "service_accounts": ["sa"],
-            "namespaces": ["ns"],
-            "policies": ["myapp-write"],
-        }
-    ]
-
-
-def test_add_kubernetes_auth_includes_ttl_only_when_given():
-    with_ttl = add_kubernetes_auth(
-        _with_policies(), role="r", service_accounts=["sa"], namespaces=["ns"],
-        capability="read", ttl="24h",
-    )
-    without = add_kubernetes_auth(
-        _with_policies(), role="r", service_accounts=["sa"], namespaces=["ns"],
-        capability="read",
-    )
-
-    assert with_ttl["kubernetes_auth"][0]["ttl"] == "24h"
-    assert "ttl" not in without["kubernetes_auth"][0]
-
-
-def test_add_kubernetes_auth_replaces_a_role_of_the_same_name():
-    once = add_kubernetes_auth(
-        _with_policies(), role="r", service_accounts=["old"], namespaces=["ns"],
-        capability="read",
-    )
-    twice = add_kubernetes_auth(
-        once, role="r", service_accounts=["new"], namespaces=["ns"], capability="read"
-    )
-
-    assert len(twice["kubernetes_auth"]) == 1
-    assert twice["kubernetes_auth"][0]["service_accounts"] == ["new"]
-
-
-def test_add_kubernetes_auth_appends_a_different_role():
-    once = add_kubernetes_auth(
-        _with_policies(), role="a", service_accounts=["sa"], namespaces=["ns"],
-        capability="read",
-    )
-    twice = add_kubernetes_auth(
-        once, role="b", service_accounts=["sa"], namespaces=["ns"], capability="read"
-    )
-
-    assert [role["role"] for role in twice["kubernetes_auth"]] == ["a", "b"]
-
-
-def test_add_kubernetes_auth_needs_a_policy_to_bind():
-    with pytest.raises(ValuesEditError):
-        add_kubernetes_auth(
-            _simple(), role="r", service_accounts=["sa"], namespaces=["ns"],
-            capability="read",
-        )
-
-
-def test_add_group_binding_appends_to_the_right_policy():
-    updated = add_group_binding(_with_policies(), group=r"AD\payments-ro", capability="read")
-
-    policies = {p["name"]: p for p in updated["policies"]}
-    assert policies["myapp-read"]["entities"] == ["group/r", r"AD\payments-ro"]
-    assert policies["myapp-write"]["entities"] == ["group/w"]
-
-
-def test_add_group_binding_is_idempotent():
-    updated = add_group_binding(_with_policies(), group="group/r", capability="read")
-
-    assert yaml_data_equals(updated, _with_policies())
-
-
-def test_add_group_binding_does_not_mutate_its_input():
-    original = _with_policies()
-    add_group_binding(original, group=r"AD\payments-ro", capability="read")
-
-    assert original["policies"][0]["entities"] == ["group/r"]
-
-
-def test_add_group_binding_needs_a_policy():
-    with pytest.raises(ValuesEditError):
-        add_group_binding(_simple(), group="g", capability="read")

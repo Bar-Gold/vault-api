@@ -134,11 +134,9 @@ description: payments secrets
 |-------|---------|
 | `GET /api/vault/v1/kv/{kv_name}` | the committed file (404 if absent) |
 | `PATCH /api/vault/v1/kv/{kv_name}` | change `description` and/or `owner` |
-| `POST /api/vault/v1/kv/{kv_name}/kubernetes-auth` | bind Kubernetes service accounts to a policy |
-| `POST /api/vault/v1/kv/{kv_name}/groups` | grant an AD group a policy |
 
-The three edit routes run the **same** pull request → CI → merge → CI chain as a create, and
-answer `200`. Two behaviours worth relying on:
+`PATCH` runs the **same** pull request → CI → merge → CI chain as a create, and answers `200`.
+Two behaviours worth relying on:
 
 - **An edit that changes nothing opens no pull request.** Re-applying the same change returns
   `Succeeded` with `"No changes required for <kv name>"` and `pull_request: null`.
@@ -148,25 +146,6 @@ answer `200`. Two behaviours worth relying on:
 ```jsonc
 // PATCH /api/vault/v1/kv/myapp
 {"kv_description": "new text"}          // and/or {"owner": "team-dl@example.com"}
-```
-
-> ⚠️ **`kubernetes-auth` and `groups` act on a `policies` list that a create does not write.**
-> Against a file this service produced they return `422` (`no 'read' policy found`). They are
-> there for a file whose pipeline-managed shape has grown policies. If that is not where you
-> are heading, delete them rather than reintroducing policy generation in this service.
-
-```jsonc
-// POST /api/vault/v1/kv/myapp/kubernetes-auth
-{
-  "role": "payments-api",            // optional; defaults to the flattened kv name
-  "service_accounts": ["payments-api"],
-  "namespaces": ["payments-prod"],
-  "capability": "write",             // "read" (default) or "write"
-  "ttl": "24h"                       // optional
-}
-
-// POST /api/vault/v1/kv/myapp/groups
-{"group": "AD\payments-readers", "capability": "read"}
 ```
 
 ---
@@ -181,7 +160,7 @@ FastAPI `Depends` for connectors — the factory closure is the injection seam.
 ### Two-layer configuration
 
 - **`app/global_conf.py`** (`global_config`) — cross-cutting: `BITBUCKET_*`, `WOODPECKER_*`,
-  `VAULT_*`, `TEAM_NAME`, `HTTP_TIMEOUT_SECONDS`, `VERIFY_SSL`.
+  `HTTP_TIMEOUT_SECONDS`, `VERIFY_SSL`.
 - **`app/v1/vault/conf.py`** (`config`) — the module's own: `API_PREFIX`, `API_TAGS`, the values
   repo layout, PR shaping and the `CI_*` timeouts.
 
@@ -208,8 +187,8 @@ a 502 — the same failure contract the reference API uses. `BaseAPI` defaults `
 | `operations.py` | the create chain, the rollbacks and the pipeline matchers; receives connectors as arguments |
 | `routes.py` | `get_v1_vault_router(bitbucket, woodpecker) -> APIRouter`, prefixed with `config.API_PREFIX` |
 
-`app/helpers.py` holds the pure functions: mount-path/policy naming, policy HCL rendering, the
-values-file shape and YAML comparison.
+`app/helpers.py` holds the pure functions: branch/file naming, the values-file shape, YAML
+rendering and comparison.
 
 ---
 
@@ -230,15 +209,31 @@ fails app creation. See `.env.example`.
 app/
   main.py            # create_app(): the wiring point (connectors + routers)
   global_conf.py     # shared BaseSettings (global_config)
-  helpers.py         # naming, policy rendering, values-file shape (pure)
+  helpers.py         # naming, values-file shape, YAML rendering (pure)
   clients/
     bitbucket.py     # branch / file / pull-request REST client
     woodpecker.py    # pipeline discovery + polling
+    http.py          # the single funnel that raises ExternalServiceError
   v1/vault/          # conf, schemas, operations, routes
 tests/
   test_helpers.py    # pure helpers
   clients/           # both clients against their real REST shapes (respx)
   v1/vault/          # schemas, the create chain + rollbacks, routes end-to-end
+tools/
+  stub_upstreams.py  # local Bitbucket + Woodpecker stand-in (see below)
+```
+
+### Driving the chain locally
+
+`tools/stub_upstreams.py` impersonates both upstreams in one process, so the whole create
+chain runs over real HTTP with no Docker, licence or network:
+
+```bash
+uv run --no-sync python tools/stub_upstreams.py --port 9000     # terminal 1
+# terminal 2: point BITBUCKET_URL / WOODPECKER_URL at it — full env in the module docstring
+
+curl -X POST 127.0.0.1:9000/__control -d '{"validation":"failure"}'   # success|failure|hang
+curl 127.0.0.1:9000/__state                                           # branches, PRs, pipelines
 ```
 
 Requires `tashtiot-apis-library >= 1.1.0`.
@@ -253,6 +248,11 @@ Requires `tashtiot-apis-library >= 1.1.0`.
   factory — if you later need, say, a different values repo per environment.
 - **Delete.** The only operation still missing. It is the same chain with a file removal as the
   commit step — reuse `_commit_via_pull_request` and keep the rollback shape.
+- **Policy-shaped edits.** `kubernetes-auth` and `groups` endpoints existed and were removed:
+  they edited a `policies` list that a create never writes, so they returned `422`
+  unconditionally against every file this service produces. They are recoverable from git
+  history if the deploy pipeline ever writes policies into the committed file — but policy
+  *generation* stays out of this service.
 
 ## Docker
 

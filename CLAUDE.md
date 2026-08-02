@@ -42,6 +42,24 @@ Docs at `http://localhost:5000/docs`, Prometheus metrics at `/metrics` (both pro
 library's `general_create_app`). `asyncio_mode = "auto"` is set in `pyproject.toml`, so async
 tests need no `@pytest.mark.asyncio`. There is no linter/formatter configured.
 
+**Driving the real chain locally: `tools/stub_upstreams.py`.** A single FastAPI process that
+impersonates both Bitbucket Server and Woodpecker, so the whole create chain runs over real
+HTTP with no Docker, licence or network. Everything except the two upstreams is real code —
+use it before reaching for more mocks.
+
+```bash
+uv run --no-sync python tools/stub_upstreams.py --port 9000     # terminal 1
+# terminal 2: point BITBUCKET_URL/WOODPECKER_URL at it (full env in the module docstring)
+curl -X POST 127.0.0.1:9000/__control -d '{"validation":"failure"}'  # or "hang" -> 504
+curl 127.0.0.1:9000/__state       # branches, PRs, pipelines, and every commit made
+curl -X POST 127.0.0.1:9000/__reset
+```
+
+`validation`/`deploy` take `success` | `failure` | `hang`; `polls` is how many status polls a
+pipeline stays non-terminal. The stub reproduces the two traps on purpose: a PR's `version` is
+bumped on every CI status change (so a stale version 409s at merge), and a merge lands the file
+on the base branch (so a repeat create hits the duplicate guard). Keep both if you extend it.
+
 `.woodpecker/build.yaml` runs the suite on push to `master` and builds/pushes the image on git
 **tags** only, passing `APP_VERSION=${CI_COMMIT_TAG}` as a build arg (it surfaces in the Swagger UI).
 
@@ -52,8 +70,6 @@ tests need no `@pytest.mark.asyncio`. There is no linter/formatter configured.
 | `POST /api/vault/v1/kv/` | `{kv_name, kv_description}` | the chain below; blocks until the deploy pipeline ends |
 | `GET /api/vault/v1/kv/{kv_name}` | — | the committed file, parsed YAML returned as-is (not a schema) |
 | `PATCH /api/vault/v1/kv/{kv_name}` | `{kv_description?, owner?}` | edits those two keys in place |
-| `POST /api/vault/v1/kv/{kv_name}/kubernetes-auth` | role/service accounts/namespaces | needs the file to carry `policies` |
-| `POST /api/vault/v1/kv/{kv_name}/groups` | `{group, capability}` | needs the file to carry `policies` |
 
 `API_PREFIX` (default `/api/vault/v1/kv`) comes from `app/v1/vault/conf.py`.
 
@@ -63,21 +79,16 @@ identifies the KV, and the file lands at `{VAULT_VALUES_DIR}/{kv_name}.yaml`.
 
 **`kv_name` is used verbatim** and may be multi-segment (`payments/vault-secrets`):
 
-- Every `{kv_name}` route uses a **`:path` converter**, so a slash does not end the segment.
-  The suffixed routes (`/groups`, `/kubernetes-auth`) still bind because the converter
-  backtracks to the anchored suffix — a KV literally named `team/groups` resolves under
-  `/team/groups/groups`, and there is a test for it.
+- Both `{kv_name}` routes use a **`:path` converter**, so a slash does not end the segment.
+  Neither has a suffix after `{kv_name}`, so there is no route-collision subtlety to preserve
+  — if you ever add one (`/{kv_name:path}/something`), the converter has to backtrack to the
+  anchored suffix, and a KV literally named `team/something` becomes ambiguous.
 - `KV_NAME_PATTERN` (segments of `[a-z0-9]`/dashes joined by single slashes) is the
   **path-traversal guard**, not just a style rule: the name lands in the file path. No
   leading/trailing slash, no empty segment, `..` cannot match.
-- Kubernetes role names and branch names cannot contain slashes, so they go through
-  `slugify_mount_path` (`payments/vault-secrets` → `payments-vault-secrets`). Branches
-  especially: git cannot hold both `vault-kv/a` and `vault-kv/a/b-suffix`.
-
-**`kubernetes-auth` and `groups` act on a `policies` list that a plain create does not
-write.** Against a file this service created they return a clean 422 (`no 'read' policy
-found`). They exist for a file whose pipeline-managed shape has grown policies. If that never
-happens, they are dead weight — delete them rather than reintroducing policy generation here.
+- Branch names cannot contain slashes, so they go through `slugify_mount_path`
+  (`payments/vault-secrets` → `payments-vault-secrets`): git cannot hold both `vault-kv/a`
+  and `vault-kv/a/b-suffix`.
 
 ## Architecture
 
@@ -94,9 +105,12 @@ for connectors).
 - `AUTH_*` / `AUTH_SSO_*` are **not** declared here — the library reads them from the environment.
 
 Both are singletons built at **import time**, so a missing required setting is an import error,
-not a request error. `VAULT_URL` / `VAULT_TOKEN` are required but **never read by any code** —
-this service never talks to Vault; the deploy pipeline does. Same for `API_DESCRIPTION`. Don't
-delete them assuming they're wired; don't go looking for the Vault client.
+not a request error. Adding a required setting means adding it to `tests/conftest.py` too.
+
+Every declared setting is read by something. `VAULT_URL`, `VAULT_TOKEN`, `TEAM_NAME`,
+`API_DESCRIPTION`, `DEFAULT_KV_MAX_VERSIONS` and `DEFAULT_DELETE_VERSION_AFTER` used to be
+declared here and read by nothing — leftovers from the removed Vault-semantics version. They
+are gone; don't reintroduce them, and don't go looking for a Vault client.
 
 **Per-module layout** (`app/v1/vault/`): `conf.py`, `schemas.py`, `operations.py`, `routes.py` —
 the same four-file split the reference API uses.
@@ -123,22 +137,21 @@ of 502. Each client passes its own `detail_from_response` (Bitbucket digs throug
 **Shared helpers (`app/helpers.py`)** are pure: `build_kv_values` (the committed document),
 `slugify_mount_path`, `build_branch_name`, `values_file_path` and `render_values_yaml`.
 
-The **edit** helpers — `update_kv_metadata`, `add_kubernetes_auth`, `add_group_binding`,
-`find_policy_name` — each take the parsed document and return a **new** one, never mutating
-the input. That is what lets `_edit_values_operation` diff old against new with
-`yaml_data_equals` and skip a no-op commit. `find_policy_name` reads the policy name out of
-the committed file rather than deriving it, so an edit can never bind to a policy that is not
-there; a miss raises `ValuesEditError`, which the operation turns into a 422.
+The **edit** helper `update_kv_metadata` takes the parsed document and returns a **new** one,
+never mutating the input. That is what lets `_edit_values_operation` diff old against new with
+`yaml_data_equals` and skip a no-op commit. Any edit helper added later must keep that
+contract.
 
 `render_values_yaml` uses a `SafeDumper` subclass that writes multi-line strings as `|`
 blocks — the default representer emits one escaped, width-wrapped scalar, which is
-unreadable in the pull request diff a human is supposed to review.
+unreadable in the pull request diff a human is supposed to review. Only a multi-line
+`description` can trigger it today.
 
 ## The create chain — read this before editing `operations.py`
 
-**One chain, four callers.** `_commit_via_pull_request` owns steps 2-6 below and is shared by
-create and all three edits, so the rollback asymmetry cannot drift apart between operations.
-Create adds the duplicate guard in front; the edits go through `_edit_values_operation`, which
+**One chain, two callers.** `_commit_via_pull_request` owns steps 2-6 below and is shared by
+create and update, so the rollback asymmetry cannot drift apart between operations.
+Create adds the duplicate guard in front; update goes through `_edit_values_operation`, which
 reads the committed file, applies a pure mutation, and **short-circuits when nothing changed**
 — returning success with `pull_request: null` rather than opening an empty PR. Edits also pass
 a `source_commit_id` from `get_last_commit`; without that optimistic-lock token Bitbucket
@@ -206,6 +219,10 @@ hangs until the timeout. Only `success` counts as success.
 - Public PyPI only has `tashtiot-apis-library==0.1.0`, which lacks `InfraOperationRequest` and
   `fastapi_template.config_api`. This service needs **>=1.1.0**; without it `tests/v1/` cannot even
   be collected (`tests/test_helpers.py` and `tests/clients/` still run).
+- **`[project.dependencies]` lists only what this service imports directly.** `prometheus-client`,
+  `aiocache`, `cryptography` and `python-dotenv` arrive transitively via the library; re-declaring
+  them here just lets the two drift. `loguru` and `pydantic-settings` *are* listed because app code
+  imports them by name — they were previously undeclared and worked only by accident.
 - **Known gap — the committed `uv.lock` is stale.** `[tool.uv.sources]` has been removed from
   `pyproject.toml`, but `uv.lock` still records `tashtiot-apis-library` as
   `source = { editable = "../apis-library" }`, so `uv sync --frozen` still fails in the Dockerfile
@@ -227,20 +244,20 @@ hangs until the timeout. Only `success` counts as success.
 - The create endpoint **blocks** for the whole chain. Any proxy in front needs a read timeout
   above `CI_PIPELINE_START_TIMEOUT_SECONDS + 2 × CI_PIPELINE_TIMEOUT_SECONDS`.
 - Status codes: 201 create, 200 edits and reads, 409 duplicate, 404 unknown mount, 502
-  pipeline/transport failure, 504 pipeline or upstream timeout, 422 validation and
-  inapplicable edits. Failures reuse `VaultKVOperationResponse` via
-  `VaultOperationError.to_response()`; every mutating route funnels through `_execute` in
-  `routes.py`, which is the single place that mapping lives.
+  pipeline/transport failure, 504 pipeline or upstream timeout, 422 request validation.
+  Failures reuse `VaultKVOperationResponse` via `VaultOperationError.to_response()`; every
+  mutating route funnels through `_execute` in `routes.py`, which is the single place that
+  mapping lives.
 - **Failures are `return`ed as a `JSONResponse`, not raised.** So the POST decorator's
   `status_code=201` and `response_model=` describe the success path only — FastAPI does not
   validate or document the failure bodies. Adding a field to `VaultKVOperationResponse` means
   the failure path silently omits it unless `to_response()` is updated too.
 - The committed document (`kvname` / `description`) is the contract with the deploy
   pipeline — change `build_kv_values` and the pipeline together.
-- Tests: `tests/test_helpers.py` (pure, no library import), `tests/clients/` (both clients plus
-  `http.py`'s error mapping, against their real REST shapes via respx), `tests/v1/vault/` (schemas,
-  the chain + rollbacks with duck-typed fakes from `tests/fakes.py`, and routes end-to-end through
-  `TestClient`). Two conftest details to respect:
+- Tests: 166 of them. `tests/test_helpers.py` (pure, no library import), `tests/clients/` (both
+  clients plus `http.py`'s error mapping, against their real REST shapes via respx),
+  `tests/v1/vault/` (schemas, the chain + rollbacks with duck-typed fakes from `tests/fakes.py`,
+  and routes end-to-end through `TestClient`). Two conftest details to respect:
   - `tests/conftest.py` sets `os.environ` **before** any `app.*` import (its own `import jwt` /
     `import pytest` sit below the env block behind `# noqa: E402`) because the config singletons
     are built at import time. Adding a required setting means adding it there, above that line.
@@ -251,11 +268,13 @@ hangs until the timeout. Only `success` counts as success.
     `create_app()` is the sole construction site; keep it that way.
 - **Delete** is the only operation still missing. It is the same chain with a file removal as
   step 2 — keep the rollback shape and reuse `_commit_via_pull_request`.
-- The **`kubernetes_auth`** section and the AD groups appended to `policies[].entities` are a
-  proposed shape, not one dictated by the deploy pipeline. If the pipeline wants different
-  field names, change `add_kubernetes_auth` / `add_group_binding` in `app/helpers.py` and the
-  pipeline together — same lockstep rule as `build_values_data`.
-- Commits are expected to be **Conventional Commits**: `cliff.toml` drives changelog generation
-  (`uvx git-cliff`) and skips `chore`/`style`/`test`. Its header text mentions GitHub Actions and
-  setuptools-scm, neither of which exists here (CI is Woodpecker; the version is a literal in
-  `pyproject.toml` plus the `APP_VERSION` build arg) — treat that wording as stale, not as a spec.
+- **`kubernetes-auth` and `groups` endpoints used to exist and were deleted.** They edited a
+  `policies` list that a create never writes, so against every file this service produces they
+  returned 422 unconditionally. If the deploy pipeline ever grows policies into the committed
+  file and you want them back, they are in git history — but the rule stands: no policy
+  *generation* in this service.
+- Commits are expected to be **Conventional Commits** (`feat:`, `fix:`, `test:`, `feat!:` for a
+  breaking change) — follow the existing `git log`. There is no changelog tooling: a `cliff.toml`
+  was removed because nothing ran it (no tags, no `CHANGELOG.md`, and its header described GitHub
+  Actions + setuptools-scm, neither of which exists here). The version is a literal in
+  `pyproject.toml` plus the `APP_VERSION` build arg.

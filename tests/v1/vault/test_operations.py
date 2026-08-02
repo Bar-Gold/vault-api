@@ -48,9 +48,6 @@ async def test_happy_path_reports_pull_request_and_both_pipelines(payload, bitbu
     assert response.pull_request.state == "MERGED"
     assert response.validation_pipeline.number == 2
     assert response.deploy_pipeline.number == 3
-    # The committed file carries no policies: this service writes a name and a
-    # description, and leaves Vault's structure to the deploy pipeline.
-    assert response.policies == []
 
 
 async def test_happy_path_call_order(payload, bitbucket, woodpecker):

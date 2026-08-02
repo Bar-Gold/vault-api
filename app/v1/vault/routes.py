@@ -8,8 +8,6 @@ from tashtiot_apis_library.connectors import ExternalServiceError
 from .conf import config
 from .operations import (
     VaultOperationError,
-    add_group_binding_operation,
-    add_kubernetes_auth_operation,
     create_kv_mount_operation,
     get_kv_mount_operation,
     update_kv_mount_operation,
@@ -17,8 +15,6 @@ from .operations import (
 from .schemas import (
     OperationStatus,
     VaultKVCreate,
-    VaultKVGroupBinding,
-    VaultKVKubernetesAuth,
     VaultKVOperationResponse,
     VaultKVUpdate,
 )
@@ -96,40 +92,6 @@ def get_v1_vault_router(bitbucket: Any, woodpecker: Any) -> APIRouter:
         logger.info(f"Updating KV {kv_name}")
         return await _execute(
             update_kv_mount_operation(bitbucket, woodpecker, kv_name, payload)
-        )
-
-    @router.post(
-        "/{kv_name:path}/kubernetes-auth",
-        response_model=VaultKVOperationResponse,
-        summary="Add a Kubernetes auth role to a KV",
-        description=(
-            "Binds Kubernetes service accounts in given namespaces to the KV's read or "
-            "write policy, through the same pull request and pipeline chain. Re-adding an "
-            "identical role is a no-op. Requires the committed file to carry policies."
-        ),
-    )
-    async def add_kubernetes_auth(kv_name: str, payload: VaultKVKubernetesAuth):
-        logger.info(f"Adding Kubernetes auth to KV {kv_name}")
-        return await _execute(
-            add_kubernetes_auth_operation(bitbucket, woodpecker, kv_name, payload)
-        )
-
-    @router.post(
-        "/{kv_name:path}/groups",
-        response_model=VaultKVOperationResponse,
-        summary="Grant an AD group access to a KV",
-        description=(
-            "Adds an AD group to the KV's read or write policy, through the same pull "
-            "request and pipeline chain. Re-adding a group already bound is a no-op. "
-            "Requires the committed file to carry policies."
-        ),
-    )
-    async def add_group(kv_name: str, payload: VaultKVGroupBinding):
-        logger.info(
-            f"Granting {payload.group} {payload.capability.value} on KV {kv_name}"
-        )
-        return await _execute(
-            add_group_binding_operation(bitbucket, woodpecker, kv_name, payload)
         )
 
     @router.get(

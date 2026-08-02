@@ -9,7 +9,6 @@ Point the service at it and everything except the upstreams is real code:
     # terminal 2
     BITBUCKET_URL=http://127.0.0.1:9000 BITBUCKET_TOKEN=x \
     WOODPECKER_URL=http://127.0.0.1:9000 WOODPECKER_TOKEN=x \
-    VAULT_URL=http://vault.invalid VAULT_TOKEN=x TEAM_NAME=kingmagen \
     VAULT_VALUES_REPO_PROJECT_KEY=INFRA VAULT_VALUES_REPO_SLUG=vault-values \
     WOODPECKER_REPO_ID=42 CI_POLL_INTERVAL_SECONDS=1 \
     uv run --no-sync python -m app.main --port 5055

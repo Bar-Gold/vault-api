@@ -2,13 +2,7 @@
 import pytest
 from pydantic import ValidationError
 
-from app.v1.vault.schemas import (
-    PolicyCapability,
-    VaultKVCreate,
-    VaultKVGroupBinding,
-    VaultKVKubernetesAuth,
-    VaultKVUpdate,
-)
+from app.v1.vault.schemas import VaultKVCreate, VaultKVUpdate
 
 
 def _create(**overrides):
@@ -106,61 +100,3 @@ def test_empty_update_is_rejected():
     """An edit that specifies nothing would open a pull request that changes nothing."""
     with pytest.raises(ValidationError):
         VaultKVUpdate()
-
-
-# --------------------------------------------------------------------------- #
-# kubernetes auth
-# --------------------------------------------------------------------------- #
-def test_kubernetes_auth_defaults_to_read():
-    spec = VaultKVKubernetesAuth(service_accounts=["sa"], namespaces=["ns"])
-
-    assert spec.capability is PolicyCapability.READ
-    assert spec.role is None
-    assert spec.ttl is None
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"service_accounts": []},
-        {"namespaces": []},
-        {"service_accounts": ["  "]},
-        {"ttl": "forever"},
-        {"role": "Bad/Role"},  # role names cannot contain slashes
-    ],
-)
-def test_rejected_kubernetes_auth(overrides):
-    values = {"service_accounts": ["sa"], "namespaces": ["ns"]}
-    values.update(overrides)
-    with pytest.raises(ValidationError):
-        VaultKVKubernetesAuth(**values)
-
-
-@pytest.mark.parametrize("ttl", ["30s", "10m", "24h", "7d"])
-def test_valid_ttls(ttl):
-    assert VaultKVKubernetesAuth(
-        service_accounts=["sa"], namespaces=["ns"], ttl=ttl
-    ).ttl == ttl
-
-
-# --------------------------------------------------------------------------- #
-# group bindings
-# --------------------------------------------------------------------------- #
-def test_group_binding_requires_a_capability():
-    with pytest.raises(ValidationError):
-        VaultKVGroupBinding(group="AD\\x")
-
-
-def test_group_binding_rejects_an_unknown_capability():
-    with pytest.raises(ValidationError):
-        VaultKVGroupBinding(group="AD\\x", capability="admin")
-
-
-def test_group_is_stripped():
-    binding = VaultKVGroupBinding(group="  AD\\x  ", capability="read")
-    assert binding.group == "AD\\x"
-
-
-def test_blank_group_is_rejected():
-    with pytest.raises(ValidationError):
-        VaultKVGroupBinding(group="   ", capability="read")

@@ -10,7 +10,7 @@ pipeline's business.
 """
 
 import copy
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import yaml
 
@@ -18,7 +18,7 @@ import yaml
 def slugify_mount_path(mount_path: str) -> str:
     """Flatten a mount path into a single dash-separated token.
 
-    Policy names and Kubernetes role names cannot contain slashes, so a mount path of
+    Branch names cannot contain a slash without nesting the ref, so a KV named
     ``payments/vault-secrets`` becomes ``payments-vault-secrets``.
     """
     return mount_path.strip("/").replace("/", "-")
@@ -55,10 +55,10 @@ class _BlockStyleDumper(yaml.SafeDumper):
 def _represent_str(dumper: yaml.Dumper, data: str) -> Any:
     """Render multi-line strings as ``|`` blocks, everything else normally.
 
-    The policy HCL is multi-line. Left to the default representer it becomes a single
-    escaped, width-wrapped double-quoted scalar (``"path \\"…\\" {\\n  capabilities…"``),
-    which parses fine but is unreadable in a pull request diff — and a human reviewing
-    that diff is the whole point of the GitOps flow.
+    A description containing a newline would otherwise become a single escaped,
+    width-wrapped double-quoted scalar (``"line one\\nline two"``), which parses fine but
+    is unreadable in a pull request diff — and a human reviewing that diff is the whole
+    point of the GitOps flow.
     """
     if "\n" in data:
         return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
@@ -70,8 +70,8 @@ _BlockStyleDumper.add_representer(str, _represent_str)
 
 def render_values_yaml(values: Dict[str, Any]) -> str:
     """Serialise the values dict for committing. Key order is preserved for readable diffs."""
-    # width: PyYAML wraps at 80 columns by default, which splits long policy paths
-    # mid-token and undoes the readability the block style buys.
+    # width: PyYAML wraps at 80 columns by default, which splits long values mid-token and
+    # undoes the readability the block style buys.
     return yaml.dump(
         values,
         Dumper=_BlockStyleDumper,
@@ -101,14 +101,10 @@ def yaml_data_equals(yaml_data_1, yaml_data_2) -> bool:
 # --------------------------------------------------------------------------- #
 # edits to an existing file
 #
-# All of these take the parsed document and return a *new* one, leaving the input alone so
-# the caller can compare the two with `yaml_data_equals` and skip a no-op commit. None of
-# them touch `kvname`: renaming means migrating the secrets in Vault, not editing a field.
+# Takes the parsed document and returns a *new* one, leaving the input alone so the caller
+# can compare the two with `yaml_data_equals` and skip a no-op commit. It never touches
+# `kvname`: renaming means migrating the secrets in Vault, not editing a field.
 # --------------------------------------------------------------------------- #
-class ValuesEditError(ValueError):
-    """The requested edit does not apply to this file."""
-
-
 def update_kv_metadata(
     values: Dict[str, Any],
     description: Optional[str] = None,
@@ -121,74 +117,3 @@ def update_kv_metadata(
     if owner is not None:
         updated["owner"] = owner
     return updated
-
-
-def build_kubernetes_role_name(kv_name: str) -> str:
-    """Default Vault Kubernetes auth role name, e.g. ``payments-vault-secrets``."""
-    return slugify_mount_path(kv_name)
-
-
-def find_policy_name(values: Dict[str, Any], capability: str) -> str:
-    """The read or write policy name recorded in the file.
-
-    Read out of the file rather than rebuilt from the coordinates, so an edit can never
-    invent a policy name that does not exist in the committed document.
-    """
-    for policy in values.get("policies") or []:
-        name = policy.get("name", "")
-        if name.endswith(f"-{capability}"):
-            return name
-    raise ValuesEditError(f"no '{capability}' policy found in the values file")
-
-
-def add_kubernetes_auth(
-    values: Dict[str, Any],
-    role: str,
-    service_accounts: List[str],
-    namespaces: List[str],
-    capability: str,
-    ttl: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Add (or replace) a Kubernetes auth role bound to one of the mount's policies.
-
-    Upsert rather than append-only: re-adding an identical role leaves the document
-    untouched, so the caller's no-op check turns a repeat request into "nothing to do"
-    instead of a duplicate entry.
-    """
-    updated = copy.deepcopy(values)
-    role_entry: Dict[str, Any] = {
-        "role": role,
-        "service_accounts": list(service_accounts),
-        "namespaces": list(namespaces),
-        "policies": [find_policy_name(values, capability)],
-    }
-    if ttl:
-        role_entry["ttl"] = ttl
-
-    roles = updated.setdefault("kubernetes_auth", [])
-    for index, existing in enumerate(roles):
-        if existing.get("role") == role:
-            roles[index] = role_entry
-            break
-    else:
-        roles.append(role_entry)
-    return updated
-
-
-def add_group_binding(
-    values: Dict[str, Any], group: str, capability: str
-) -> Dict[str, Any]:
-    """Grant an AD group the mount's read or write policy.
-
-    Adding a group that is already bound leaves the document untouched.
-    """
-    updated = copy.deepcopy(values)
-    policy_name = find_policy_name(values, capability)
-    for policy in updated["policies"]:
-        if policy["name"] != policy_name:
-            continue
-        entities = policy.setdefault("entities", [])
-        if group not in entities:
-            entities.append(group)
-        return updated
-    raise ValuesEditError(f"policy {policy_name} disappeared while editing")

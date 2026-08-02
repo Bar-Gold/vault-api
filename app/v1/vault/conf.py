@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #   Settings for the Vault KV v1 API.
-from typing import List, Optional
+from typing import List
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -13,11 +13,6 @@ class VaultV1StaticSettings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
-    )
-
-    API_DESCRIPTION: str = Field(
-        description="Human-readable description of the Vault KV API",
-        default="Create and read HashiCorp Vault KV mounts and their policies via GitOps.",
     )
 
     API_PREFIX: str = Field(
@@ -79,17 +74,6 @@ class VaultV1StaticSettings(BaseSettings):
     CI_PIPELINE_TIMEOUT_SECONDS: float = Field(
         default=900.0,
         description="How long to wait for a running pipeline to reach a terminal status.",
-    )
-
-    # --- Defaults for the created mount ---
-    DEFAULT_KV_MAX_VERSIONS: int = Field(
-        default=10,
-        description="Default max_versions on a new KV-v2 mount when the request omits it.",
-    )
-
-    DEFAULT_DELETE_VERSION_AFTER: Optional[str] = Field(
-        default=None,
-        description="Default Vault duration string (e.g. '720h') after which versions are deleted.",
     )
 
 

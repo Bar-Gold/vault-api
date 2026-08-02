@@ -40,13 +40,6 @@ class VaultApiStaticSettings(BaseSettings):
         description="Personal/service token for the Woodpecker REST API.",
     )
 
-    # --- Vault ---
-    VAULT_URL: str = Field(description="Base URL for HashiCorp Vault.")
-
-    VAULT_TOKEN: str = Field(description="Token used to authenticate to Vault.")
-
-    TEAM_NAME: str = Field(description="Team name used as the Vault mount path prefix.")
-
     # --- Outbound HTTP ---
     HTTP_TIMEOUT_SECONDS: float = Field(
         default=30.0,

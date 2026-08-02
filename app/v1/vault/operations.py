@@ -19,7 +19,7 @@ revert PR and a second human decision.
 """
 
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import yaml
 from loguru import logger
@@ -27,12 +27,7 @@ from tashtiot_apis_library.connectors import ExternalServiceError
 
 from ...clients.bitbucket import PullRequest
 from ...clients.woodpecker import Pipeline, PipelineTimeoutError
-from ...global_conf import global_config
 from ...helpers import (
-    ValuesEditError,
-    add_group_binding,
-    add_kubernetes_auth,
-    build_kubernetes_role_name,
     build_kv_values,
     render_values_yaml,
     build_branch_name,
@@ -46,8 +41,6 @@ from .schemas import (
     PipelineInfo,
     PullRequestInfo,
     VaultKVCreate,
-    VaultKVGroupBinding,
-    VaultKVKubernetesAuth,
     VaultKVOperationResponse,
     VaultKVUpdate,
 )
@@ -65,7 +58,6 @@ class VaultOperationError(Exception):
         message: str,
         kv_name: str,
         status_code: int = 502,
-        policies: Optional[List[str]] = None,
         pull_request: Optional[PullRequest] = None,
         validation_pipeline: Optional[Pipeline] = None,
         deploy_pipeline: Optional[Pipeline] = None,
@@ -74,7 +66,6 @@ class VaultOperationError(Exception):
         self.message = message
         self.kv_name = kv_name
         self.status_code = status_code
-        self.policies = policies or []
         self.pull_request = pull_request
         self.validation_pipeline = validation_pipeline
         self.deploy_pipeline = deploy_pipeline
@@ -85,7 +76,6 @@ class VaultOperationError(Exception):
             status=OperationStatus.FAILED,
             message=self.message,
             kv_name=self.kv_name,
-            policies=self.policies,
             pull_request=_pull_request_info(self.pull_request),
             validation_pipeline=_pipeline_info(self.validation_pipeline),
             deploy_pipeline=_pipeline_info(self.deploy_pipeline),
@@ -219,7 +209,6 @@ async def _commit_via_pull_request(
     summary: str,
     description: str,
     kv_name: str,
-    policies: List[str],
     source_commit_id: Optional[str] = None,
 ) -> Tuple[PullRequest, Pipeline, Pipeline]:
     """branch -> commit -> PR -> gate 1 -> merge -> gate 2, with every rollback.
@@ -276,7 +265,6 @@ async def _commit_via_pull_request(
             f"Validation pipeline did not complete: {timeout_error.message}",
             kv_name=kv_name,
             status_code=504,
-            policies=policies,
             pull_request=pull_request,
             validation_pipeline=timeout_error.pipeline,
         ) from timeout_error
@@ -286,7 +274,6 @@ async def _commit_via_pull_request(
         raise VaultOperationError(
             _pipeline_failure("Validation", validation),
             kv_name=kv_name,
-            policies=policies,
             pull_request=pull_request,
             validation_pipeline=validation,
         )
@@ -303,7 +290,6 @@ async def _commit_via_pull_request(
             f"Pull request {pull_request.id} passed validation but could not be merged: "
             f"{merge_error.detail}",
             kv_name=kv_name,
-            policies=policies,
             pull_request=pull_request,
             validation_pipeline=validation,
         ) from merge_error
@@ -321,7 +307,6 @@ async def _commit_via_pull_request(
             f"The change is already merged to {base_branch}.",
             kv_name=kv_name,
             status_code=504,
-            policies=policies,
             pull_request=merged,
             validation_pipeline=validation,
             deploy_pipeline=timeout_error.pipeline,
@@ -332,7 +317,6 @@ async def _commit_via_pull_request(
             f"{_pipeline_failure('Deploy', deploy)}. "
             f"The change is already merged to {base_branch} and needs a revert.",
             kv_name=kv_name,
-            policies=policies,
             pull_request=merged,
             validation_pipeline=validation,
             deploy_pipeline=deploy,
@@ -367,7 +351,6 @@ async def create_kv_mount_operation(
             f"- description: {payload.kv_description}\n"
         ),
         kv_name=kv_name,
-        policies=[],
     )
 
     return VaultKVOperationResponse(
@@ -439,18 +422,7 @@ async def _edit_values_operation(
     path = values_file_path(config.VAULT_VALUES_DIR, kv_name)
 
     current = await _read_values(bitbucket, path, kv_name)
-
-    try:
-        updated = mutate(current)
-    except ValuesEditError as edit_error:
-        # The document does not support the edit (e.g. no write policy to bind to).
-        raise VaultOperationError(
-            f"Cannot edit {kv_name}: {edit_error}",
-            kv_name=kv_name,
-            status_code=422,
-        ) from edit_error
-
-    policies = [policy.get("name", "") for policy in updated.get("policies") or []]
+    updated = mutate(current)
 
     if yaml_data_equals(current, updated):
         logger.info(f"No change required for {kv_name}; skipping the pull request")
@@ -458,7 +430,6 @@ async def _edit_values_operation(
             status=OperationStatus.SUCCEEDED,
             message=f"No changes required for {kv_name}",
             kv_name=kv_name,
-            policies=policies,
         )
 
     # Editing an existing file needs Bitbucket's optimistic-lock token for that path.
@@ -475,7 +446,6 @@ async def _edit_values_operation(
         summary=summary,
         description=description,
         kv_name=kv_name,
-        policies=policies,
         source_commit_id=source_commit_id,
     )
 
@@ -483,7 +453,6 @@ async def _edit_values_operation(
         status=OperationStatus.SUCCEEDED,
         message=success_message,
         kv_name=kv_name,
-        policies=policies,
         pull_request=_pull_request_info(merged),
         validation_pipeline=_pipeline_info(validation),
         deploy_pipeline=_pipeline_info(deploy),
@@ -521,70 +490,6 @@ async def update_kv_mount_operation(
             f"Automated by vault-api.\n\n- kv: `{kv_name}`\n- changes: {changes}\n"
         ),
         success_message=f"Successful update of {kv_name}",
-        branch_suffix=branch_suffix,
-    )
-
-
-async def add_kubernetes_auth_operation(
-    bitbucket: Any,
-    woodpecker: Any,
-    kv_name: str,
-    payload: VaultKVKubernetesAuth,
-    branch_suffix: Optional[str] = None,
-) -> VaultKVOperationResponse:
-    """Bind a Kubernetes service account to one of the KV's policies."""
-    role = payload.role or build_kubernetes_role_name(kv_name)
-
-    return await _edit_values_operation(
-        bitbucket,
-        woodpecker,
-        kv_name=kv_name,
-        mutate=lambda values: add_kubernetes_auth(
-            values,
-            role=role,
-            service_accounts=payload.service_accounts,
-            namespaces=payload.namespaces,
-            capability=payload.capability.value,
-            ttl=payload.ttl,
-        ),
-        summary=f"Add Kubernetes auth role {role} to {kv_name}",
-        description=(
-            f"Automated by vault-api.\n\n"
-            f"- kv: `{kv_name}`\n"
-            f"- role: `{role}` ({payload.capability.value})\n"
-            f"- service accounts: {', '.join(payload.service_accounts)}\n"
-            f"- namespaces: {', '.join(payload.namespaces)}\n"
-        ),
-        success_message=f"Successful addition of Kubernetes auth role {role} to {kv_name}",
-        branch_suffix=branch_suffix,
-    )
-
-
-async def add_group_binding_operation(
-    bitbucket: Any,
-    woodpecker: Any,
-    kv_name: str,
-    payload: VaultKVGroupBinding,
-    branch_suffix: Optional[str] = None,
-) -> VaultKVOperationResponse:
-    """Grant an AD group one of the KV's policies."""
-    return await _edit_values_operation(
-        bitbucket,
-        woodpecker,
-        kv_name=kv_name,
-        mutate=lambda values: add_group_binding(
-            values, group=payload.group, capability=payload.capability.value
-        ),
-        summary=f"Grant {payload.group} {payload.capability.value} access to {kv_name}",
-        description=(
-            f"Automated by vault-api.\n\n"
-            f"- kv: `{kv_name}`\n"
-            f"- group: `{payload.group}`\n"
-            f"- capability: {payload.capability.value}\n"
-        ),
-        success_message=(
-            f"Successful addition of {payload.group} ({payload.capability.value}) to {kv_name}"
-        ),
         branch_suffix=branch_suffix,
     )
 
