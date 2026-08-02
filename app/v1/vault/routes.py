@@ -9,6 +9,7 @@ from .conf import config
 from .operations import (
     VaultOperationError,
     create_kv_mount_operation,
+    create_kv_pull_request_operation,
     get_kv_mount_operation,
     update_kv_mount_operation,
 )
@@ -76,6 +77,27 @@ def get_v1_vault_router(bitbucket: Any, woodpecker: Any) -> APIRouter:
     async def create(payload: VaultKVCreate):
         logger.info(f"Creating KV {payload.kv_name}")
         return await _execute(create_kv_mount_operation(bitbucket, woodpecker, payload))
+
+    # Registered before the `/{kv_name:path}` routes. There is no POST on that path today,
+    # so nothing is ambiguous — but if one is ever added, this fixed segment must keep
+    # winning, or a KV named "pull-request" would shadow this endpoint.
+    @router.post(
+        "/pull-request",
+        response_model=VaultKVOperationResponse,
+        status_code=201,
+        summary="Open a pull request for a new KV, without waiting for CI",
+        description=(
+            "Commits the same file as a create and opens the same pull request, then "
+            "returns immediately — no validation pipeline, no merge, no deploy pipeline. "
+            "The pull request is left OPEN for a human to review and merge, so nothing "
+            "reaches the base branch. Use this when you want the request to answer in one "
+            "round-trip instead of blocking for the whole chain. The duplicate guard still "
+            "applies, and a failure still deletes the branch it created."
+        ),
+    )
+    async def create_pull_request_only(payload: VaultKVCreate):
+        logger.info(f"Opening a pull request for KV {payload.kv_name} (no CI, no merge)")
+        return await _execute(create_kv_pull_request_operation(bitbucket, payload))
 
     @router.patch(
         "/{kv_name:path}",

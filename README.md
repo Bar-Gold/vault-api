@@ -96,7 +96,8 @@ POST /api/vault/v1/kv/
 ```
 
 **The request blocks for the whole chain.** That is deliberate (the endpoint's contract is the
-final answer, not a job handle), but it has two consequences:
+final answer, not a job handle) — see `POST /pull-request` below for the non-blocking
+alternative — but it has two consequences:
 
 - any proxy/ingress in front of this service needs a read timeout larger than
   `CI_PIPELINE_START_TIMEOUT_SECONDS + 2 × CI_PIPELINE_TIMEOUT_SECONDS`;
@@ -132,8 +133,31 @@ description: payments secrets
 
 | Route | Purpose |
 |-------|---------|
+| `POST /api/vault/v1/kv/pull-request` | open the pull request and stop — no CI wait, no merge |
 | `GET /api/vault/v1/kv/{kv_name}` | the committed file (404 if absent) |
 | `PATCH /api/vault/v1/kv/{kv_name}` | change `description` and/or `owner` |
+
+### `POST /pull-request` — the non-blocking half
+
+Same body as a create, same duplicate guard, same commit, same pull request — then it
+**returns**, answering `201` in one round-trip instead of blocking for two pipelines:
+
+```jsonc
+{"kv_name": "myapp", "kv_description": "payments secrets"}
+// -> 201 {"status":"Succeeded", "pull_request":{"id":42,"state":"OPEN"},
+//         "validation_pipeline":null, "deploy_pipeline":null}
+```
+
+Nothing reaches the base branch — a human reviews and merges. Rollbacks still apply: a failed
+commit or a failed PR deletes the branch it created.
+
+Two behaviours to know, both intentional:
+
+- **CI still runs.** Opening a pull request triggers the validation pipeline in the forge like
+  any other PR. This endpoint simply does not *wait* for it, which is why the pipeline fields
+  come back `null` — nothing was observed, not nothing happened.
+- **Calling it twice for the same name opens two pull requests.** The duplicate guard checks
+  the base branch, and an unmerged PR is not on it. Reviewers close the loser.
 
 `PATCH` runs the **same** pull request → CI → merge → CI chain as a create, and answers `200`.
 Two behaviours worth relying on:

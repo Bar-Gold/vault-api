@@ -199,6 +199,57 @@ async def _assert_absent(bitbucket: Any, path: str, kv_name: str) -> None:
 # --------------------------------------------------------------------------- #
 # operations
 # --------------------------------------------------------------------------- #
+async def _open_pull_request(
+    bitbucket: Any,
+    *,
+    path: str,
+    content: str,
+    branch: str,
+    summary: str,
+    description: str,
+    kv_name: str,
+    source_commit_id: Optional[str] = None,
+) -> PullRequest:
+    """branch -> commit -> open PR, and nothing after that.
+
+    Both rollbacks live here: a failed commit or a failed PR deletes the branch, so a
+    failure leaves the repo exactly as it was found. Touches no CI and never merges.
+
+    Shared by `_commit_via_pull_request` (which goes on to gate and merge) and
+    `create_kv_pull_request_operation` (which stops here). One implementation means the
+    two cannot drift apart in what they roll back.
+    """
+    base_branch = config.VAULT_VALUES_REPO_BASE_BRANCH
+
+    await bitbucket.create_branch(branch, base_branch)
+    try:
+        await bitbucket.put_file(
+            path=path,
+            branch=branch,
+            content=content,
+            message=summary,
+            source_commit_id=source_commit_id,
+        )
+    except Exception:
+        await _delete_branch_quietly(bitbucket, branch)
+        raise
+
+    try:
+        pull_request = await bitbucket.create_pull_request(
+            title=summary,
+            description=description,
+            from_branch=branch,
+            to_branch=base_branch,
+            reviewers=config.PR_REVIEWERS,
+        )
+    except Exception:
+        await _delete_branch_quietly(bitbucket, branch)
+        raise
+
+    logger.info(f"Opened pull request {pull_request.id} for {kv_name}")
+    return pull_request
+
+
 async def _commit_via_pull_request(
     bitbucket: Any,
     woodpecker: Any,
@@ -223,36 +274,20 @@ async def _commit_via_pull_request(
     base_branch = config.VAULT_VALUES_REPO_BASE_BRANCH
 
     # Watermark before anything can trigger CI, so we never match a pre-existing pipeline.
+    # This has to precede the branch creation, hence not folding it into _open_pull_request.
     baseline = await _latest_pipeline_number(woodpecker)
 
-    # ---- 1. branch + commit ------------------------------------------------ #
-    await bitbucket.create_branch(branch, base_branch)
-    try:
-        await bitbucket.put_file(
-            path=path,
-            branch=branch,
-            content=content,
-            message=summary,
-            source_commit_id=source_commit_id,
-        )
-    except Exception:
-        await _delete_branch_quietly(bitbucket, branch)
-        raise
-
-    # ---- 2. pull request --------------------------------------------------- #
-    try:
-        pull_request = await bitbucket.create_pull_request(
-            title=summary,
-            description=description,
-            from_branch=branch,
-            to_branch=base_branch,
-            reviewers=config.PR_REVIEWERS,
-        )
-    except Exception:
-        await _delete_branch_quietly(bitbucket, branch)
-        raise
-
-    logger.info(f"Opened pull request {pull_request.id} for {kv_name}")
+    # ---- 1-2. branch + commit + pull request ------------------------------- #
+    pull_request = await _open_pull_request(
+        bitbucket,
+        path=path,
+        content=content,
+        branch=branch,
+        summary=summary,
+        description=description,
+        kv_name=kv_name,
+        source_commit_id=source_commit_id,
+    )
 
     # ---- 3. validation pipeline (blocks the merge) ------------------------- #
     try:
@@ -360,6 +395,51 @@ async def create_kv_mount_operation(
         pull_request=_pull_request_info(merged),
         validation_pipeline=_pipeline_info(validation),
         deploy_pipeline=_pipeline_info(deploy),
+    )
+
+
+async def create_kv_pull_request_operation(
+    bitbucket: Any,
+    payload: VaultKVCreate,
+    branch_suffix: Optional[str] = None,
+) -> VaultKVOperationResponse:
+    """Open the pull request and stop — no CI gates, no merge.
+
+    The same duplicate guard, branch, commit and pull request as a create, minus everything
+    that waits or merges. Returns as soon as Bitbucket has the PR, so it answers in one
+    round-trip instead of blocking for the length of two pipelines.
+
+    Nothing reaches the base branch: whoever reviews the pull request decides that. Note
+    that this takes no Woodpecker client at all — the argument would be dead weight.
+    """
+    kv_name = payload.kv_name
+    values = build_kv_values(kv_name, payload.kv_description)
+    path = values_file_path(config.VAULT_VALUES_DIR, kv_name)
+
+    await _assert_absent(bitbucket, path, kv_name)
+
+    pull_request = await _open_pull_request(
+        bitbucket,
+        path=path,
+        content=render_values_yaml(values),
+        branch=_branch_for(kv_name, branch_suffix),
+        summary=f"Create KV {kv_name}",
+        description=(
+            f"Automated by vault-api.\n\n"
+            f"- kv: `{kv_name}`\n"
+            f"- description: {payload.kv_description}\n"
+        ),
+        kv_name=kv_name,
+    )
+
+    return VaultKVOperationResponse(
+        status=OperationStatus.SUCCEEDED,
+        message=(
+            f"Opened pull request {pull_request.id} for {kv_name}. "
+            f"It is not merged — review, CI and merge are up to you."
+        ),
+        kv_name=kv_name,
+        pull_request=_pull_request_info(pull_request),
     )
 
 

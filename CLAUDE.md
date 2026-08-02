@@ -68,8 +68,14 @@ on the base branch (so a repeat create hits the duplicate guard). Keep both if y
 | Route | Body | Notes |
 |-------|------|-------|
 | `POST /api/vault/v1/kv/` | `{kv_name, kv_description}` | the chain below; blocks until the deploy pipeline ends |
+| `POST /api/vault/v1/kv/pull-request` | `{kv_name, kv_description}` | steps 1-3 only: opens the PR and returns. No CI wait, no merge |
 | `GET /api/vault/v1/kv/{kv_name}` | — | the committed file, parsed YAML returned as-is (not a schema) |
 | `PATCH /api/vault/v1/kv/{kv_name}` | `{kv_description?, owner?}` | edits those two keys in place |
+
+**`/pull-request` is a fixed segment registered before the `{kv_name:path}` routes.** There is
+no POST on that path today so nothing is ambiguous, but if one is ever added this route must
+keep winning — otherwise a KV named `pull-request` shadows the endpoint. A `GET` on the same
+URL is still a normal read of a KV named `pull-request`; the two coexist.
 
 `API_PREFIX` (default `/api/vault/v1/kv`) comes from `app/v1/vault/conf.py`.
 
@@ -149,6 +155,15 @@ unreadable in the pull request diff a human is supposed to review. Only a multi-
 
 ## The create chain — read this before editing `operations.py`
 
+**Two shared helpers, nested.** `_open_pull_request` owns branch → commit → PR and both of
+their rollbacks (either failure deletes the branch). `_commit_via_pull_request` calls it and
+then adds the gates and the merge. So there are three callers in total: the full create and
+update go through `_commit_via_pull_request`; `create_kv_pull_request_operation` stops at
+`_open_pull_request`. One implementation each means the rollback shape cannot drift.
+
+The baseline watermark is taken **before** `_open_pull_request` and deliberately not folded
+into it — it has to precede the branch creation, and the PR-only path has no use for it.
+
 **One chain, two callers.** `_commit_via_pull_request` owns steps 2-6 below and is shared by
 create and update, so the rollback asymmetry cannot drift apart between operations.
 Create adds the duplicate guard in front; update goes through `_edit_values_operation`, which
@@ -178,6 +193,17 @@ There is **no transaction**; each step hand-rolls its own rollback:
 
 **Step 5 is the point of no return.** Preserve that asymmetry when editing. Rollback failures are
 logged and never raised over the original error.
+
+`create_kv_pull_request_operation` runs the duplicate guard and steps 2-3, then returns 201
+with the PR `OPEN`. It takes **no Woodpecker client** — the argument would be dead weight.
+Two consequences, both deliberate and both pinned by tests:
+
+- **Opening a PR still triggers CI in the forge.** The endpoint does not suppress the
+  validation pipeline; it just does not wait for it. The response's pipeline fields are `null`
+  because nothing was *observed*, not because nothing ran.
+- **A repeat call opens a second PR.** The duplicate guard reads the base branch, and an
+  unmerged PR is not there, so it cannot see the first one. Catching it would mean listing
+  open PRs — a different and inherently racy check. Reviewers close the loser.
 
 Two details that are easy to break:
 - **The version re-read before merging/declining.** Bitbucket's `version` is an optimistic lock
@@ -242,8 +268,10 @@ hangs until the timeout. Only `success` counts as success.
 ## Notes
 
 - The create endpoint **blocks** for the whole chain. Any proxy in front needs a read timeout
-  above `CI_PIPELINE_START_TIMEOUT_SECONDS + 2 × CI_PIPELINE_TIMEOUT_SECONDS`.
-- Status codes: 201 create, 200 edits and reads, 409 duplicate, 404 unknown mount, 502
+  above `CI_PIPELINE_START_TIMEOUT_SECONDS + 2 × CI_PIPELINE_TIMEOUT_SECONDS`. `/pull-request`
+  is the escape hatch when that is unacceptable: it answers in one round-trip (~100ms against
+  the stub) and hands the merge to a human.
+- Status codes: 201 create and PR-only, 200 edits and reads, 409 duplicate, 404 unknown mount, 502
   pipeline/transport failure, 504 pipeline or upstream timeout, 422 request validation.
   Failures reuse `VaultKVOperationResponse` via `VaultOperationError.to_response()`; every
   mutating route funnels through `_execute` in `routes.py`, which is the single place that
@@ -254,7 +282,7 @@ hangs until the timeout. Only `success` counts as success.
   the failure path silently omits it unless `to_response()` is updated too.
 - The committed document (`kvname` / `description`) is the contract with the deploy
   pipeline — change `build_kv_values` and the pipeline together.
-- Tests: 166 of them. `tests/test_helpers.py` (pure, no library import), `tests/clients/` (both
+- Tests: 183 of them. `tests/test_helpers.py` (pure, no library import), `tests/clients/` (both
   clients plus `http.py`'s error mapping, against their real REST shapes via respx),
   `tests/v1/vault/` (schemas, the chain + rollbacks with duck-typed fakes from `tests/fakes.py`,
   and routes end-to-end through `TestClient`). Two conftest details to respect:
