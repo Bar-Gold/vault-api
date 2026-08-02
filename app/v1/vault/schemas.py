@@ -27,10 +27,20 @@ class VaultKVCreate(BaseModel):
     business, so none of it is modelled here.
     """
 
+    # Without an explicit example, Swagger UI synthesises one from `pattern` and renders an
+    # unreadable regex-derived string in the "Example Value" box. These give it something a
+    # human can edit.
+    model_config = {
+        "json_schema_extra": {
+            "example": {"kv_name": "myapp", "kv_description": "payments secrets"}
+        }
+    }
+
     kv_name: str = Field(
         ...,
         max_length=128,
         pattern=KV_NAME_PATTERN,
+        examples=["myapp"],
         description=(
             "Name of the KV. Used verbatim, and may be a multi-segment path such as "
             "'payments/vault-secrets'. Becomes the committed file name."
@@ -41,6 +51,7 @@ class VaultKVCreate(BaseModel):
         ...,
         min_length=1,
         max_length=256,
+        examples=["payments secrets"],
         description="What this KV is for. Recorded in the committed file.",
     )
 
@@ -58,15 +69,21 @@ class VaultKVUpdate(BaseModel):
     `kv_name` comes from the URL path; the body carries only the change.
     """
 
+    model_config = {
+        "json_schema_extra": {"example": {"kv_description": "payments secrets, rotated quarterly"}}
+    }
+
     kv_description: Optional[str] = Field(
         default=None,
         max_length=256,
+        examples=["payments secrets, rotated quarterly"],
         description="Replacement description.",
     )
 
     owner: Optional[str] = Field(
         default=None,
         max_length=128,
+        examples=["team-payments@example.com"],
         description="Owner recorded in the file, if the file carries one.",
     )
 
