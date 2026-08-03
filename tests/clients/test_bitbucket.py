@@ -110,6 +110,77 @@ async def test_put_file_includes_source_commit_id_when_editing(bitbucket):
     assert "old-sha" in sent
 
 
+# --------------------------------------------------------------------------- #
+# listing — the cross-file duplicate scan depends on this
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_list_files_returns_paths_relative_to_the_directory(bitbucket):
+    route = respx.get(f"{API}/files/kv").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "values": ["payments.yaml", "infra.yaml"],
+                "size": 2,
+                "isLastPage": True,
+            },
+        )
+    )
+
+    files = await bitbucket.list_files("kv", at="master")
+
+    assert files == ["payments.yaml", "infra.yaml"]
+    assert route.calls.last.request.url.params["at"] == "master"
+
+
+@respx.mock
+async def test_list_files_follows_pagination(bitbucket):
+    """Bitbucket will not return a large directory in one page."""
+    pages = [
+        httpx.Response(
+            200,
+            json={
+                "values": ["a.yaml", "b.yaml"],
+                "size": 2,
+                "isLastPage": False,
+                "nextPageStart": 2,
+            },
+        ),
+        httpx.Response(
+            200, json={"values": ["c.yaml"], "size": 1, "isLastPage": True}
+        ),
+    ]
+    route = respx.get(f"{API}/files/kv").mock(side_effect=pages)
+
+    files = await bitbucket.list_files("kv")
+
+    assert files == ["a.yaml", "b.yaml", "c.yaml"]
+    assert route.call_count == 2
+    assert route.calls[1].request.url.params["start"] == "2"
+
+
+@respx.mock
+async def test_list_files_treats_a_missing_directory_as_empty(bitbucket):
+    """The values dir legitimately does not exist before the first store is created."""
+    respx.get(f"{API}/files/kv").mock(
+        return_value=httpx.Response(404, json={"errors": [{"message": "not found"}]})
+    )
+
+    assert await bitbucket.list_files("kv") == []
+
+
+@respx.mock
+async def test_list_files_propagates_a_real_failure(bitbucket):
+    """Only a 404 is benign; a 500 must not look like an empty directory."""
+    respx.get(f"{API}/files/kv").mock(
+        return_value=httpx.Response(500, json={"errors": [{"message": "boom"}]})
+    )
+
+    with pytest.raises(ExternalServiceError) as exc_info:
+        await bitbucket.list_files("kv")
+
+    assert exc_info.value.status_code == 500
+
+
 @respx.mock
 async def test_get_file_content_returns_raw_text_at_ref(bitbucket):
     route = respx.get(f"{API}/raw/kv/prod/myapp.yaml").mock(

@@ -8,9 +8,9 @@ A create request is not a direct write to Vault. It opens a pull request against
 repo, waits for CI to validate it, merges it, and waits for the deploy pipeline that applies
 the change — then answers `Successful creation of <kv name>`.
 
-**The service knows nothing about Vault.** It commits a two-key document and reports what the
-pipelines did with it; mounts, engine versions and policies are the deploy pipeline's
-business.
+**The service knows nothing about Vault.** It appends an entry to a values file holding a
+list of KV stores, and reports what the pipelines did with it; mounts, engine versions and
+policies are the deploy pipeline's business.
 
 ---
 
@@ -83,9 +83,9 @@ The index URLs embed a `user:token`, so **`uv.toml` is gitignored** — keep it 
 ```
 POST /api/vault/v1/kv/
   │
-  ├─ 0. reject if the values file already exists on the base branch        -> 409
-  ├─ 1. create branch  vault-kv/<kv-name>-<rand>
-  ├─ 2. commit         kv/<kv-name>.yaml
+  ├─ 0. reject if the store name is used in ANY file on the base branch    -> 409
+  ├─ 1. create branch  vault-kv/<file>-<kv-name>-<rand>
+  ├─ 2. commit         kv/<file>.yaml   (append to kvStores; create if first)
   ├─ 3. open pull request -> base branch
   ├─ 4. WAIT for the Woodpecker `pull_request` pipeline  ── fails ──> decline PR + delete branch -> 502
   │                                                      ── times out ─> decline PR + delete branch -> 504
@@ -110,40 +110,66 @@ alternative — but it has two consequences:
 ```jsonc
 POST /api/vault/v1/kv/
 {
-  "kv_name": "myapp",              // ^[a-z0-9]+(-[a-z0-9]+)*(/...)*$, <=128 chars
-  "kv_description": "payments secrets"
+  "file": "payments",              // which values file; ^[a-z0-9]+(-[a-z0-9]+)*$
+  "kv_name": "myapp",              // unique across ALL files; same pattern, no slash
+  "kv_description": "payments secrets",
+  "roles": {                       // required: >=1 role with >=1 host
+    "read":  ["app01.corp.example.com"],
+    "write": ["app02.corp.example.com"]    // either key, or both
+  }
 }
 ```
 
-Two fields, and that is the whole request. `kv_name` is used verbatim and may be a
-multi-segment path (`payments/vault-secrets`), which nests the committed file to match. The
-pattern also blocks `..`, so a name can never escape the values directory.
+`file` is the only field that reaches a filesystem path, and its pattern blocks `..` and
+slashes, so a request can never escape the values directory. `kv_name` is a value inside the
+document; it is single-segment because the read/update routes address a store as
+`{file}/{kv_name}`.
 
-### The committed file (`kv/myapp.yaml`)
+### The committed file (`kv/payments.yaml`)
 
-This is the contract with the deploy pipeline — **change it in lockstep with the pipeline
-that consumes it**:
+**One file holds many stores.** A create appends to the `kvStores` list, creating the file
+only if this is its first store. This is the contract with the deploy pipeline — **change it
+in lockstep with the pipeline that consumes it**:
 
 ```yaml
-kvname: myapp
-description: payments secrets
+kvStores:
+  - name: myapp
+    description: payments secrets
+    roles:
+      read:
+        - app01.corp.example.com
+      write:
+        - app02.corp.example.com
+  - name: billing
+    description: billing secrets
+    roles:
+      read:
+        - app03.corp.example.com
+        - app04.corp.example.com
 ```
+
+`read` and `write` are **separate keys** — a store may carry either, or both. The combined
+string `read/write` is not a role and is rejected with `422`. `ALLOWED_ROLE_KEYS` in
+`app/v1/vault/schemas.py` is the single place to change if the pipeline ever wants a
+different set of role names.
 
 ### Other routes
 
 | Route | Purpose |
 |-------|---------|
 | `POST /api/vault/v1/kv/pull-request` | open the pull request and stop — no CI wait, no merge |
-| `GET /api/vault/v1/kv/{kv_name}` | the committed file (404 if absent) |
-| `PATCH /api/vault/v1/kv/{kv_name}` | change `description` and/or `owner` |
+| `GET /api/vault/v1/kv/{file}` | the whole values file (404 if absent) |
+| `GET /api/vault/v1/kv/{file}/{kv_name}` | one store out of it |
+| `PATCH /api/vault/v1/kv/{file}/{kv_name}` | change one store's `description` and/or `roles` |
 
 ### `POST /pull-request` — the non-blocking half
 
-Same body as a create, same duplicate guard, same commit, same pull request — then it
+Same body as a create, same uniqueness check, same commit, same pull request — then it
 **returns**, answering `201` in one round-trip instead of blocking for two pipelines:
 
 ```jsonc
-{"kv_name": "myapp", "kv_description": "payments secrets"}
+{"file": "payments", "kv_name": "myapp", "kv_description": "payments secrets",
+ "roles": {"read": ["app01.corp.example.com"]}}
 // -> 201 {"status":"Succeeded", "pull_request":{"id":42,"state":"OPEN"},
 //         "validation_pipeline":null, "deploy_pipeline":null}
 ```
@@ -156,21 +182,31 @@ Two behaviours to know, both intentional:
 - **CI still runs.** Opening a pull request triggers the validation pipeline in the forge like
   any other PR. This endpoint simply does not *wait* for it, which is why the pipeline fields
   come back `null` — nothing was observed, not nothing happened.
-- **Calling it twice for the same name opens two pull requests.** The duplicate guard checks
-  the base branch, and an unmerged PR is not on it. Reviewers close the loser.
+- **Calling it twice for the same name opens two pull requests.** The name scan reads the base
+  branch, and an unmerged PR is not on it. Reviewers close the loser.
 
 `PATCH` runs the **same** pull request → CI → merge → CI chain as a create, and answers `200`.
-Two behaviours worth relying on:
+Three behaviours worth relying on:
 
+- **Only the named store changes.** Its siblings in the file are written back untouched.
+- **`roles` is replaced wholesale**, not merged — otherwise a host could never be removed.
 - **An edit that changes nothing opens no pull request.** Re-applying the same change returns
   `Succeeded` with `"No changes required for <kv name>"` and `pull_request: null`.
 - **`PATCH` cannot rename.** The name is fixed at creation, because renaming means migrating
   the secrets in Vault, not editing a field.
 
 ```jsonc
-// PATCH /api/vault/v1/kv/myapp
-{"kv_description": "new text"}          // and/or {"owner": "team-dl@example.com"}
+// PATCH /api/vault/v1/kv/payments/myapp
+{"kv_description": "new text"}
+{"roles": {"read": ["app02.corp.example.com"]}}    // or both
 ```
+
+### Uniqueness
+
+Store names are global to Vault, so a create scans **every** file in the values directory and
+returns `409` if the name is used anywhere — not just in the target file. That costs a
+directory listing plus a read per file. It is a check, not a lock: two creates in flight both
+pass it and the second pull request conflicts at merge, which a human resolves.
 
 ---
 

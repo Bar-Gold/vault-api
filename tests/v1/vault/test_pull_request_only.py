@@ -8,6 +8,7 @@ import pytest
 import yaml
 from tashtiot_apis_library.connectors import ExternalServiceError
 
+from app.helpers import build_kv_store, build_kv_stores_document, render_values_yaml
 from app.v1.vault.conf import config
 from app.v1.vault.operations import (
     VaultOperationError,
@@ -16,8 +17,25 @@ from app.v1.vault.operations import (
 from app.v1.vault.schemas import VaultKVCreate
 
 KV = "myapp"
-VALUES_PATH = "kv/myapp.yaml"
+FILE = "payments"
+VALUES_PATH = "kv/payments.yaml"
+ROLES = {"read": ["app01.corp.example.com"]}
 PR_URL = f"{config.API_PREFIX}/pull-request"
+
+CREATE_BODY = {
+    "file": FILE,
+    "kv_name": KV,
+    "kv_description": "payments secrets",
+    "roles": ROLES,
+}
+
+
+def _file_with(*names):
+    return render_values_yaml(
+        build_kv_stores_document(
+            [build_kv_store(n, "payments secrets", ROLES) for n in names]
+        )
+    )
 
 
 async def _open(bitbucket, payload, **kwargs):
@@ -51,7 +69,8 @@ async def test_call_order_stops_at_the_pull_request(payload, bitbucket):
     await _open(bitbucket, payload)
 
     assert bitbucket.calls == [
-        "get_file_content",  # duplicate guard
+        "list_files",  # scan every file for the name
+        "get_file_content",  # read the target file (404 -> new file)
         "create_branch",
         "put_file",
         "create_pull_request",
@@ -71,40 +90,68 @@ async def test_commits_the_same_document_as_a_full_create(payload, bitbucket):
     await _open(bitbucket, payload)
 
     assert yaml.safe_load(bitbucket.committed[VALUES_PATH]) == {
-        "kvname": KV,
-        "description": payload.kv_description,
+        "kvStores": [
+            {
+                "name": KV,
+                "description": payload.kv_description,
+                "roles": ROLES,
+            }
+        ]
     }
 
 
 async def test_commits_without_an_optimistic_lock_token(payload, bitbucket):
-    """This is a create, not an edit — sourceCommitId would make Bitbucket reject it."""
+    """A file that does not exist yet is a create — sourceCommitId would be rejected."""
     await _open(bitbucket, payload)
 
     assert bitbucket.source_commit_ids == [None]
 
 
-async def test_branch_is_flattened_for_a_multi_segment_name(bitbucket):
-    payload = VaultKVCreate(kv_name="payments/vault-secrets", kv_description="x")
+async def test_appends_to_an_existing_file(payload, bitbucket):
+    bitbucket.existing_files[VALUES_PATH] = _file_with("already-here")
+
+    await _open(bitbucket, payload)
+
+    committed = yaml.safe_load(bitbucket.committed[VALUES_PATH])
+    assert [s["name"] for s in committed["kvStores"]] == ["already-here", KV]
+    assert bitbucket.source_commit_ids == ["file-commit-sha"]
+
+
+async def test_branch_carries_both_coordinates(bitbucket):
+    payload = VaultKVCreate(
+        file="infra", kv_name="secrets-store", kv_description="x", roles=ROLES
+    )
 
     result = await _open(bitbucket, payload)
 
     stored = bitbucket.pull_requests[result.pull_request.id]
-    assert stored.from_branch == "vault-kv/payments-vault-secrets-abc123"
-    assert "kv/payments/vault-secrets.yaml" in bitbucket.committed
+    assert stored.from_branch == "vault-kv/infra-secrets-store-abc123"
+    assert "kv/infra.yaml" in bitbucket.committed
 
 
 # --------------------------------------------------------------------------- #
 # guards and rollbacks — inherited from the shared helper, so they must still hold
 # --------------------------------------------------------------------------- #
 async def test_duplicate_is_409_and_touches_nothing(payload, bitbucket):
-    bitbucket.existing_files[VALUES_PATH] = "kvname: myapp\ndescription: already here\n"
+    bitbucket.existing_files[VALUES_PATH] = _file_with(KV)
 
     with pytest.raises(VaultOperationError) as error:
         await _open(bitbucket, payload)
 
     assert error.value.status_code == 409
     assert "already exists" in error.value.message
-    assert bitbucket.calls == ["get_file_content"]
+    assert "create_branch" not in bitbucket.calls
+
+
+async def test_a_name_used_in_another_file_is_also_409(payload, bitbucket):
+    """Names are global, so the scan covers every file, not just the target."""
+    bitbucket.existing_files["kv/other-team.yaml"] = _file_with(KV)
+
+    with pytest.raises(VaultOperationError) as error:
+        await _open(bitbucket, payload)
+
+    assert error.value.status_code == 409
+    assert "create_branch" not in bitbucket.calls
 
 
 async def test_a_second_call_opens_a_second_pull_request(payload, bitbucket):
@@ -167,19 +214,16 @@ async def test_a_non_404_duplicate_check_failure_propagates(payload, bitbucket):
 # through the app
 # --------------------------------------------------------------------------- #
 def test_route_requires_a_token(client):
-    body = {"kv_name": KV, "kv_description": "x"}
-
-    assert client.post(PR_URL, json=body).status_code == 401
+    assert client.post(PR_URL, json=CREATE_BODY).status_code == 401
 
 
 def test_route_returns_201_and_leaves_the_pr_open(client, auth_headers, bitbucket, woodpecker):
-    response = client.post(
-        PR_URL, json={"kv_name": KV, "kv_description": "payments secrets"}, headers=auth_headers
-    )
+    response = client.post(PR_URL, json=CREATE_BODY, headers=auth_headers)
 
     assert response.status_code == 201
     body = response.json()
     assert body["status"] == "Succeeded"
+    assert body["file"] == FILE
     assert body["pull_request"]["state"] == "OPEN"
     assert body["validation_pipeline"] is None
     assert body["deploy_pipeline"] is None
@@ -190,32 +234,47 @@ def test_route_returns_201_and_leaves_the_pr_open(client, auth_headers, bitbucke
 
 def test_route_rejects_a_bad_name(client, auth_headers, bitbucket):
     response = client.post(
-        PR_URL, json={"kv_name": "My_App", "kv_description": "x"}, headers=auth_headers
+        PR_URL, json={**CREATE_BODY, "kv_name": "My_App"}, headers=auth_headers
     )
 
     assert response.status_code == 422
     assert bitbucket.calls == []
 
 
-def test_route_returns_409_for_a_duplicate(client, auth_headers, bitbucket):
-    bitbucket.existing_files[VALUES_PATH] = "kvname: myapp\ndescription: already here\n"
-
+def test_route_rejects_a_traversing_file(client, auth_headers, bitbucket):
+    """`file` is the only request field that reaches a path."""
     response = client.post(
-        PR_URL, json={"kv_name": KV, "kv_description": "x"}, headers=auth_headers
+        PR_URL, json={**CREATE_BODY, "file": "../etc/passwd"}, headers=auth_headers
     )
+
+    assert response.status_code == 422
+    assert bitbucket.calls == []
+
+
+def test_route_rejects_missing_roles(client, auth_headers, bitbucket):
+    body = {k: v for k, v in CREATE_BODY.items() if k != "roles"}
+
+    response = client.post(PR_URL, json=body, headers=auth_headers)
+
+    assert response.status_code == 422
+    assert bitbucket.calls == []
+
+
+def test_route_returns_409_for_a_duplicate(client, auth_headers, bitbucket):
+    bitbucket.existing_files[VALUES_PATH] = _file_with(KV)
+
+    response = client.post(PR_URL, json=CREATE_BODY, headers=auth_headers)
 
     assert response.status_code == 409
 
 
-def test_the_fixed_segment_is_not_swallowed_by_the_path_converter(
+def test_the_fixed_segment_is_not_swallowed_by_the_file_route(
     client, auth_headers, bitbucket
 ):
-    """POST /pull-request must hit this endpoint, not be read as a kv_name."""
-    response = client.post(
-        PR_URL, json={"kv_name": KV, "kv_description": "x"}, headers=auth_headers
-    )
+    """POST /pull-request must hit this endpoint, not be read as a file name."""
+    response = client.post(PR_URL, json=CREATE_BODY, headers=auth_headers)
 
     assert response.status_code == 201
-    # A GET on the same path is a *read* of a KV literally named "pull-request", which is
-    # a legal name — so the two coexist without either shadowing the other.
+    # A GET on the same path is a *read* of a file literally named "pull-request", which
+    # is a legal name — so the two coexist without either shadowing the other.
     assert client.get(PR_URL, headers=auth_headers).status_code == 404

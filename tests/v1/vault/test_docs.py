@@ -57,7 +57,8 @@ def test_openapi_is_reachable_and_lists_the_routes(client):
 
     assert response.status_code == 200
     paths = response.json()["paths"]
-    assert any("/kv/pull-request" in p for p in paths)
+    assert any(p.endswith("/kv/pull-request") for p in paths)
+    assert any(p.endswith("{file}/{kv_name}") for p in paths)
 
 
 def test_create_schema_carries_a_readable_example(client):
@@ -66,8 +67,14 @@ def test_create_schema_carries_a_readable_example(client):
     schemas = client.get("/openapi.json").json()["components"]["schemas"]
     create = schemas["VaultKVCreate"]
 
-    assert create["example"] == {"kv_name": "myapp", "kv_description": "payments secrets"}
+    assert create["example"] == {
+        "file": "payments",
+        "kv_name": "myapp",
+        "kv_description": "payments secrets",
+        "roles": {"read": ["app01.corp.example.com"]},
+    }
     assert create["properties"]["kv_name"]["examples"] == ["myapp"]
+    assert create["properties"]["file"]["examples"] == ["payments"]
 
 
 def test_update_schema_carries_an_example(client):
@@ -75,7 +82,9 @@ def test_update_schema_carries_an_example(client):
     update = schemas["VaultKVUpdate"]
 
     assert "example" in update
-    assert update["properties"]["owner"]["examples"] == ["team-payments@example.com"]
+    assert update["properties"]["roles"]["examples"] == [
+        {"read": ["app01.corp.example.com"]}
+    ]
 
 
 def test_the_create_example_is_actually_valid(client):

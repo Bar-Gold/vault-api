@@ -53,6 +53,22 @@ class FakeBitbucket:
             )
         return self.existing_files[path]
 
+    async def list_files(
+        self, directory: str, at: Optional[str] = None, page_size: int = 1000
+    ) -> List[str]:
+        """Paths under `directory`, relative to it — mirrors the real client's contract.
+
+        The real one turns a 404 into an empty list, so this returns [] for a directory
+        with nothing in it rather than raising.
+        """
+        self._record("list_files")
+        prefix = directory.strip("/") + "/"
+        return sorted(
+            path[len(prefix):]
+            for path in self.existing_files
+            if path.startswith(prefix)
+        )
+
     async def create_branch(self, name: str, start_point: str) -> Dict[str, Any]:
         self._record("create_branch")
         return {"id": f"refs/heads/{name}"}

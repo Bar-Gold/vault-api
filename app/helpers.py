@@ -10,42 +10,101 @@ pipeline's business.
 """
 
 import copy
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 
+# Top-level key of the committed document. A file holds a *list* of KV stores under it.
+KV_STORES_KEY = "kvStores"
+
 
 def slugify_mount_path(mount_path: str) -> str:
-    """Flatten a mount path into a single dash-separated token.
+    """Flatten a path into a single dash-separated token.
 
-    Branch names cannot contain a slash without nesting the ref, so a KV named
-    ``payments/vault-secrets`` becomes ``payments-vault-secrets``.
+    Branch names cannot contain a slash without nesting the ref. Names and files are
+    single-segment now, so this is belt-and-braces rather than load-bearing.
     """
     return mount_path.strip("/").replace("/", "-")
 
 
-def build_branch_name(kv_name: str, suffix: str, prefix: str) -> str:
-    """Short-lived branch the file is committed to before the PR is opened.
+def build_branch_name(file: str, kv_name: str, suffix: str, prefix: str) -> str:
+    """Short-lived branch the change is committed to before the PR is opened.
 
-    The name is flattened: a slash in `kv_name` would nest the ref, and git cannot hold
-    both ``vault-kv/payments`` and ``vault-kv/payments/secrets-abc``.
+    Carries both coordinates so a reviewer can tell from the branch name alone which file
+    and which store a pull request touches.
     """
-    return f"{prefix}/{slugify_mount_path(kv_name)}-{suffix}"
+    return f"{prefix}/{slugify_mount_path(file)}-{slugify_mount_path(kv_name)}-{suffix}"
 
 
-def values_file_path(values_dir: str, kv_name: str) -> str:
-    """Repo-relative path of the committed file, e.g. ``kv/myapp.yaml``."""
-    return f"{values_dir.strip('/')}/{kv_name.strip('/')}.yaml"
+def values_file_path(values_dir: str, file: str) -> str:
+    """Repo-relative path of the committed file, e.g. ``kv/payments.yaml``.
 
-
-def build_kv_values(kv_name: str, kv_description: str) -> Dict[str, Any]:
-    """The committed document: the name and what it is for.
-
-    This is the contract with the deploy pipeline. Everything the KV means in Vault - the
-    mount, the engine version, the policies - is the pipeline's business, not this
-    service's, so none of it is written here. Change this dict and the pipeline together.
+    Keyed on the *file*, not the store name: one file holds many stores.
     """
-    return {"kvname": kv_name, "description": kv_description}
+    return f"{values_dir.strip('/')}/{file.strip('/')}.yaml"
+
+
+def build_kv_store(
+    kv_name: str, kv_description: str, roles: Dict[str, List[str]]
+) -> Dict[str, Any]:
+    """One entry in the ``kvStores`` list.
+
+    This is the contract with the deploy pipeline. What the KV means in Vault — the mount,
+    the engine version, the policies — is the pipeline's business, not this service's, so
+    none of it is written here. Change this dict and the pipeline together.
+    """
+    return {
+        "name": kv_name,
+        "description": kv_description,
+        "roles": {role: list(hosts) for role, hosts in roles.items()},
+    }
+
+
+def build_kv_stores_document(stores: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """A whole values file: the ``kvStores`` list and nothing else."""
+    return {KV_STORES_KEY: list(stores)}
+
+
+def read_kv_stores(values: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The store list out of a parsed document, tolerating an empty or absent key.
+
+    A file that exists but has ``kvStores:`` with nothing under it parses to ``None``, which
+    is a legitimate empty file rather than a corrupt one.
+    """
+    if not values:
+        return []
+    stores = values.get(KV_STORES_KEY)
+    return list(stores) if stores else []
+
+
+def find_kv_store(values: Dict[str, Any], kv_name: str) -> Optional[Dict[str, Any]]:
+    """The entry with this name, or None. Names are unique within a file."""
+    for store in read_kv_stores(values):
+        if isinstance(store, dict) and store.get("name") == kv_name:
+            return store
+    return None
+
+
+def kv_store_names(values: Optional[Dict[str, Any]]) -> List[str]:
+    """Every store name in a document, for the cross-file duplicate scan."""
+    return [
+        store["name"]
+        for store in read_kv_stores(values)
+        if isinstance(store, dict) and store.get("name")
+    ]
+
+
+def add_kv_store(
+    values: Optional[Dict[str, Any]], store: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Append a store to a document, returning a **new** one.
+
+    Accepts None so the caller can treat "the file does not exist yet" and "the file exists
+    and we are appending" as the same code path.
+    """
+    stores = [copy.deepcopy(existing) for existing in read_kv_stores(values)]
+    stores.append(copy.deepcopy(store))
+    return build_kv_stores_document(stores)
 
 
 class _BlockStyleDumper(yaml.SafeDumper):
@@ -103,17 +162,34 @@ def yaml_data_equals(yaml_data_1, yaml_data_2) -> bool:
 #
 # Takes the parsed document and returns a *new* one, leaving the input alone so the caller
 # can compare the two with `yaml_data_equals` and skip a no-op commit. It never touches
-# `kvname`: renaming means migrating the secrets in Vault, not editing a field.
+# `name`: renaming means migrating the secrets in Vault, not editing a field.
 # --------------------------------------------------------------------------- #
-def update_kv_metadata(
+class KVStoreNotFound(LookupError):
+    """The named store is not in this file."""
+
+
+def update_kv_store(
     values: Dict[str, Any],
+    kv_name: str,
     description: Optional[str] = None,
-    owner: Optional[str] = None,
+    roles: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, Any]:
-    """Replace the description and/or the recorded owner."""
+    """Replace the description and/or roles of one store, leaving its siblings alone.
+
+    `roles` is replaced wholesale rather than merged: a caller that wants to drop a host
+    needs to be able to express it, and a merge would make removal impossible.
+    """
     updated = copy.deepcopy(values)
-    if description is not None:
-        updated["description"] = description
-    if owner is not None:
-        updated["owner"] = owner
-    return updated
+    stores = updated.get(KV_STORES_KEY) or []
+
+    for store in stores:
+        if not isinstance(store, dict) or store.get("name") != kv_name:
+            continue
+        if description is not None:
+            store["description"] = description
+        if roles is not None:
+            store["roles"] = {role: list(hosts) for role, hosts in roles.items()}
+        updated[KV_STORES_KEY] = stores
+        return updated
+
+    raise KVStoreNotFound(kv_name)

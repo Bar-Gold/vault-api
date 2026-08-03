@@ -10,12 +10,26 @@ pipeline, merges, waits for the deploying pipeline, and returns
 `Successful creation of <kv name>`.
 
 **Scope boundary — read this first.** The service deliberately knows nothing about Vault. It
-commits a two-key document:
+commits a file holding a **list** of KV stores:
 
 ```yaml
-kvname: myapp
-description: payments secrets
+kvStores:
+  - name: myapp
+    description: payments secrets
+    roles:
+      read:                  # `read` and `write` are separate keys; either, or both
+        - app01.corp.example.com
+      write:
+        - app02.corp.example.com
+  - name: billing            # several stores per file is the point
+    description: billing secrets
+    roles:
+      read:
+        - app03.corp.example.com
 ```
+
+**One file, many stores.** A create *appends* to `{VAULT_VALUES_DIR}/{file}.yaml`, creating
+the file only if it is the first store in it. Nothing else in that file is touched.
 
 Mounts, KV engine versions, policies, HCL — none of it is modelled here. That is the deploy
 pipeline's business. `VAULT_URL` / `VAULT_TOKEN` are required settings that **no code reads**.
@@ -67,34 +81,38 @@ on the base branch (so a repeat create hits the duplicate guard). Keep both if y
 
 | Route | Body | Notes |
 |-------|------|-------|
-| `POST /api/vault/v1/kv/` | `{kv_name, kv_description}` | the chain below; blocks until the deploy pipeline ends |
-| `POST /api/vault/v1/kv/pull-request` | `{kv_name, kv_description}` | steps 1-3 only: opens the PR and returns. No CI wait, no merge |
-| `GET /api/vault/v1/kv/{kv_name}` | — | the committed file, parsed YAML returned as-is (not a schema) |
-| `PATCH /api/vault/v1/kv/{kv_name}` | `{kv_description?, owner?}` | edits those two keys in place |
+| `POST /api/vault/v1/kv/` | `{file, kv_name, kv_description, roles}` | the chain below; blocks until the deploy pipeline ends |
+| `POST /api/vault/v1/kv/pull-request` | same body | steps 1-3 only: opens the PR and returns. No CI wait, no merge |
+| `GET /api/vault/v1/kv/{file}` | — | the whole values file, parsed YAML returned as-is (not a schema) |
+| `GET /api/vault/v1/kv/{file}/{kv_name}` | — | one entry out of that file's `kvStores` |
+| `PATCH /api/vault/v1/kv/{file}/{kv_name}` | `{kv_description?, roles?}` | edits one store; its siblings are untouched |
 
-**`/pull-request` is a fixed segment registered before the `{kv_name:path}` routes.** There is
-no POST on that path today so nothing is ambiguous, but if one is ever added this route must
-keep winning — otherwise a KV named `pull-request` shadows the endpoint. A `GET` on the same
-URL is still a normal read of a KV named `pull-request`; the two coexist.
+**`/pull-request` is a fixed segment registered before the `{file}` routes.** There is no POST
+on those paths today so nothing is ambiguous, but if one is ever added this route must keep
+winning — otherwise a file named `pull-request` shadows the endpoint. A `GET` on the same URL
+is still a normal read of a file named `pull-request`; the two coexist, and a test pins it.
 
 `API_PREFIX` (default `/api/vault/v1/kv`) comes from `app/v1/vault/conf.py`.
 
-**The create request is exactly two fields**, and `test_create_takes_exactly_two_fields`
-pins that. There is no environment and no infra-coordinates `metadata` block; the name alone
-identifies the KV, and the file lands at `{VAULT_VALUES_DIR}/{kv_name}.yaml`.
+**The create request is exactly four fields** and `test_create_takes_exactly_four_fields` pins
+that: `file`, `kv_name`, `kv_description`, `roles`. There is no environment and no
+infra-coordinates `metadata` block.
 
-**`kv_name` is used verbatim** and may be multi-segment (`payments/vault-secrets`):
+**`file` is the path-traversal guard now, not `kv_name`.** That inverted when the format
+changed — `kv_name` became a value inside the document while `file` became the thing that
+lands in `{VAULT_VALUES_DIR}/{file}.yaml`:
 
-- Both `{kv_name}` routes use a **`:path` converter**, so a slash does not end the segment.
-  Neither has a suffix after `{kv_name}`, so there is no route-collision subtlety to preserve
-  — if you ever add one (`/{kv_name:path}/something`), the converter has to backtrack to the
-  anchored suffix, and a KV literally named `team/something` becomes ambiguous.
-- `KV_NAME_PATTERN` (segments of `[a-z0-9]`/dashes joined by single slashes) is the
-  **path-traversal guard**, not just a style rule: the name lands in the file path. No
-  leading/trailing slash, no empty segment, `..` cannot match.
-- Branch names cannot contain slashes, so they go through `slugify_mount_path`
-  (`payments/vault-secrets` → `payments-vault-secrets`): git cannot hold both `vault-kv/a`
-  and `vault-kv/a/b-suffix`.
+- `FILE_PATTERN` and `KV_NAME_PATTERN` are both a **single segment** of `[a-z0-9]`/dashes. No
+  slash, so no directory can be escaped or created, and `..` cannot match.
+- `kv_name` is single-segment for a second reason: the routes address a store as
+  `{file}/{kv_name}`, and a slash would make that split ambiguous. Multi-segment names were
+  supported under the old one-file-per-KV layout and are not any more.
+- `roles` is **required**, at least one key with at least one host. `ALLOWED_ROLE_KEYS` in
+  `schemas.py` holds `read` and `write` as **separate** keys — a store may carry either or
+  both. The combined string `read/write` is *not* a role and is rejected; `<read/write>` in
+  the format spec was a placeholder meaning "one of these", like `<name>` and `<FQDN>`
+  beside it. That frozenset is the only thing to change if the pipeline ever wants a
+  different set; everything else treats `roles` as an opaque mapping.
 
 ## Architecture
 
@@ -140,13 +158,21 @@ is load-bearing: `routes.py` keys off `external_error.status_code == 504` to ans
 of 502. Each client passes its own `detail_from_response` (Bitbucket digs through
 `{"errors": [{"message": ...}]}`); `default_detail` is the fallback.
 
-**Shared helpers (`app/helpers.py`)** are pure: `build_kv_values` (the committed document),
-`slugify_mount_path`, `build_branch_name`, `values_file_path` and `render_values_yaml`.
+**Shared helpers (`app/helpers.py`)** are pure: `build_kv_store` (one entry),
+`build_kv_stores_document`, `add_kv_store`, `read_kv_stores`, `find_kv_store`,
+`kv_store_names`, `update_kv_store`, `slugify_mount_path`, `build_branch_name`,
+`values_file_path` and `render_values_yaml`.
 
-The **edit** helper `update_kv_metadata` takes the parsed document and returns a **new** one,
-never mutating the input. That is what lets `_edit_values_operation` diff old against new with
-`yaml_data_equals` and skip a no-op commit. Any edit helper added later must keep that
-contract.
+`add_kv_store` and `update_kv_store` take the parsed document and return a **new** one, never
+mutating the input. That is what lets the update operation diff old against new with
+`yaml_data_equals` and skip a no-op commit. Any helper added later must keep that contract.
+`add_kv_store` accepts `None` so "the file does not exist yet" and "append to an existing
+file" are one code path. `update_kv_store` raises `KVStoreNotFound` when the named store is
+not in the file, which the operation turns into a 404.
+
+`read_kv_stores` tolerates `kvStores:` with nothing under it (parses to `None`) — an empty
+file, not a corrupt one. `kv_store_names` skips malformed entries so a hand-edited file
+cannot break the duplicate scan.
 
 `render_values_yaml` uses a `SafeDumper` subclass that writes multi-line strings as `|`
 blocks — the default representer emits one escaped, width-wrapped scalar, which is
@@ -164,17 +190,25 @@ update go through `_commit_via_pull_request`; `create_kv_pull_request_operation`
 The baseline watermark is taken **before** `_open_pull_request` and deliberately not folded
 into it — it has to precede the branch creation, and the PR-only path has no use for it.
 
-**One chain, two callers.** `_commit_via_pull_request` owns steps 2-6 below and is shared by
-create and update, so the rollback asymmetry cannot drift apart between operations.
-Create adds the duplicate guard in front; update goes through `_edit_values_operation`, which
-reads the committed file, applies a pure mutation, and **short-circuits when nothing changed**
-— returning success with `pull_request: null` rather than opening an empty PR. Edits also pass
-a `source_commit_id` from `get_last_commit`; without that optimistic-lock token Bitbucket
-rejects an edit to an existing path as an attempted create.
+`_prepare_create` is the third shared piece: both create paths call it for the name scan, the
+read-or-start of the target file, and the optimistic-lock token. That is why they cannot
+diverge on the duplicate rules.
+
+Update reads the file, applies `update_kv_store`, and **short-circuits when nothing changed**
+— returning success with `pull_request: null` rather than opening an empty PR. It always
+passes a `source_commit_id`; without that optimistic-lock token Bitbucket rejects an edit to
+an existing path as an attempted create.
 
 `create_kv_mount_operation` runs, in order:
 
-1. duplicate guard — `get_file_content` on the base branch; a hit is a 409, a 404 proceeds
+0. **name scan** — `list_files` on `VAULT_VALUES_DIR`, then `get_file_content` + parse for
+   each `.yaml`; the name appearing anywhere is a 409. Store names are global to Vault, so
+   this cannot be scoped to the target file. It is a check, not a lock: two creates in flight
+   both pass and the second PR conflicts at merge, same as any other GitOps race. A file that
+   will not parse is logged and skipped rather than blocking an unrelated create.
+1. read the target file — absent (404) means this is its first store, so `source_commit_id`
+   stays `None` and Bitbucket treats the write as a create; present means append, and
+   `get_last_commit` supplies the optimistic-lock token
 2. `create_branch` → `put_file`
 3. `create_pull_request`
 4. **gate 1**: `await_pipeline` on the `pull_request` event
@@ -194,16 +228,16 @@ There is **no transaction**; each step hand-rolls its own rollback:
 **Step 5 is the point of no return.** Preserve that asymmetry when editing. Rollback failures are
 logged and never raised over the original error.
 
-`create_kv_pull_request_operation` runs the duplicate guard and steps 2-3, then returns 201
-with the PR `OPEN`. It takes **no Woodpecker client** — the argument would be dead weight.
-Two consequences, both deliberate and both pinned by tests:
+`create_kv_pull_request_operation` runs steps 0-3, then returns 201 with the PR `OPEN`. It
+takes **no Woodpecker client** — the argument would be dead weight. Two consequences, both
+deliberate and both pinned by tests:
 
 - **Opening a PR still triggers CI in the forge.** The endpoint does not suppress the
   validation pipeline; it just does not wait for it. The response's pipeline fields are `null`
   because nothing was *observed*, not because nothing ran.
-- **A repeat call opens a second PR.** The duplicate guard reads the base branch, and an
-  unmerged PR is not there, so it cannot see the first one. Catching it would mean listing
-  open PRs — a different and inherently racy check. Reviewers close the loser.
+- **A repeat call opens a second PR.** The name scan reads the base branch, and an unmerged
+  PR is not there, so it cannot see the first one. Catching it would mean listing open PRs —
+  a different and inherently racy check. Reviewers close the loser.
 
 Two details that are easy to break:
 - **The version re-read before merging/declining.** Bitbucket's `version` is an optimistic lock
@@ -280,9 +314,9 @@ hangs until the timeout. Only `success` counts as success.
   `status_code=201` and `response_model=` describe the success path only — FastAPI does not
   validate or document the failure bodies. Adding a field to `VaultKVOperationResponse` means
   the failure path silently omits it unless `to_response()` is updated too.
-- The committed document (`kvname` / `description`) is the contract with the deploy
-  pipeline — change `build_kv_values` and the pipeline together.
-- Tests: 183 of them. `tests/test_helpers.py` (pure, no library import), `tests/clients/` (both
+- The committed entry (`name` / `description` / `roles`, under a `kvStores` list) is the
+  contract with the deploy pipeline — change `build_kv_store` and the pipeline together.
+- Tests: 269 of them. `tests/test_helpers.py` (pure, no library import), `tests/clients/` (both
   clients plus `http.py`'s error mapping, against their real REST shapes via respx),
   `tests/v1/vault/` (schemas, the chain + rollbacks with duck-typed fakes from `tests/fakes.py`,
   and routes end-to-end through `TestClient`). Two conftest details to respect:

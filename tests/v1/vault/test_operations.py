@@ -8,19 +8,30 @@ import yaml
 from tashtiot_apis_library.connectors import ExternalServiceError
 
 from app.clients.woodpecker import Pipeline, PipelineTimeoutError
+from app.helpers import build_kv_store, build_kv_stores_document, render_values_yaml
 from app.v1.vault.operations import (
     VaultOperationError,
     create_kv_mount_operation,
     deploy_pipeline_matcher,
-    get_kv_mount_operation,
+    get_kv_file_operation,
+    get_kv_store_operation,
     pull_request_pipeline_matcher,
 )
 from app.v1.vault.schemas import OperationStatus
 from tests.fakes import FakeBitbucket, FakeWoodpecker, make_pipeline
 
 KV = "myapp"
-VALUES_PATH = "kv/myapp.yaml"
-BRANCH = "vault-kv/myapp-abc123"
+FILE = "payments"
+VALUES_PATH = "kv/payments.yaml"
+BRANCH = "vault-kv/payments-myapp-abc123"
+ROLES = {"read": ["app01.corp.example.com"]}
+
+
+def _file_with(*names, description="payments secrets"):
+    """A rendered values file already holding these stores."""
+    return render_values_yaml(
+        build_kv_stores_document([build_kv_store(n, description, ROLES) for n in names])
+    )
 
 
 async def _create(bitbucket, woodpecker, payload):
@@ -54,7 +65,8 @@ async def test_happy_path_call_order(payload, bitbucket, woodpecker):
     await _create(bitbucket, woodpecker, payload)
 
     assert bitbucket.calls == [
-        "get_file_content",  # duplicate check
+        "list_files",  # scan every file for the name
+        "get_file_content",  # read the target file (404 -> new file)
         "create_branch",
         "put_file",
         "create_pull_request",
@@ -66,11 +78,51 @@ async def test_happy_path_call_order(payload, bitbucket, woodpecker):
     assert "delete_branch" not in bitbucket.calls
 
 
-async def test_committed_file_is_the_rendered_values_yaml(payload, bitbucket, woodpecker):
+async def test_committed_file_is_a_kvstores_list(payload, bitbucket, woodpecker):
     await _create(bitbucket, woodpecker, payload)
 
     committed = yaml.safe_load(bitbucket.committed[VALUES_PATH])
-    assert committed == {"kvname": KV, "description": payload.kv_description}
+    assert committed == {
+        "kvStores": [
+            {
+                "name": KV,
+                "description": payload.kv_description,
+                "roles": {"read": ["app01.corp.example.com"]},
+            }
+        ]
+    }
+
+
+async def test_a_new_file_is_written_without_an_optimistic_lock_token(
+    payload, bitbucket, woodpecker
+):
+    """sourceCommitId on a path that does not exist makes Bitbucket reject the write."""
+    await _create(bitbucket, woodpecker, payload)
+
+    assert bitbucket.source_commit_ids == [None]
+    assert "get_last_commit" not in bitbucket.calls
+
+
+async def test_appending_to_an_existing_file_keeps_the_existing_stores(
+    payload, woodpecker
+):
+    """The whole point of the format: one file, several stores."""
+    bitbucket = FakeBitbucket(existing_files={VALUES_PATH: _file_with("already-here")})
+
+    await _create(bitbucket, woodpecker, payload)
+
+    committed = yaml.safe_load(bitbucket.committed[VALUES_PATH])
+    assert [s["name"] for s in committed["kvStores"]] == ["already-here", KV]
+
+
+async def test_appending_to_an_existing_file_sends_the_lock_token(payload, woodpecker):
+    """Editing a path that already exists needs Bitbucket's optimistic-lock token."""
+    bitbucket = FakeBitbucket(existing_files={VALUES_PATH: _file_with("already-here")})
+
+    await _create(bitbucket, woodpecker, payload)
+
+    assert bitbucket.source_commit_ids == ["file-commit-sha"]
+    assert bitbucket.calls.index("get_last_commit") < bitbucket.calls.index("put_file")
 
 
 async def test_merge_uses_the_freshly_read_version(payload, bitbucket, woodpecker):
@@ -81,26 +133,68 @@ async def test_merge_uses_the_freshly_read_version(payload, bitbucket, woodpecke
 
 
 # --------------------------------------------------------------------------- #
-# duplicate guard
+# duplicate guard — names are global to Vault, so it scans every file
 # --------------------------------------------------------------------------- #
-async def test_existing_mount_is_rejected_before_anything_is_created(payload, woodpecker):
-    bitbucket = FakeBitbucket(existing_files={VALUES_PATH: "mount: {}\n"})
+async def test_a_name_already_in_the_target_file_is_rejected(payload, woodpecker):
+    bitbucket = FakeBitbucket(existing_files={VALUES_PATH: _file_with(KV)})
 
     with pytest.raises(VaultOperationError) as exc_info:
         await _create(bitbucket, woodpecker, payload)
 
     assert exc_info.value.status_code == 409
     assert KV in exc_info.value.message
-    assert bitbucket.calls == ["get_file_content"]
+    assert "create_branch" not in bitbucket.calls
+
+
+async def test_a_name_used_in_a_different_file_is_also_rejected(payload, woodpecker):
+    """Store names are global to Vault, so uniqueness cannot be scoped to one file."""
+    bitbucket = FakeBitbucket(existing_files={"kv/other-team.yaml": _file_with(KV)})
+
+    with pytest.raises(VaultOperationError) as exc_info:
+        await _create(bitbucket, woodpecker, payload)
+
+    assert exc_info.value.status_code == 409
+    assert "kv/other-team.yaml" in exc_info.value.message
+    assert "create_branch" not in bitbucket.calls
+
+
+async def test_a_different_name_in_the_same_file_is_fine(payload, bitbucket, woodpecker):
+    bitbucket.existing_files[VALUES_PATH] = _file_with("something-else")
+
+    response = await _create(bitbucket, woodpecker, payload)
+
+    assert response.status == OperationStatus.SUCCEEDED
+
+
+async def test_an_unparseable_file_does_not_block_an_unrelated_create(
+    payload, bitbucket, woodpecker
+):
+    """A hand-edited file elsewhere must not make every create fail."""
+    bitbucket.existing_files["kv/broken.yaml"] = "kvStores: [unclosed\n  ::: bad"
+
+    response = await _create(bitbucket, woodpecker, payload)
+
+    assert response.status == OperationStatus.SUCCEEDED
+
+
+async def test_non_yaml_files_in_the_values_dir_are_skipped(
+    payload, bitbucket, woodpecker
+):
+    bitbucket.existing_files["kv/README.md"] = "# not a values file\n"
+
+    response = await _create(bitbucket, woodpecker, payload)
+
+    assert response.status == OperationStatus.SUCCEEDED
 
 
 async def test_non_404_on_the_duplicate_check_propagates(payload, woodpecker):
     bitbucket = FakeBitbucket(
+        existing_files={"kv/other.yaml": _file_with("someone-else")},
         fail_on={
             "get_file_content": ExternalServiceError(
                 service_name="bitbucket", detail="server on fire", status_code=500
             )
-        }
+        },
     )
 
     with pytest.raises(ExternalServiceError):
@@ -124,7 +218,13 @@ async def test_failed_commit_deletes_the_branch(payload, woodpecker):
     with pytest.raises(ExternalServiceError):
         await _create(bitbucket, woodpecker, payload)
 
-    assert bitbucket.calls == ["get_file_content", "create_branch", "put_file", "delete_branch"]
+    assert bitbucket.calls == [
+        "list_files",
+        "get_file_content",
+        "create_branch",
+        "put_file",
+        "delete_branch",
+    ]
 
 
 async def test_failed_pull_request_deletes_the_branch(payload, woodpecker):
@@ -400,33 +500,54 @@ async def test_watermark_excludes_pipelines_that_existed_before_the_request(payl
 
 
 # --------------------------------------------------------------------------- #
-# read
+# reads
 # --------------------------------------------------------------------------- #
-async def test_get_mount_reads_the_values_file_from_the_base_branch():
-    bitbucket = FakeBitbucket(
-        existing_files={VALUES_PATH: yaml.safe_dump({"mount": {"path": KV}})}
-    )
+async def test_get_file_returns_every_store():
+    bitbucket = FakeBitbucket(existing_files={VALUES_PATH: _file_with("one", "two")})
 
-    data = await get_kv_mount_operation(bitbucket, "myapp")
+    data = await get_kv_file_operation(bitbucket, FILE)
 
-    assert data["mount"]["path"] == KV
+    assert [s["name"] for s in data["kvStores"]] == ["one", "two"]
 
 
-async def test_get_mount_reports_a_corrupt_values_file():
+async def test_get_file_reports_a_corrupt_values_file():
     """A hand-edited/badly-merged file must not surface as a bare 500."""
-    bitbucket = FakeBitbucket(existing_files={VALUES_PATH: "mount: [unclosed\n  ::: bad"})
+    bitbucket = FakeBitbucket(existing_files={VALUES_PATH: "kvStores: [unclosed\n  ::: bad"})
 
     with pytest.raises(VaultOperationError) as exc_info:
-        await get_kv_mount_operation(bitbucket, "myapp")
+        await get_kv_file_operation(bitbucket, FILE)
 
     assert "not valid YAML" in exc_info.value.message
-    assert exc_info.value.kv_name == KV
 
 
-async def test_get_mount_propagates_not_found():
-    bitbucket = FakeBitbucket()
+async def test_get_file_of_a_missing_file_is_404():
+    with pytest.raises(VaultOperationError) as exc_info:
+        await get_kv_file_operation(FakeBitbucket(), "nope")
 
-    with pytest.raises(ExternalServiceError) as exc_info:
-        await get_kv_mount_operation(bitbucket, "nope")
+    assert exc_info.value.status_code == 404
+
+
+async def test_get_store_returns_only_that_entry():
+    bitbucket = FakeBitbucket(existing_files={VALUES_PATH: _file_with("one", "two")})
+
+    store = await get_kv_store_operation(bitbucket, FILE, "two")
+
+    assert store["name"] == "two"
+    assert store["roles"] == ROLES
+
+
+async def test_get_store_of_an_absent_name_is_404():
+    bitbucket = FakeBitbucket(existing_files={VALUES_PATH: _file_with("one")})
+
+    with pytest.raises(VaultOperationError) as exc_info:
+        await get_kv_store_operation(bitbucket, FILE, "nope")
+
+    assert exc_info.value.status_code == 404
+    assert "not defined in" in exc_info.value.message
+
+
+async def test_get_store_of_a_missing_file_is_404():
+    with pytest.raises(VaultOperationError) as exc_info:
+        await get_kv_store_operation(FakeBitbucket(), "nope", KV)
 
     assert exc_info.value.status_code == 404

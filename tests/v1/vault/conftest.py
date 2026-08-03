@@ -7,8 +7,13 @@ from tests.fakes import FakeBitbucket, FakeWoodpecker, make_pipeline
 
 @pytest.fixture
 def payload():
-    """The whole create request: a name, and what the KV is for."""
-    return VaultKVCreate(kv_name="myapp", kv_description="payments secrets")
+    """The whole create request: which file, the store's name, why, and who reaches it."""
+    return VaultKVCreate(
+        file="payments",
+        kv_name="myapp",
+        kv_description="payments secrets",
+        roles={"read": ["app01.corp.example.com"]},
+    )
 
 
 @pytest.fixture

@@ -3,16 +3,26 @@
 The `client` fixture builds the real app with both connectors replaced by fakes, so these
 tests exercise routing, the global AuthMiddleware, validation and the error mapping.
 """
-import yaml
 from fastapi.encoders import jsonable_encoder
 
 from app.clients.woodpecker import PipelineTimeoutError
+from app.helpers import build_kv_store, build_kv_stores_document, render_values_yaml
 from app.v1.vault.conf import config
 from tests.fakes import make_pipeline
 
 CREATE_URL = f"{config.API_PREFIX}/"
 KV = "myapp"
-VALUES_PATH = "kv/myapp.yaml"
+FILE = "payments"
+VALUES_PATH = "kv/payments.yaml"
+ROLES = {"read": ["app01.corp.example.com"]}
+
+
+def _file_with(*names):
+    return render_values_yaml(
+        build_kv_stores_document(
+            [build_kv_store(n, "payments secrets", ROLES) for n in names]
+        )
+    )
 
 
 def _body(payload):
@@ -105,13 +115,23 @@ def test_pipeline_timeout_returns_504(client, payload, auth_headers, woodpecker)
     assert "did not complete" in response.json()["error"]
 
 
-def test_duplicate_mount_returns_409(client, payload, auth_headers, bitbucket):
-    bitbucket.existing_files[VALUES_PATH] = "mount: {}\n"
+def test_duplicate_store_returns_409(client, payload, auth_headers, bitbucket):
+    bitbucket.existing_files[VALUES_PATH] = _file_with(KV)
 
     response = client.post(CREATE_URL, json=_body(payload), headers=auth_headers)
 
     assert response.status_code == 409
     assert "already exists" in response.json()["error"]
+
+
+def test_a_name_taken_in_another_file_returns_409(client, payload, auth_headers, bitbucket):
+    """Store names are global to Vault, so the scan covers the whole values directory."""
+    bitbucket.existing_files["kv/other-team.yaml"] = _file_with(KV)
+
+    response = client.post(CREATE_URL, json=_body(payload), headers=auth_headers)
+
+    assert response.status_code == 409
+    assert "kv/other-team.yaml" in response.json()["error"]
 
 
 def test_upstream_timeout_returns_504(client, payload, auth_headers, bitbucket):
@@ -163,10 +183,18 @@ def test_missing_description_is_rejected(client, payload, auth_headers):
     assert client.post(CREATE_URL, json=body, headers=auth_headers).status_code == 422
 
 
-def test_traversal_in_the_name_is_rejected(client, payload, auth_headers, bitbucket):
-    """The name reaches a file path, so '..' must never get through."""
+def test_traversal_in_the_file_is_rejected(client, payload, auth_headers, bitbucket):
+    """`file` is the only request field that reaches a path, so '..' must not get through."""
     body = _body(payload)
-    body["kv_name"] = "../../etc/passwd"
+    body["file"] = "../../etc/passwd"
+
+    assert client.post(CREATE_URL, json=body, headers=auth_headers).status_code == 422
+    assert bitbucket.calls == []
+
+
+def test_missing_roles_is_rejected(client, payload, auth_headers, bitbucket):
+    body = _body(payload)
+    body.pop("roles")
 
     assert client.post(CREATE_URL, json=body, headers=auth_headers).status_code == 422
     assert bitbucket.calls == []
@@ -175,31 +203,31 @@ def test_traversal_in_the_name_is_rejected(client, payload, auth_headers, bitbuc
 # --------------------------------------------------------------------------- #
 # read
 # --------------------------------------------------------------------------- #
-def test_read_returns_the_committed_values(client, auth_headers, bitbucket):
-    bitbucket.existing_files[VALUES_PATH] = yaml.safe_dump({"mount": {"path": KV}})
+def test_read_returns_the_committed_file(client, auth_headers, bitbucket):
+    bitbucket.existing_files[VALUES_PATH] = _file_with(KV)
 
-    response = client.get(f"{config.API_PREFIX}/myapp", headers=auth_headers)
+    response = client.get(f"{config.API_PREFIX}/{FILE}", headers=auth_headers)
 
     assert response.status_code == 200
-    assert response.json()["mount"]["path"] == KV
+    assert response.json()["kvStores"][0]["name"] == KV
 
 
 def test_read_corrupt_values_file_returns_502_not_500(client, auth_headers, bitbucket):
-    bitbucket.existing_files[VALUES_PATH] = "mount: [unclosed\n  ::: bad"
+    bitbucket.existing_files[VALUES_PATH] = "kvStores: [unclosed\n  ::: bad"
 
-    response = client.get(f"{config.API_PREFIX}/myapp", headers=auth_headers)
+    response = client.get(f"{config.API_PREFIX}/{FILE}", headers=auth_headers)
 
     assert response.status_code == 502
     assert "not valid YAML" in response.json()["error"]
 
 
-def test_read_unknown_mount_returns_404(client, auth_headers):
+def test_read_unknown_file_returns_404(client, auth_headers):
     response = client.get(f"{config.API_PREFIX}/nope", headers=auth_headers)
     assert response.status_code == 404
 
 
 def test_read_takes_no_query_parameters(client, auth_headers, bitbucket):
-    """The name alone identifies the KV — there is no environment to disambiguate."""
-    bitbucket.existing_files[VALUES_PATH] = yaml.safe_dump({"kvname": KV})
+    """The file name alone identifies the document — nothing to disambiguate."""
+    bitbucket.existing_files[VALUES_PATH] = _file_with(KV)
 
-    assert client.get(f"{config.API_PREFIX}/myapp", headers=auth_headers).status_code == 200
+    assert client.get(f"{config.API_PREFIX}/{FILE}", headers=auth_headers).status_code == 200

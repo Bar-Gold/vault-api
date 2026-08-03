@@ -11,6 +11,7 @@ Endpoints used (Bitbucket Server 7+/Data Center):
   POST   /rest/branch-utils/1.0/projects/{k}/repos/{s}/branches
   DELETE /rest/branch-utils/1.0/projects/{k}/repos/{s}/branches
   PUT    /rest/api/1.0/projects/{k}/repos/{s}/browse/{path}
+  GET    /rest/api/1.0/projects/{k}/repos/{s}/files/{dir}?at={ref}
   POST   /rest/api/1.0/projects/{k}/repos/{s}/pull-requests
   GET    /rest/api/1.0/projects/{k}/repos/{s}/pull-requests/{id}
   POST   /rest/api/1.0/projects/{k}/repos/{s}/pull-requests/{id}/merge?version={v}
@@ -21,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
+from tashtiot_apis_library.connectors import ExternalServiceError
 
 from . import http
 
@@ -159,6 +161,39 @@ class BitbucketClient:
         response = await self._request("GET", f"{self._api}/commits", params=params)
         values = response.json().get("values") or []
         return values[0].get("id") if values else None
+
+    async def list_files(
+        self, directory: str, at: Optional[str] = None, page_size: int = 1000
+    ) -> List[str]:
+        """Paths under `directory`, relative to it, at a ref.
+
+        Bitbucket paginates this and will not return everything in one page on a large
+        directory, so follow `nextPageStart` until `isLastPage`. A 404 means the directory
+        does not exist yet, which is an empty result rather than an error — the values
+        directory is legitimately absent before the first store is ever created.
+        """
+        files: List[str] = []
+        start = 0
+        while True:
+            params: Dict[str, Any] = {"limit": page_size, "start": start}
+            if at:
+                params["at"] = at
+            try:
+                response = await self._request(
+                    "GET", f"{self._api}/files/{directory.strip('/')}", params=params
+                )
+            except ExternalServiceError as exc:
+                if exc.status_code == 404:
+                    return []
+                raise
+
+            body = response.json()
+            files.extend(body.get("values") or [])
+            if body.get("isLastPage", True):
+                return files
+            start = body.get("nextPageStart")
+            if start is None:
+                return files
 
     async def get_file_content(self, path: str, at: Optional[str] = None) -> str:
         """Raw file content at a ref (defaults to the repo's default branch)."""

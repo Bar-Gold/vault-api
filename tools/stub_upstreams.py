@@ -246,6 +246,37 @@ async def put_file(key: str, slug: str, path: str, request: Request):
     return {"id": f"commit-{branch}", "message": fields.get("message", "")}
 
 
+@app.get("/rest/api/1.0/projects/{key}/repos/{slug}/files/{directory:path}")
+async def list_files(
+    key: str, slug: str, directory: str, at: Optional[str] = None,
+    start: int = 0, limit: int = 1000,
+):
+    """Files under a directory — the create flow scans these for a duplicate store name.
+
+    Paginated like the real thing, so the client's nextPageStart loop is actually
+    exercised rather than assumed. A missing directory is a 404, which the client turns
+    into an empty list (the values dir legitimately does not exist before the first
+    store).
+    """
+    ref = (at or BASE_BRANCH).replace("refs/heads/", "")
+    prefix = directory.strip("/") + "/"
+    matches = sorted(
+        path[len(prefix):]
+        for path in state.files.get(ref, {})
+        if path.startswith(prefix)
+    )
+    if not matches:
+        return _error(404, f"{directory} not found on {ref}")
+
+    page = matches[start : start + limit]
+    next_start = start + limit
+    is_last = next_start >= len(matches)
+    body: Dict[str, Any] = {"values": page, "size": len(page), "isLastPage": is_last}
+    if not is_last:
+        body["nextPageStart"] = next_start
+    return body
+
+
 @app.get("/rest/api/1.0/projects/{key}/repos/{slug}/commits")
 async def list_commits(
     key: str, slug: str, path: Optional[str] = None, until: Optional[str] = None, limit: int = 25

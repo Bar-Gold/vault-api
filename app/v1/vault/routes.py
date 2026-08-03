@@ -10,7 +10,8 @@ from .operations import (
     VaultOperationError,
     create_kv_mount_operation,
     create_kv_pull_request_operation,
-    get_kv_mount_operation,
+    get_kv_file_operation,
+    get_kv_store_operation,
     update_kv_mount_operation,
 )
 from .schemas import (
@@ -57,6 +58,26 @@ async def _execute(operation: Any) -> Any:
         )
 
 
+async def _read(operation: Any) -> Any:
+    """Await a read, mapping failures the same way but treating a 404 upstream as a 404."""
+    try:
+        return await operation
+    except VaultOperationError as operation_error:
+        logger.error(f"Vault KV read failed: {operation_error.message}")
+        return _json(operation_error.to_response(), operation_error.status_code)
+    except ExternalServiceError as external_error:
+        return JSONResponse(
+            {
+                "status": OperationStatus.FAILED.value,
+                "error": (
+                    f"Exception in {external_error.service_name}. "
+                    f"errors: {external_error.detail}"
+                ),
+            },
+            status_code=404 if external_error.status_code == 404 else 502,
+        )
+
+
 def get_v1_vault_router(bitbucket: Any, woodpecker: Any) -> APIRouter:
     """Create the APIRouter for Vault KV operations."""
     router = APIRouter(prefix=config.API_PREFIX, tags=config.API_TAGS)
@@ -65,76 +86,79 @@ def get_v1_vault_router(bitbucket: Any, woodpecker: Any) -> APIRouter:
         "/",
         response_model=VaultKVOperationResponse,
         status_code=201,
-        summary="Create a KV",
+        summary="Create a KV store",
         description=(
-            "Commits a file with the KV's name and description, opens a Bitbucket pull "
-            "request, waits for the validation pipeline, merges, then waits for the deploy "
-            "pipeline. The request blocks for the whole chain and returns "
-            "'Successful creation of <kv name>' on success. What the KV means in Vault is "
-            "the deploy pipeline's business, not this service's."
+            "Appends a store to the values file named by 'file', creating that file if it "
+            "is the first one. Opens a Bitbucket pull request, waits for the validation "
+            "pipeline, merges, then waits for the deploy pipeline. The request blocks for "
+            "the whole chain. The store name must be unique across every file in the "
+            "values directory."
         ),
     )
     async def create(payload: VaultKVCreate):
-        logger.info(f"Creating KV {payload.kv_name}")
+        logger.info(f"Creating KV store {payload.kv_name} in {payload.file}")
         return await _execute(create_kv_mount_operation(bitbucket, woodpecker, payload))
 
-    # Registered before the `/{kv_name:path}` routes. There is no POST on that path today,
-    # so nothing is ambiguous — but if one is ever added, this fixed segment must keep
-    # winning, or a KV named "pull-request" would shadow this endpoint.
+    # Registered before the `/{file}` routes. There is no POST on those paths today, so
+    # nothing is ambiguous — but if one is ever added, this fixed segment must keep
+    # winning, or a file named "pull-request" would shadow this endpoint.
     @router.post(
         "/pull-request",
         response_model=VaultKVOperationResponse,
         status_code=201,
-        summary="Open a pull request for a new KV, without waiting for CI",
+        summary="Open a pull request for a new KV store, without waiting for CI",
         description=(
-            "Commits the same file as a create and opens the same pull request, then "
+            "Commits the same change as a create and opens the same pull request, then "
             "returns immediately — no validation pipeline, no merge, no deploy pipeline. "
             "The pull request is left OPEN for a human to review and merge, so nothing "
-            "reaches the base branch. Use this when you want the request to answer in one "
-            "round-trip instead of blocking for the whole chain. The duplicate guard still "
-            "applies, and a failure still deletes the branch it created."
+            "reaches the base branch. The uniqueness check still applies, and a failure "
+            "still deletes the branch it created."
         ),
     )
     async def create_pull_request_only(payload: VaultKVCreate):
-        logger.info(f"Opening a pull request for KV {payload.kv_name} (no CI, no merge)")
+        logger.info(
+            f"Opening a pull request for KV store {payload.kv_name} in {payload.file} "
+            f"(no CI, no merge)"
+        )
         return await _execute(create_kv_pull_request_operation(bitbucket, payload))
 
     @router.patch(
-        "/{kv_name:path}",
+        "/{file}/{kv_name}",
         response_model=VaultKVOperationResponse,
-        summary="Update a KV's description or owner",
+        summary="Update a KV store's description or roles",
         description=(
-            "Edits the committed file in place through the same pull request and pipeline "
-            "chain as a create. The name is not editable — renaming means migrating the "
-            "secrets in Vault, not editing a field. An edit that changes nothing succeeds "
-            "without opening a pull request."
+            "Edits one store inside a values file, through the same pull request and "
+            "pipeline chain as a create. Its siblings in the file are untouched. The name "
+            "is not editable — renaming means migrating the secrets in Vault. Roles are "
+            "replaced wholesale, so a host is removed by omitting it. An edit that changes "
+            "nothing succeeds without opening a pull request."
         ),
     )
-    async def update(kv_name: str, payload: VaultKVUpdate):
-        logger.info(f"Updating KV {kv_name}")
+    async def update(file: str, kv_name: str, payload: VaultKVUpdate):
+        logger.info(f"Updating KV store {kv_name} in {file}")
         return await _execute(
-            update_kv_mount_operation(bitbucket, woodpecker, kv_name, payload)
+            update_kv_mount_operation(bitbucket, woodpecker, file, kv_name, payload)
         )
 
     @router.get(
-        "/{kv_name:path}",
-        summary="Read a KV's committed file",
-        description="Returns the file committed for this KV, parsed as YAML.",
+        "/{file}/{kv_name}",
+        summary="Read one KV store",
+        description="Returns a single entry from the values file's kvStores list.",
     )
-    async def get_mount(kv_name: str):
-        logger.info(f"Reading KV {kv_name}")
-        try:
-            return await get_kv_mount_operation(bitbucket, kv_name)
-        except VaultOperationError as operation_error:
-            logger.error(f"Vault KV read failed: {operation_error.message}")
-            return _json(operation_error.to_response(), operation_error.status_code)
-        except ExternalServiceError as external_error:
-            return JSONResponse(
-                {
-                    "status": OperationStatus.FAILED.value,
-                    "error": f"Exception in {external_error.service_name}. errors: {external_error.detail}",
-                },
-                status_code=404 if external_error.status_code == 404 else 502,
-            )
+    async def get_store(file: str, kv_name: str):
+        logger.info(f"Reading KV store {kv_name} from {file}")
+        return await _read(get_kv_store_operation(bitbucket, file, kv_name))
+
+    @router.get(
+        "/{file}",
+        summary="Read a whole values file",
+        description=(
+            "Returns the committed file for this name, parsed as YAML — every store it "
+            "defines under kvStores."
+        ),
+    )
+    async def get_file(file: str):
+        logger.info(f"Reading values file {file}")
+        return await _read(get_kv_file_operation(bitbucket, file))
 
     return router
