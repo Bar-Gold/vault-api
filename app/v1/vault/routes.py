@@ -1,6 +1,6 @@
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Path
+from fastapi import APIRouter, Path, Query
 from loguru import logger
 from starlette.responses import JSONResponse
 from tashtiot_apis_library.connectors import ExternalServiceError
@@ -8,28 +8,30 @@ from tashtiot_apis_library.connectors import ExternalServiceError
 from .conf import config
 from .operations import (
     VaultOperationError,
-    create_kubernetes_auth_operation,
-    create_kubernetes_auth_pull_request_operation,
+    add_k8s_service_account_operation,
+    add_k8s_service_account_pull_request_operation,
     create_kv_mount_operation,
     create_kv_pull_request_operation,
-    delete_kubernetes_auth_operation,
-    delete_kubernetes_auth_pull_request_operation,
     delete_kv_store_operation,
     delete_kv_store_pull_request_operation,
-    get_kubernetes_auth_file_operation,
-    get_kubernetes_auth_role_operation,
+    get_k8s_service_accounts_operation,
     get_kv_file_operation,
     get_kv_store_operation,
-    update_kubernetes_auth_operation,
+    remove_k8s_service_account_operation,
+    remove_k8s_service_account_pull_request_operation,
     update_kv_mount_operation,
 )
 from .schemas import (
     FILE_PATTERN,
-    K8S_ROLE_NAME_PATTERN,
+    K8S_CLUSTER_MAX_LENGTH,
+    K8S_CLUSTER_PATTERN,
+    K8S_NAMESPACE_MAX_LENGTH,
+    K8S_NAMESPACE_PATTERN,
+    K8S_SERVICE_ACCOUNT_MAX_LENGTH,
+    K8S_SERVICE_ACCOUNT_PATTERN,
     KV_NAME_PATTERN,
+    K8sServiceAccountCreate,
     OperationStatus,
-    VaultKubernetesAuthCreate,
-    VaultKubernetesAuthUpdate,
     VaultKVCreate,
     VaultKVUpdate,
     VaultOperationResponse,
@@ -58,13 +60,38 @@ KVNameParam = Annotated[
     ),
 ]
 
-RoleNameParam = Annotated[
+# A binding has no name, so a delete has to carry all three parts of its identity. They are
+# query parameters rather than a request body because DELETE bodies are widely dropped by
+# proxies and clients, and validated with the same patterns the POST body enforces — an
+# unbind for a name the cluster could never have accepted is a 422, not a 404 two calls
+# later.
+ServiceAccountQuery = Annotated[
     str,
-    Path(
-        max_length=128,
-        pattern=K8S_ROLE_NAME_PATTERN,
-        examples=["myapp-ci"],
-        description="Name of the Kubernetes auth role inside that file.",
+    Query(
+        max_length=K8S_SERVICE_ACCOUNT_MAX_LENGTH,
+        pattern=K8S_SERVICE_ACCOUNT_PATTERN,
+        examples=["vault"],
+        description="ServiceAccount name of the binding to remove.",
+    ),
+]
+
+NamespaceQuery = Annotated[
+    str,
+    Query(
+        max_length=K8S_NAMESPACE_MAX_LENGTH,
+        pattern=K8S_NAMESPACE_PATTERN,
+        examples=["athena"],
+        description="Namespace of the binding to remove.",
+    ),
+]
+
+ClusterQuery = Annotated[
+    str,
+    Query(
+        max_length=K8S_CLUSTER_MAX_LENGTH,
+        pattern=K8S_CLUSTER_PATTERN,
+        examples=["dev"],
+        description="OS4 cluster suffix of the binding to remove.",
     ),
 ]
 
@@ -249,149 +276,131 @@ def get_v1_vault_router(bitbucket: Any, woodpecker: Any) -> APIRouter:
         logger.info(f"Reading values file {file}")
         return await _read(get_kv_file_operation(bitbucket, file))
 
-    return router
-
-
-def get_v1_kubernetes_auth_router(bitbucket: Any, woodpecker: Any) -> APIRouter:
-    """Create the APIRouter for Kubernetes auth roles.
-
-    A prefix of its own rather than a segment under `/kv`: anything nested there would sit
-    in a `{file}` or `{kv_name}` position, so a file or store actually named
-    "kubernetes-auth" would fight it for the URL. A separate prefix has zero shadowing risk
-    in either direction.
-    """
-    router = APIRouter(
-        prefix=config.API_K8S_AUTH_PREFIX, tags=config.API_K8S_AUTH_TAGS
-    )
-
+    # ----------------------------------------------------------------- #
+    # Kubernetes service accounts — a sub-resource of one store
+    #
+    # These hang off `/{file}/{kv_name}` rather than getting a router of their own,
+    # because that is what they are in the document: a list inside a store, not a
+    # resource with a namespace of its own. There is no PATCH — an entry is three
+    # scalars that together *are* its identity, so changing one is a remove plus an
+    # add, and a PATCH would have nothing left to edit.
+    #
+    # Ordering: the `/pull-request` variants are four segments against the plain
+    # ones' three, so nothing here is ambiguous. They are registered first anyway,
+    # for one rule across the file.
+    # ----------------------------------------------------------------- #
     @router.post(
-        "/",
+        "/{file}/{kv_name}/k8s-service-accounts/pull-request",
         response_model=VaultOperationResponse,
         status_code=201,
-        summary="Create a Kubernetes auth role",
+        summary="Open a pull request binding a service account, without waiting for CI",
         description=(
-            "Appends a role to the values file named by 'file' — the same file the KV "
-            "stores live in — creating that file if it is the first entry in it. Opens a "
-            "Bitbucket pull request, waits for the validation pipeline, merges, then waits "
-            "for the deploy pipeline. The request blocks for the whole chain. Every KV "
-            "store named in 'access' must already exist on the base branch."
+            "Commits the same change as the bind endpoint and opens the same pull "
+            "request, then returns immediately — no validation pipeline, no merge, no "
+            "deploy pipeline. The binding is not on the base branch until a human "
+            "merges. A failure still deletes the branch it created."
         ),
     )
-    async def create_role(payload: VaultKubernetesAuthCreate):
-        logger.info(
-            f"Creating Kubernetes auth role {payload.role_name} in {payload.file}"
-        )
-        return await _execute(
-            create_kubernetes_auth_operation(bitbucket, woodpecker, payload)
-        )
-
-    # Registered before the `/{file}` routes, the same rule the KV router follows: this
-    # fixed segment sits in a `{file}` position, so a file named "pull-request" would
-    # shadow the endpoint if the order were reversed. A GET on the same URL is still an
-    # ordinary read of a file with that name.
-    @router.post(
-        "/pull-request",
-        response_model=VaultOperationResponse,
-        status_code=201,
-        summary="Open a pull request for a new Kubernetes auth role, without waiting for CI",
-        description=(
-            "Commits the same change as a create and opens the same pull request, then "
-            "returns immediately — no validation pipeline, no merge, no deploy pipeline. "
-            "The pull request is left OPEN for a human to review and merge. The uniqueness "
-            "and store-existence checks still apply, and a failure still deletes the "
-            "branch it created."
-        ),
-    )
-    async def create_role_pull_request_only(payload: VaultKubernetesAuthCreate):
-        logger.info(
-            f"Opening a pull request for Kubernetes auth role {payload.role_name} in "
-            f"{payload.file} (no CI, no merge)"
-        )
-        return await _execute(
-            create_kubernetes_auth_pull_request_operation(bitbucket, payload)
-        )
-
-    @router.patch(
-        "/{file}/{role_name}",
-        response_model=VaultOperationResponse,
-        summary="Update a Kubernetes auth role",
-        description=(
-            "Edits one role inside a values file, through the same pull request and "
-            "pipeline chain as a create. Its siblings are untouched. Neither the name nor "
-            "the cluster is editable — both are part of the role's identity in Vault, so "
-            "changing either is a delete plus a create. Service accounts, namespaces and "
-            "access are replaced wholesale, so an entry is removed by omitting it. An edit "
-            "that changes nothing succeeds without opening a pull request."
-        ),
-    )
-    async def update_role(
-        file: FileParam, role_name: RoleNameParam, payload: VaultKubernetesAuthUpdate
+    async def bind_service_account_pull_request_only(
+        file: FileParam, kv_name: KVNameParam, payload: K8sServiceAccountCreate
     ):
-        logger.info(f"Updating Kubernetes auth role {role_name} in {file}")
+        logger.info(
+            f"Opening a pull request to bind {payload.service_account} to {kv_name} "
+            f"in {file} (no CI, no merge)"
+        )
         return await _execute(
-            update_kubernetes_auth_operation(
-                bitbucket, woodpecker, file, role_name, payload
+            add_k8s_service_account_pull_request_operation(
+                bitbucket, file, kv_name, payload
             )
         )
 
     @router.delete(
-        "/{file}/{role_name}/pull-request",
+        "/{file}/{kv_name}/k8s-service-accounts/pull-request",
         response_model=VaultOperationResponse,
         status_code=201,
-        summary="Open a pull request removing a Kubernetes auth role, without waiting for CI",
+        summary="Open a pull request unbinding a service account, without waiting for CI",
         description=(
-            "Commits the same removal as a delete and opens the same pull request, then "
-            "returns immediately. The role is still defined on the base branch until a "
-            "human merges. A failure still deletes the branch it created."
+            "Commits the same removal as the unbind endpoint and opens the same pull "
+            "request, then returns immediately. The binding is still in place on the "
+            "base branch until a human merges."
         ),
     )
-    async def delete_role_pull_request_only(file: FileParam, role_name: RoleNameParam):
+    async def unbind_service_account_pull_request_only(
+        file: FileParam,
+        kv_name: KVNameParam,
+        service_account: ServiceAccountQuery,
+        namespace: NamespaceQuery,
+        cluster: ClusterQuery,
+    ):
         logger.info(
-            f"Opening a pull request to delete Kubernetes auth role {role_name} from "
-            f"{file} (no CI, no merge)"
+            f"Opening a pull request to unbind {service_account} from {kv_name} "
+            f"in {file} (no CI, no merge)"
         )
         return await _execute(
-            delete_kubernetes_auth_pull_request_operation(bitbucket, file, role_name)
+            remove_k8s_service_account_pull_request_operation(
+                bitbucket, file, kv_name, (service_account, namespace, cluster)
+            )
+        )
+
+    @router.post(
+        "/{file}/{kv_name}/k8s-service-accounts",
+        response_model=VaultOperationResponse,
+        status_code=201,
+        summary="Bind a Kubernetes service account to a KV store",
+        description=(
+            "Appends a (serviceAccount, namespace, cluster) entry to the store's "
+            "k8sServiceAccounts list, through the same pull request and pipeline chain "
+            "as a create. The store's other fields and its sibling stores are "
+            "untouched. The same triple twice on one store is a 409; the same service "
+            "account on a different store is normal and allowed."
+        ),
+    )
+    async def bind_service_account(
+        file: FileParam, kv_name: KVNameParam, payload: K8sServiceAccountCreate
+    ):
+        logger.info(f"Binding {payload.service_account} to {kv_name} in {file}")
+        return await _execute(
+            add_k8s_service_account_operation(
+                bitbucket, woodpecker, file, kv_name, payload
+            )
         )
 
     @router.delete(
-        "/{file}/{role_name}",
+        "/{file}/{kv_name}/k8s-service-accounts",
         response_model=VaultOperationResponse,
-        summary="Delete a Kubernetes auth role",
+        summary="Unbind a Kubernetes service account from a KV store",
         description=(
-            "Removes one role from a values file, through the same pull request and "
-            "pipeline chain as a create. The KV stores it referenced are left alone — a "
-            "store with no role pointing at it is perfectly valid. Deleting a role that is "
-            "not there is a 404."
+            "Removes one entry from the store's k8sServiceAccounts list, through the "
+            "same chain as a create. The binding has no name, so all three parts of its "
+            "identity are required as query parameters. Removing the last one drops the "
+            "k8sServiceAccounts key entirely, leaving the store as a fresh create would "
+            "have written it. Unbinding something that is not bound is a 404."
         ),
     )
-    async def delete_role(file: FileParam, role_name: RoleNameParam):
-        logger.info(f"Deleting Kubernetes auth role {role_name} from {file}")
+    async def unbind_service_account(
+        file: FileParam,
+        kv_name: KVNameParam,
+        service_account: ServiceAccountQuery,
+        namespace: NamespaceQuery,
+        cluster: ClusterQuery,
+    ):
+        logger.info(f"Unbinding {service_account} from {kv_name} in {file}")
         return await _execute(
-            delete_kubernetes_auth_operation(bitbucket, woodpecker, file, role_name)
+            remove_k8s_service_account_operation(
+                bitbucket, woodpecker, file, kv_name, (service_account, namespace, cluster)
+            )
         )
 
     @router.get(
-        "/{file}/{role_name}",
-        summary="Read one Kubernetes auth role",
-        description="Returns a single entry from the values file's kubernetesAuth list.",
-    )
-    async def get_role(file: FileParam, role_name: RoleNameParam):
-        logger.info(f"Reading Kubernetes auth role {role_name} from {file}")
-        return await _read(
-            get_kubernetes_auth_role_operation(bitbucket, file, role_name)
-        )
-
-    @router.get(
-        "/{file}",
-        summary="Read every Kubernetes auth role in a values file",
+        "/{file}/{kv_name}/k8s-service-accounts",
+        summary="Read a KV store's Kubernetes service account bindings",
         description=(
-            "Returns the file's kubernetesAuth list. A file that declares no roles answers "
-            "200 with an empty list; only a missing file is a 404."
+            "Returns the store's k8sServiceAccounts list. A store that binds nothing "
+            "answers 200 with an empty list; only a missing file or store is a 404."
         ),
     )
-    async def get_roles(file: FileParam):
-        logger.info(f"Reading Kubernetes auth roles from {file}")
-        return await _read(get_kubernetes_auth_file_operation(bitbucket, file))
+    async def get_service_accounts(file: FileParam, kv_name: KVNameParam):
+        logger.info(f"Reading service account bindings for {kv_name} in {file}")
+        return await _read(get_k8s_service_accounts_operation(bitbucket, file, kv_name))
 
     return router

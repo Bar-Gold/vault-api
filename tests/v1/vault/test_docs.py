@@ -68,13 +68,22 @@ def test_create_schema_carries_a_readable_example(client):
     create = schemas["VaultKVCreate"]
 
     assert create["example"] == {
-        "file": "payments",
-        "kv_name": "myapp",
-        "kv_description": "payments secrets",
-        "roles": {"read": ["app01.corp.example.com"]},
+        "file": "athena",
+        "kv_name": "athena-passwords",
+        "kv_description": "Passwords for athena",
+        "roles": {
+            "write": ["CN=svc-athena,OU=ServiceAccounts,DC=corp,DC=example,DC=com"]
+        },
     }
     assert create["properties"]["kv_name"]["examples"] == ["myapp"]
     assert create["properties"]["file"]["examples"] == ["payments"]
+
+
+def test_the_role_example_is_a_distinguished_name(client):
+    """The values files bind LDAP DNs, not hostnames — the example has to show the real thing."""
+    schemas = client.get("/openapi.json").json()["components"]["schemas"]
+
+    assert schemas["VaultKVCreate"]["example"]["roles"]["write"][0].startswith("CN=")
 
 
 def test_update_schema_carries_an_example(client):
@@ -83,7 +92,7 @@ def test_update_schema_carries_an_example(client):
 
     assert "example" in update
     assert update["properties"]["roles"]["examples"] == [
-        {"read": ["app01.corp.example.com"]}
+        {"write": ["CN=svc-athena,OU=ServiceAccounts,DC=corp,DC=example,DC=com"]}
     ]
 
 
@@ -93,7 +102,17 @@ def test_the_create_example_is_actually_valid(client):
 
     example = client.get("/openapi.json").json()["components"]["schemas"]["VaultKVCreate"]["example"]
 
-    assert VaultKVCreate(**example).kv_name == "myapp"
+    assert VaultKVCreate(**example).kv_name == "athena-passwords"
+
+
+def test_the_binding_example_is_actually_valid(client):
+    """Same rule for the sub-resource: the example must survive its own validators."""
+    from app.v1.vault.schemas import K8sServiceAccountCreate
+
+    schemas = client.get("/openapi.json").json()["components"]["schemas"]
+    example = schemas["K8sServiceAccountCreate"]["example"]
+
+    assert K8sServiceAccountCreate(**example).cluster == "dev"
 
 
 def test_docs_needs_no_auth(client):

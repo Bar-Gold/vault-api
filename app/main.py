@@ -11,7 +11,7 @@ from .clients.bitbucket import BitbucketClient
 from .clients.woodpecker import WoodpeckerClient
 from .global_conf import global_config
 from .v1.vault.conf import config as vault_config
-from .v1.vault.routes import get_v1_kubernetes_auth_router, get_v1_vault_router
+from .v1.vault.routes import get_v1_vault_router
 
 DOCS_PATH = "/docs"
 
@@ -91,10 +91,9 @@ def create_app() -> FastAPI:
         completion_timeout=vault_config.CI_PIPELINE_TIMEOUT_SECONDS,
     )
 
-    # Add routes to app. Both routers share the same two connectors — the values file is
-    # shared, so the two resource kinds are two views of one repo, not two services.
+    # Add routes to app. One router: Kubernetes service accounts are a sub-resource of a KV
+    # store, not a resource kind of their own, so they hang off these same paths.
     app.include_router(get_v1_vault_router(bitbucket, woodpecker))
-    app.include_router(get_v1_kubernetes_auth_router(bitbucket, woodpecker))
 
     return app
 

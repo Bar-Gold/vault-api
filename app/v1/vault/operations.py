@@ -1,14 +1,15 @@
-"""Business logic for Vault KV stores and Kubernetes auth roles.
+"""Business logic for Vault KV stores and the service accounts bound to them.
 
-A values file holds two independent **lists** of named entries — stores under `kvStores`
-and auth roles under `kubernetesAuth` — so a create of either kind appends to
-`kv/<file>.yaml` rather than owning a file of its own. The file is created if this is its
-first entry, and an operation on one key leaves the other untouched.
+A values file holds one **list** of named stores under `kvStores`, so a create appends to
+`kv/<file>.yaml` rather than owning a file of its own; the file is created if this is its
+first store.
 
-The two are not independent in one direction: a role's `access` names the stores it
-reaches, so deleting a store something still points at is refused rather than orphaned.
-What `(store, capability)` *means* in Vault — the mount, the policy, the HCL — is the
-deploy pipeline's business; this service never generates any of it.
+A Kubernetes service account binding is **nested inside a store**, under
+`k8sServiceAccounts`, not stored beside it. That single fact removes a whole category of
+work: nothing points at a binding from elsewhere, so there is no referential rule, no
+cross-file uniqueness scan and no orphan to refuse — deleting a store takes its bindings
+with it. What a binding *means* in Vault — the mount, the policy, the HCL — is the deploy
+pipeline's business; this service never generates any of it.
 
 The create flow is a GitOps chain with two CI gates:
 
@@ -31,7 +32,7 @@ revert PR and a second human decision.
 """
 
 import uuid
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 import yaml
 from loguru import logger
@@ -40,33 +41,32 @@ from tashtiot_apis_library.connectors import ExternalServiceError
 from ...clients.bitbucket import PullRequest
 from ...clients.woodpecker import Pipeline, PipelineTimeoutError
 from ...helpers import (
+    K8sServiceAccountIdentity,
+    K8sServiceAccountNotFound,
     KVStoreNotFound,
-    add_kubernetes_auth_role,
+    add_k8s_service_account,
     add_kv_store,
     build_branch_name,
-    build_kubernetes_auth_role,
+    build_k8s_service_account,
     build_kv_store,
-    find_kubernetes_auth_role,
+    find_k8s_service_account,
     find_kv_store,
-    kubernetes_auth_role_identities,
-    kubernetes_auth_roles,
+    k8s_service_account_identity,
+    k8s_service_accounts,
     kv_store_names,
-    kv_store_referrers,
-    remove_kubernetes_auth_role,
+    remove_k8s_service_account,
     remove_kv_store,
     render_values_yaml,
-    update_kubernetes_auth_role,
     update_kv_store,
     values_file_path,
     yaml_data_equals,
 )
 from .conf import config
 from .schemas import (
+    K8sServiceAccountCreate,
     OperationStatus,
     PipelineInfo,
     PullRequestInfo,
-    VaultKubernetesAuthCreate,
-    VaultKubernetesAuthUpdate,
     VaultKVCreate,
     VaultKVUpdate,
     VaultOperationResponse,
@@ -86,7 +86,6 @@ class VaultOperationError(Exception):
         kv_name: str = "",
         file: str = "",
         status_code: int = 502,
-        role_name: str = "",
         pull_request: Optional[PullRequest] = None,
         validation_pipeline: Optional[Pipeline] = None,
         deploy_pipeline: Optional[Pipeline] = None,
@@ -96,7 +95,6 @@ class VaultOperationError(Exception):
         self.kv_name = kv_name
         self.file = file
         self.status_code = status_code
-        self.role_name = role_name
         self.pull_request = pull_request
         self.validation_pipeline = validation_pipeline
         self.deploy_pipeline = deploy_pipeline
@@ -104,15 +102,14 @@ class VaultOperationError(Exception):
     def to_response(self) -> "VaultOperationResponse":
         """The failed response body, so the route only has to pick the HTTP status.
 
-        `role_name` has to be carried through here as well as `kv_name`: this is the single
-        constructor of the failure body, so a field it forgets is a field every failure
-        response silently omits.
+        This is the single constructor of the failure body, so a field it forgets is a
+        field every failure response silently omits — failures are *returned* as a
+        JSONResponse, so FastAPI never validates them against the model.
         """
         return VaultOperationResponse(
             status=OperationStatus.FAILED,
             message=self.message,
             kv_name=self.kv_name,
-            role_name=self.role_name,
             file=self.file,
             pull_request=_pull_request_info(self.pull_request),
             validation_pipeline=_pipeline_info(self.validation_pipeline),
@@ -219,7 +216,7 @@ async def _decline_and_cleanup(bitbucket: Any, pull_request: PullRequest, branch
 
 
 async def _read_document(
-    bitbucket: Any, path: str, kv_name: str, file: str, role_name: str = ""
+    bitbucket: Any, path: str, kv_name: str, file: str
 ) -> Optional[Dict[str, Any]]:
     """Parsed values file at the base branch, or None when it does not exist yet.
 
@@ -240,7 +237,6 @@ async def _read_document(
             f"{path} exists on {base_branch} but is not valid YAML: {parse_error}",
             kv_name=kv_name,
             file=file,
-            role_name=role_name,
         ) from parse_error
 
     # `kvStores:` with nothing under it parses to None — an empty file, not a broken one.
@@ -249,7 +245,6 @@ async def _read_document(
             f"{path} exists on {base_branch} but is not a YAML mapping",
             kv_name=kv_name,
             file=file,
-            role_name=role_name,
         )
     return parsed
 
@@ -257,13 +252,14 @@ async def _read_document(
 async def _walk_values_files(bitbucket: Any) -> AsyncIterator[Tuple[str, Any]]:
     """Every parsed yaml under `VAULT_VALUES_DIR` on the base branch, path first.
 
-    Three scans need this — the store-name scan, the auth-role uniqueness scan and the
-    referential check a delete runs — so "read and parse every file, skipping the ones that
-    cannot be parsed" has one implementation. A file we did not write, or a bad merge, is
-    logged and skipped rather than blocking an unrelated operation.
+    One caller today — the create's store-name scan — because store names are the only
+    thing in this format with a values-dir-wide namespace. It stays a separate generator
+    so that "read and parse every file, skipping the ones that cannot be parsed" has one
+    implementation whenever a second dir-wide question appears. A file we did not write,
+    or a bad merge, is logged and skipped rather than blocking an unrelated operation.
 
-    It costs a directory listing plus a read per file, which is why every caller does it
-    once, up front, and takes everything it needs out of the same pass.
+    It costs a directory listing plus a read per file, which is why a caller does it once,
+    up front, and takes everything it needs out of the same pass.
     """
     base_branch = config.VAULT_VALUES_REPO_BASE_BRANCH
     values_dir = config.VAULT_VALUES_DIR
@@ -319,7 +315,6 @@ async def _open_pull_request(
     summary: str,
     description: str,
     kv_name: str = "",
-    role_name: str = "",
     source_commit_id: Optional[str] = None,
 ) -> PullRequest:
     """branch -> commit -> open PR, and nothing after that.
@@ -327,10 +322,10 @@ async def _open_pull_request(
     Both rollbacks live here: a failed commit or a failed PR deletes the branch, so a
     failure leaves the repo exactly as it was found. Touches no CI and never merges.
 
-    Shared by `_commit_via_pull_request` (which goes on to gate and merge) and both PR-only
-    operations (which stop here). One implementation means they cannot drift apart in what
-    they roll back. `kv_name` / `role_name` only name the subject in the log line — exactly
-    one of them is set, by whichever resource kind is being written.
+    Shared by `_commit_via_pull_request` (which goes on to gate and merge) and all four
+    PR-only operations (which stop here). One implementation means they cannot drift apart
+    in what they roll back. `kv_name` only names the subject in the log line; a binding
+    operation passes the store it edits, since that is what the diff touches.
     """
     base_branch = config.VAULT_VALUES_REPO_BASE_BRANCH
 
@@ -359,7 +354,7 @@ async def _open_pull_request(
         await _delete_branch_quietly(bitbucket, branch)
         raise
 
-    logger.info(f"Opened pull request {pull_request.id} for {role_name or kv_name}")
+    logger.info(f"Opened pull request {pull_request.id} for {kv_name}")
     return pull_request
 
 
@@ -373,15 +368,14 @@ async def _commit_via_pull_request(
     summary: str,
     description: str,
     kv_name: str = "",
-    role_name: str = "",
     source_commit_id: Optional[str] = None,
 ) -> Tuple[PullRequest, Pipeline, Pipeline]:
     """branch -> commit -> PR -> gate 1 -> merge -> gate 2, with every rollback.
 
-    Shared by every mutating flow over both resource kinds: the only thing that differs
+    Shared by every mutating flow — stores and bindings alike: the only thing that differs
     between them is what gets written and whether an optimistic-lock token is needed.
     Keeping one implementation means the rollback asymmetry cannot drift between
-    operations. `kv_name` / `role_name` are carried only so a failure names its subject.
+    operations. `kv_name` is carried only so a failure names its subject.
 
     Returns the merged pull request and both pipelines. Raises `VaultOperationError` for
     every business failure, having already rolled back whatever is still safe to roll back.
@@ -401,7 +395,6 @@ async def _commit_via_pull_request(
         summary=summary,
         description=description,
         kv_name=kv_name,
-        role_name=role_name,
         source_commit_id=source_commit_id,
     )
 
@@ -415,7 +408,6 @@ async def _commit_via_pull_request(
         raise VaultOperationError(
             f"Validation pipeline did not complete: {timeout_error.message}",
             kv_name=kv_name,
-            role_name=role_name,
             status_code=504,
             pull_request=pull_request,
             validation_pipeline=timeout_error.pipeline,
@@ -426,7 +418,6 @@ async def _commit_via_pull_request(
         raise VaultOperationError(
             _pipeline_failure("Validation", validation),
             kv_name=kv_name,
-            role_name=role_name,
             pull_request=pull_request,
             validation_pipeline=validation,
         )
@@ -443,12 +434,11 @@ async def _commit_via_pull_request(
             f"Pull request {pull_request.id} passed validation but could not be merged: "
             f"{merge_error.detail}",
             kv_name=kv_name,
-            role_name=role_name,
             pull_request=pull_request,
             validation_pipeline=validation,
         ) from merge_error
 
-    logger.info(f"Merged pull request {merged.id} for {role_name or kv_name}")
+    logger.info(f"Merged pull request {merged.id} for {kv_name}")
 
     # ---- 5. deploy pipeline ------------------------------------------------ #
     try:
@@ -460,7 +450,6 @@ async def _commit_via_pull_request(
             f"Deploy pipeline did not complete: {timeout_error.message}. "
             f"The change is already merged to {base_branch}.",
             kv_name=kv_name,
-            role_name=role_name,
             status_code=504,
             pull_request=merged,
             validation_pipeline=validation,
@@ -472,7 +461,6 @@ async def _commit_via_pull_request(
             f"{_pipeline_failure('Deploy', deploy)}. "
             f"The change is already merged to {base_branch} and needs a revert.",
             kv_name=kv_name,
-            role_name=role_name,
             pull_request=merged,
             validation_pipeline=validation,
             deploy_pipeline=deploy,
@@ -604,17 +592,16 @@ async def create_kv_pull_request_operation(
 # edits to an existing store
 # --------------------------------------------------------------------------- #
 async def _require_document(
-    bitbucket: Any, path: str, kv_name: str, file: str, role_name: str = ""
+    bitbucket: Any, path: str, kv_name: str, file: str
 ) -> Dict[str, Any]:
     """Like `_read_document`, but a missing file is a 404 rather than an empty start."""
-    document = await _read_document(bitbucket, path, kv_name, file, role_name)
+    document = await _read_document(bitbucket, path, kv_name, file)
     if document is None:
         raise VaultOperationError(
             f"{file} does not exist ({path} is not on "
             f"{config.VAULT_VALUES_REPO_BASE_BRANCH})",
             kv_name=kv_name,
             file=file,
-            role_name=role_name,
             status_code=404,
         )
     return document
@@ -708,33 +695,6 @@ async def update_kv_mount_operation(
 # --------------------------------------------------------------------------- #
 # removing a store
 # --------------------------------------------------------------------------- #
-async def _assert_no_referrers(bitbucket: Any, kv_name: str, file: str) -> None:
-    """Refuse to delete a store a Kubernetes auth role still names in its `access`.
-
-    Scoped to the whole values directory, not the target file: a role in `kv/platform.yaml`
-    may perfectly well reach a store defined in `kv/payments.yaml`.
-
-    The alternative was cascading the delete into those roles, which is a multi-resource
-    mutation hidden behind a single-resource URI — the blast radius would be invisible in
-    the request. Orphaning the binding silently is worse still, so this refuses and names
-    the blockers, and the caller deletes them first.
-    """
-    blockers = []
-    async for path, parsed in _walk_values_files(bitbucket):
-        referrers = kv_store_referrers(parsed, kv_name)
-        if referrers:
-            blockers.append(f"{', '.join(referrers)} ({path})")
-
-    if blockers:
-        raise VaultOperationError(
-            f"{kv_name} is referenced by kubernetesAuth role(s) {'; '.join(blockers)}; "
-            f"delete those first",
-            kv_name=kv_name,
-            file=file,
-            status_code=409,
-        )
-
-
 async def _prepare_delete(
     bitbucket: Any, file: str, kv_name: str
 ) -> Tuple[str, str, Optional[str]]:
@@ -743,10 +703,12 @@ async def _prepare_delete(
     The counterpart of `_prepare_create`, and shared by both delete paths for the same
     reason: they cannot then disagree about what is a 404.
 
-    It walks the values directory like a create does, but for the opposite question: not
-    "is this name free" (a create-only concern) but "does anything still point at it".
-    Unlike an update there is no `yaml_data_equals` short circuit either — if
-    `remove_kv_store` did not raise, the document changed. A removal is never a no-op.
+    Unlike a create it runs **no scan at all**. Uniqueness is a create-only concern, and
+    there is nothing referential to check: a store's Kubernetes service accounts are nested
+    inside it, so removing the store removes its bindings in the same diff and no reference
+    is left dangling anywhere in the values directory. There is no `yaml_data_equals` short
+    circuit either — if `remove_kv_store` did not raise, the document changed. A removal is
+    never a no-op.
     """
     path = values_file_path(config.VAULT_VALUES_DIR, file)
     current = await _require_document(bitbucket, path, kv_name, file)
@@ -760,8 +722,6 @@ async def _prepare_delete(
             file=file,
             status_code=404,
         ) from missing
-
-    await _assert_no_referrers(bitbucket, kv_name, file)
 
     # The file exists by definition here, so the write is an edit and Bitbucket wants the
     # optimistic-lock token for that path.
@@ -892,316 +852,130 @@ async def get_kv_store_operation(
 
 
 # --------------------------------------------------------------------------- #
-# Kubernetes auth roles
+# Kubernetes service accounts
 #
-# A second kind of entry in the same values file, so every one of these runs the *same*
-# chain over the *same* file: `_open_pull_request` and `_commit_via_pull_request` are
-# reused verbatim, which is what keeps the rollback asymmetry identical. The merge is the
-# point of no return here too.
+# A binding is a sub-resource of a store, not a resource kind of its own, and that changes
+# what these operations have to do rather than how they do it. The chain is unchanged —
+# `_open_pull_request` and `_commit_via_pull_request` are reused verbatim, so the rollback
+# asymmetry is identical and the merge is still the point of no return.
 #
-# What differs is only what is prepared before the branch exists, because a role has two
-# things a store does not: an identity that includes an optional cluster, and a reference
-# to stores that must already be there.
+# What is *absent* is the point. Because the binding lives inside the store, there is no
+# cross-file scan here at all: no uniqueness walk (a binding is unique within its store,
+# and the same service account may legitimately reach many stores), no store-existence
+# check (the store is the thing being edited — if it is not there, that is the 404), and
+# no referential rule (nothing points at a binding, so nothing can dangle).
 # --------------------------------------------------------------------------- #
-def _k8s_branch_for(file: str, role_name: str, branch_suffix: Optional[str]) -> str:
-    """Its own prefix, so a reviewer can tell the change kind from the branch name."""
+def _k8s_sa_branch_for(file: str, kv_name: str, branch_suffix: Optional[str]) -> str:
+    """Its own prefix, so a reviewer can tell the change kind from the branch name.
+
+    Keyed on the store, not the binding: the triple has no name to slug, and the store is
+    what the diff touches.
+    """
     return build_branch_name(
         file,
-        role_name,
+        kv_name,
         branch_suffix or uuid.uuid4().hex[:8],
-        config.K8S_AUTH_BRANCH_PREFIX,
+        config.K8S_SA_BRANCH_PREFIX,
     )
 
 
-def _k8s_description(path: str, role_name: str, change: str) -> str:
+def _identity_text(identity: K8sServiceAccountIdentity) -> str:
+    """The triple as one human-readable token, for messages and PR descriptions."""
+    service_account, namespace, cluster = identity
+    return f"{service_account} in {namespace} on {cluster}"
+
+
+def _k8s_sa_description(
+    path: str, kv_name: str, identity: K8sServiceAccountIdentity, change: str
+) -> str:
+    service_account, namespace, cluster = identity
     return (
         f"Automated by vault-api.\n\n"
         f"- file: {path}\n"
-        f"- kubernetes auth role: {role_name}\n"
-        f"- {change}\n"
+        f"- store: {kv_name}\n"
+        f"- change: {change}\n"
+        f"- serviceAccount: {service_account}\n"
+        f"- namespace: {namespace}\n"
+        f"- cluster: {cluster}\n"
     )
 
 
-def _access_stores(access: Dict[str, List[str]]) -> Set[str]:
-    return {store for stores in access.values() for store in stores}
+async def _require_store(
+    bitbucket: Any, path: str, file: str, kv_name: str
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """The parsed document and the one store inside it, or a 404 for whichever is missing.
 
-
-def _assert_stores_exist(
-    known_stores: Set[str],
-    access: Dict[str, List[str]],
-    file: str,
-    role_name: str,
-) -> None:
-    """Every store an `access` names must already be on the base branch.
-
-    Consequence worth knowing: a store created through `POST /kv/pull-request` is on an
-    unmerged branch, so a role referencing it straight away is a 409 until that pull
-    request lands. Same base-branch-only visibility that makes a repeat PR-only create open
-    a second pull request.
+    Both binding operations start here, which is why "unknown file" and "unknown store"
+    cannot answer differently between adding and removing one.
     """
-    missing = sorted(_access_stores(access) - known_stores)
-    if missing:
+    document = await _require_document(bitbucket, path, kv_name, file)
+
+    store = find_kv_store(document, kv_name)
+    if store is None:
         raise VaultOperationError(
-            f"access names unknown KV store(s) {missing}; they must already exist on "
-            f"{config.VAULT_VALUES_REPO_BASE_BRANCH}",
+            f"{kv_name} is not defined in {path}",
+            kv_name=kv_name,
             file=file,
-            role_name=role_name,
+            status_code=404,
+        )
+    return document, store
+
+
+async def _prepare_k8s_sa_add(
+    bitbucket: Any, file: str, kv_name: str, payload: K8sServiceAccountCreate
+) -> Tuple[str, str, Optional[str], K8sServiceAccountIdentity]:
+    """Everything adding a binding needs before it touches a branch.
+
+    Shared by the blocking path and its PR-only twin, the same way `_prepare_create` is, so
+    the two cannot disagree about what is a 404 and what is a 409.
+    """
+    path = values_file_path(config.VAULT_VALUES_DIR, file)
+    document, store = await _require_store(bitbucket, path, file, kv_name)
+
+    account = build_k8s_service_account(
+        payload.service_account, payload.namespace, payload.cluster
+    )
+    identity = k8s_service_account_identity(account)
+
+    # Unique within the store only. The same service account reaching two stores is the
+    # normal case — that is how one workload gets at two secrets.
+    if find_k8s_service_account(store, identity) is not None:
+        raise VaultOperationError(
+            f"{_identity_text(identity)} is already bound to {kv_name} in {path}",
+            kv_name=kv_name,
+            file=file,
             status_code=409,
         )
 
+    updated = add_k8s_service_account(document, kv_name, account)
 
-async def _prepare_k8s_auth_create(
-    bitbucket: Any, payload: VaultKubernetesAuthCreate
-) -> Tuple[str, str, Optional[str]]:
-    """Everything a Kubernetes auth create needs before it touches a branch.
-
-    Shared by both create paths for the same reason `_prepare_create` is: they cannot then
-    diverge on what counts as a duplicate. One directory walk answers both questions it
-    asks — is this role's identity taken, and do the stores it names exist.
-    """
-    base_branch = config.VAULT_VALUES_REPO_BASE_BRANCH
-    path = values_file_path(config.VAULT_VALUES_DIR, payload.file)
-
-    known_stores: Set[str] = set()
-    async for scanned_path, parsed in _walk_values_files(bitbucket):
-        known_stores.update(kv_store_names(parsed))
-
-        for cluster, name in kubernetes_auth_role_identities(parsed):
-            if name != payload.role_name:
-                continue
-            # Identity is `(cluster, name)`, with `""` standing in for an absent cluster:
-            # `cluster` is optional here (an estate with one Kubernetes auth mount has none
-            # to name), so its absence is itself a coordinate rather than a wildcard. The
-            # same role name in two *different* clusters is legitimate — a Vault k8s role
-            # is scoped to its mount.
-            if cluster == (payload.cluster or ""):
-                raise VaultOperationError(
-                    f"{payload.role_name} already exists (defined in {scanned_path} on "
-                    f"{base_branch})",
-                    file=payload.file,
-                    role_name=payload.role_name,
-                    status_code=409,
-                )
-            # Different cluster, same file: the routes address a role as
-            # `{file}/{role_name}`, so two of them in one file would be unaddressable.
-            if scanned_path == path:
-                raise VaultOperationError(
-                    f"{payload.role_name} already exists in {scanned_path} for cluster "
-                    f"'{cluster}'; a role name must be unique within a file",
-                    file=payload.file,
-                    role_name=payload.role_name,
-                    status_code=409,
-                )
-
-    _assert_stores_exist(known_stores, payload.access, payload.file, payload.role_name)
-
-    current = await _read_document(
-        bitbucket, path, kv_name="", file=payload.file, role_name=payload.role_name
-    )
-    updated = add_kubernetes_auth_role(
-        current,
-        build_kubernetes_auth_role(
-            payload.role_name,
-            payload.role_description,
-            payload.service_accounts,
-            payload.namespaces,
-            payload.access,
-            cluster=payload.cluster,
-            ttl=payload.ttl,
-        ),
-    )
-
-    source_commit_id = None
-    if current is not None:
-        source_commit_id = await bitbucket.get_last_commit(path, at=base_branch)
-
-    return path, render_values_yaml(updated), source_commit_id
-
-
-async def create_kubernetes_auth_operation(
-    bitbucket: Any,
-    woodpecker: Any,
-    payload: VaultKubernetesAuthCreate,
-    branch_suffix: Optional[str] = None,
-) -> VaultOperationResponse:
-    """Append the role to its file, then block until both pipelines have finished."""
-    path, content, source_commit_id = await _prepare_k8s_auth_create(bitbucket, payload)
-
-    merged, validation, deploy = await _commit_via_pull_request(
-        bitbucket,
-        woodpecker,
-        path=path,
-        content=content,
-        branch=_k8s_branch_for(payload.file, payload.role_name, branch_suffix),
-        summary=f"Create Kubernetes auth role {payload.role_name} in {payload.file}",
-        description=_k8s_description(
-            path, payload.role_name, f"access: {payload.access}"
-        ),
-        role_name=payload.role_name,
-        source_commit_id=source_commit_id,
-    )
-
-    return VaultOperationResponse(
-        status=OperationStatus.SUCCEEDED,
-        message=f"Successful creation of {payload.role_name}",
-        role_name=payload.role_name,
-        file=payload.file,
-        pull_request=_pull_request_info(merged),
-        validation_pipeline=_pipeline_info(validation),
-        deploy_pipeline=_pipeline_info(deploy),
-    )
-
-
-async def create_kubernetes_auth_pull_request_operation(
-    bitbucket: Any,
-    payload: VaultKubernetesAuthCreate,
-    branch_suffix: Optional[str] = None,
-) -> VaultOperationResponse:
-    """Open the pull request and stop — no CI gates, no merge.
-
-    Takes no Woodpecker client, exactly as the PR-only KV create does, and carries the same
-    two caveats: opening a pull request still triggers validation CI in the forge (this
-    just does not wait for it), and a repeat call opens a second pull request because the
-    uniqueness scan reads the base branch, where an unmerged role is not.
-    """
-    path, content, source_commit_id = await _prepare_k8s_auth_create(bitbucket, payload)
-
-    pull_request = await _open_pull_request(
-        bitbucket,
-        path=path,
-        content=content,
-        branch=_k8s_branch_for(payload.file, payload.role_name, branch_suffix),
-        summary=f"Create Kubernetes auth role {payload.role_name} in {payload.file}",
-        description=_k8s_description(
-            path, payload.role_name, f"access: {payload.access}"
-        ),
-        role_name=payload.role_name,
-        source_commit_id=source_commit_id,
-    )
-
-    return VaultOperationResponse(
-        status=OperationStatus.SUCCEEDED,
-        message=(
-            f"Opened pull request {pull_request.id} for {payload.role_name}. "
-            f"It is not merged — review, CI and merge are up to you."
-        ),
-        role_name=payload.role_name,
-        file=payload.file,
-        pull_request=_pull_request_info(pull_request),
-    )
-
-
-async def update_kubernetes_auth_operation(
-    bitbucket: Any,
-    woodpecker: Any,
-    file: str,
-    role_name: str,
-    payload: VaultKubernetesAuthUpdate,
-    branch_suffix: Optional[str] = None,
-) -> VaultOperationResponse:
-    """Edit one role. Its name, its cluster and its siblings are untouched.
-
-    An edit that changes nothing returns success without opening a pull request, exactly as
-    a KV update does. A changed `access` re-runs the "every store named exists" check —
-    otherwise an edit could introduce the dangling reference a create refuses.
-    """
-    path = values_file_path(config.VAULT_VALUES_DIR, file)
-    current = await _require_document(
-        bitbucket, path, kv_name="", file=file, role_name=role_name
-    )
-
-    try:
-        updated = update_kubernetes_auth_role(
-            current,
-            role_name,
-            role_description=payload.role_description,
-            service_accounts=payload.service_accounts,
-            namespaces=payload.namespaces,
-            access=payload.access,
-            ttl=payload.ttl,
-        )
-    except KVStoreNotFound as missing:
-        raise VaultOperationError(
-            f"{role_name} is not defined in {path}",
-            file=file,
-            role_name=role_name,
-            status_code=404,
-        ) from missing
-
-    if payload.access is not None:
-        known_stores: Set[str] = set()
-        async for _, parsed in _walk_values_files(bitbucket):
-            known_stores.update(kv_store_names(parsed))
-        _assert_stores_exist(known_stores, payload.access, file, role_name)
-
-    if yaml_data_equals(current, updated):
-        logger.info(f"No change required for {role_name}; skipping the pull request")
-        return VaultOperationResponse(
-            status=OperationStatus.SUCCEEDED,
-            message=f"No changes required for {role_name}",
-            role_name=role_name,
-            file=file,
-        )
-
-    changes = ", ".join(
-        f"{field}: {value}"
-        for field, value in (
-            ("description", payload.role_description),
-            ("service accounts", payload.service_accounts),
-            ("namespaces", payload.namespaces),
-            ("access", payload.access),
-            ("ttl", payload.ttl),
-        )
-        if value is not None
-    )
-
+    # The file exists by definition here, so the write is an edit and Bitbucket wants the
+    # optimistic-lock token for that path.
     source_commit_id = await bitbucket.get_last_commit(
         path, at=config.VAULT_VALUES_REPO_BASE_BRANCH
     )
 
-    merged, validation, deploy = await _commit_via_pull_request(
-        bitbucket,
-        woodpecker,
-        path=path,
-        content=render_values_yaml(updated),
-        branch=_k8s_branch_for(file, role_name, branch_suffix),
-        summary=f"Update Kubernetes auth role {role_name} in {file}",
-        description=_k8s_description(path, role_name, f"changes: {changes}"),
-        role_name=role_name,
-        source_commit_id=source_commit_id,
-    )
-
-    return VaultOperationResponse(
-        status=OperationStatus.SUCCEEDED,
-        message=f"Successful update of {role_name}",
-        role_name=role_name,
-        file=file,
-        pull_request=_pull_request_info(merged),
-        validation_pipeline=_pipeline_info(validation),
-        deploy_pipeline=_pipeline_info(deploy),
-    )
+    return path, render_values_yaml(updated), source_commit_id, identity
 
 
-async def _prepare_k8s_auth_delete(
-    bitbucket: Any, file: str, role_name: str
+async def _prepare_k8s_sa_remove(
+    bitbucket: Any, file: str, kv_name: str, identity: K8sServiceAccountIdentity
 ) -> Tuple[str, str, Optional[str]]:
-    """Everything a Kubernetes auth delete needs before it touches a branch.
+    """Everything removing a binding needs before it touches a branch.
 
-    No referential check in this direction: a KV store with no auth role pointing at it is
-    perfectly valid, so only the reverse (deleting a *store*) can orphan anything.
+    No `yaml_data_equals` short circuit, for the same reason a store delete has none: if
+    `remove_k8s_service_account` did not raise, the document changed.
     """
     path = values_file_path(config.VAULT_VALUES_DIR, file)
-    current = await _require_document(
-        bitbucket, path, kv_name="", file=file, role_name=role_name
-    )
+    document, _ = await _require_store(bitbucket, path, file, kv_name)
 
     try:
-        updated = remove_kubernetes_auth_role(current, role_name)
-    except KVStoreNotFound as missing:
+        updated = remove_k8s_service_account(document, kv_name, identity)
+    except K8sServiceAccountNotFound as missing:
         raise VaultOperationError(
-            f"{role_name} is not defined in {path}",
+            f"{_identity_text(identity)} is not bound to {kv_name} in {path}",
+            kv_name=kv_name,
             file=file,
-            role_name=role_name,
             status_code=404,
         ) from missing
 
@@ -1212,16 +986,17 @@ async def _prepare_k8s_auth_delete(
     return path, render_values_yaml(updated), source_commit_id
 
 
-async def delete_kubernetes_auth_operation(
+async def add_k8s_service_account_operation(
     bitbucket: Any,
     woodpecker: Any,
     file: str,
-    role_name: str,
+    kv_name: str,
+    payload: K8sServiceAccountCreate,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
-    """Remove one role from its file, then block until both pipelines have finished."""
-    path, content, source_commit_id = await _prepare_k8s_auth_delete(
-        bitbucket, file, role_name
+    """Bind a service account to a store, then block until both pipelines have finished."""
+    path, content, source_commit_id, identity = await _prepare_k8s_sa_add(
+        bitbucket, file, kv_name, payload
     )
 
     merged, validation, deploy = await _commit_via_pull_request(
@@ -1229,17 +1004,19 @@ async def delete_kubernetes_auth_operation(
         woodpecker,
         path=path,
         content=content,
-        branch=_k8s_branch_for(file, role_name, branch_suffix),
-        summary=f"Delete Kubernetes auth role {role_name} from {file}",
-        description=_k8s_description(path, role_name, "change: removed"),
-        role_name=role_name,
+        branch=_k8s_sa_branch_for(file, kv_name, branch_suffix),
+        summary=f"Bind service account {payload.service_account} to {kv_name} in {file}",
+        description=_k8s_sa_description(
+            path, kv_name, identity, "added to k8sServiceAccounts"
+        ),
+        kv_name=kv_name,
         source_commit_id=source_commit_id,
     )
 
     return VaultOperationResponse(
         status=OperationStatus.SUCCEEDED,
-        message=f"Successful deletion of {role_name}",
-        role_name=role_name,
+        message=f"Successfully bound {_identity_text(identity)} to {kv_name}",
+        kv_name=kv_name,
         file=file,
         pull_request=_pull_request_info(merged),
         validation_pipeline=_pipeline_info(validation),
@@ -1247,70 +1024,140 @@ async def delete_kubernetes_auth_operation(
     )
 
 
-async def delete_kubernetes_auth_pull_request_operation(
+async def add_k8s_service_account_pull_request_operation(
     bitbucket: Any,
     file: str,
-    role_name: str,
+    kv_name: str,
+    payload: K8sServiceAccountCreate,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
-    """Open the pull request that removes the role, and stop — no CI gates, no merge."""
-    path, content, source_commit_id = await _prepare_k8s_auth_delete(
-        bitbucket, file, role_name
+    """Open the pull request that adds the binding, and stop — no CI gates, no merge.
+
+    Takes no Woodpecker client, exactly as the other PR-only operations do, and carries the
+    same two consequences: the forge still runs the validation pipeline (it is simply not
+    waited on), and a repeat call opens a second pull request because the first is not on
+    the base branch for the duplicate check to see.
+    """
+    path, content, source_commit_id, identity = await _prepare_k8s_sa_add(
+        bitbucket, file, kv_name, payload
     )
 
     pull_request = await _open_pull_request(
         bitbucket,
         path=path,
         content=content,
-        branch=_k8s_branch_for(file, role_name, branch_suffix),
-        summary=f"Delete Kubernetes auth role {role_name} from {file}",
-        description=_k8s_description(path, role_name, "change: removed"),
-        role_name=role_name,
+        branch=_k8s_sa_branch_for(file, kv_name, branch_suffix),
+        summary=f"Bind service account {payload.service_account} to {kv_name} in {file}",
+        description=_k8s_sa_description(
+            path, kv_name, identity, "added to k8sServiceAccounts"
+        ),
+        kv_name=kv_name,
         source_commit_id=source_commit_id,
     )
 
     return VaultOperationResponse(
         status=OperationStatus.SUCCEEDED,
         message=(
-            f"Opened pull request {pull_request.id} to delete {role_name}. "
+            f"Opened pull request {pull_request.id} to bind "
+            f"{_identity_text(identity)} to {kv_name}. "
             f"It is not merged — review, CI and merge are up to you."
         ),
-        role_name=role_name,
+        kv_name=kv_name,
         file=file,
         pull_request=_pull_request_info(pull_request),
     )
 
 
-async def get_kubernetes_auth_file_operation(
-    bitbucket: Any, file: str
+async def remove_k8s_service_account_operation(
+    bitbucket: Any,
+    woodpecker: Any,
+    file: str,
+    kv_name: str,
+    identity: K8sServiceAccountIdentity,
+    branch_suffix: Optional[str] = None,
+) -> VaultOperationResponse:
+    """Unbind a service account from a store, then block until both pipelines finish.
+
+    Removing the store's last binding drops the `k8sServiceAccounts` key entirely, leaving
+    the store exactly as a fresh create would have written it.
+    """
+    path, content, source_commit_id = await _prepare_k8s_sa_remove(
+        bitbucket, file, kv_name, identity
+    )
+
+    service_account, _, _ = identity
+    merged, validation, deploy = await _commit_via_pull_request(
+        bitbucket,
+        woodpecker,
+        path=path,
+        content=content,
+        branch=_k8s_sa_branch_for(file, kv_name, branch_suffix),
+        summary=f"Unbind service account {service_account} from {kv_name} in {file}",
+        description=_k8s_sa_description(
+            path, kv_name, identity, "removed from k8sServiceAccounts"
+        ),
+        kv_name=kv_name,
+        source_commit_id=source_commit_id,
+    )
+
+    return VaultOperationResponse(
+        status=OperationStatus.SUCCEEDED,
+        message=f"Successfully unbound {_identity_text(identity)} from {kv_name}",
+        kv_name=kv_name,
+        file=file,
+        pull_request=_pull_request_info(merged),
+        validation_pipeline=_pipeline_info(validation),
+        deploy_pipeline=_pipeline_info(deploy),
+    )
+
+
+async def remove_k8s_service_account_pull_request_operation(
+    bitbucket: Any,
+    file: str,
+    kv_name: str,
+    identity: K8sServiceAccountIdentity,
+    branch_suffix: Optional[str] = None,
+) -> VaultOperationResponse:
+    """Open the pull request that removes the binding, and stop — no CI gates, no merge."""
+    path, content, source_commit_id = await _prepare_k8s_sa_remove(
+        bitbucket, file, kv_name, identity
+    )
+
+    service_account, _, _ = identity
+    pull_request = await _open_pull_request(
+        bitbucket,
+        path=path,
+        content=content,
+        branch=_k8s_sa_branch_for(file, kv_name, branch_suffix),
+        summary=f"Unbind service account {service_account} from {kv_name} in {file}",
+        description=_k8s_sa_description(
+            path, kv_name, identity, "removed from k8sServiceAccounts"
+        ),
+        kv_name=kv_name,
+        source_commit_id=source_commit_id,
+    )
+
+    return VaultOperationResponse(
+        status=OperationStatus.SUCCEEDED,
+        message=(
+            f"Opened pull request {pull_request.id} to unbind "
+            f"{_identity_text(identity)} from {kv_name}. "
+            f"It is not merged — review, CI and merge are up to you."
+        ),
+        kv_name=kv_name,
+        file=file,
+        pull_request=_pull_request_info(pull_request),
+    )
+
+
+async def get_k8s_service_accounts_operation(
+    bitbucket: Any, file: str, kv_name: str
 ) -> List[Dict[str, Any]]:
-    """Every Kubernetes auth role in a values file.
+    """Every binding on one store.
 
-    A file with none answers `200` with an empty list rather than `404`: the file exists,
-    it just declares no roles. Only a missing *file* is a 404.
+    A store that binds nothing answers 200 with an empty list — it simply has no
+    `k8sServiceAccounts` key. Only a missing file or a missing store is a 404.
     """
     path = values_file_path(config.VAULT_VALUES_DIR, file)
-    document = await _require_document(bitbucket, path, kv_name="", file=file)
-    return kubernetes_auth_roles(document)
-
-
-async def get_kubernetes_auth_role_operation(
-    bitbucket: Any, file: str, role_name: str
-) -> Dict[str, Any]:
-    """One Kubernetes auth role out of a values file."""
-    path = values_file_path(config.VAULT_VALUES_DIR, file)
-    document = await _require_document(
-        bitbucket, path, kv_name="", file=file, role_name=role_name
-    )
-
-    role = find_kubernetes_auth_role(document, role_name)
-    if role is None:
-        raise VaultOperationError(
-            f"{role_name} is not defined in {path}",
-            file=file,
-            role_name=role_name,
-            status_code=404,
-        )
-    return role
-
-
+    _, store = await _require_store(bitbucket, path, file, kv_name)
+    return k8s_service_accounts(store)

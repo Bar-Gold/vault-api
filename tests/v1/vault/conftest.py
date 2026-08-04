@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from app.v1.vault.schemas import VaultKubernetesAuthCreate, VaultKVCreate
+from app.v1.vault.schemas import K8sServiceAccountCreate, VaultKVCreate
 from tests.fakes import FakeBitbucket, FakeWoodpecker, make_pipeline
 
 
@@ -17,16 +17,22 @@ def payload():
 
 
 @pytest.fixture
-def role_payload():
-    """A Kubernetes auth role reaching the store the `payload` fixture creates."""
-    return VaultKubernetesAuthCreate(
-        file="payments",
-        role_name="myapp-ci",
-        role_description="CI deployer for the payments app",
-        cluster="prod-il-1",
-        service_accounts=["vault-reader"],
-        namespaces=["payments"],
-        access={"read": ["myapp"]},
+def account_payload():
+    """A service account binding for the store the `payload` fixture creates."""
+    return K8sServiceAccountCreate(
+        service_account="vault",
+        namespace="payments",
+        cluster="dev",
+    )
+
+
+@pytest.fixture
+def account_identity(account_payload):
+    """The same binding as the `(serviceAccount, namespace, cluster)` a delete takes."""
+    return (
+        account_payload.service_account,
+        account_payload.namespace,
+        account_payload.cluster,
     )
 
 

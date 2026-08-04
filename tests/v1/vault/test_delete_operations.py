@@ -8,8 +8,7 @@ import yaml
 from tashtiot_apis_library.connectors import ExternalServiceError
 
 from app.helpers import (
-    add_kubernetes_auth_role,
-    build_kubernetes_auth_role,
+    build_k8s_service_account,
     build_kv_store,
     build_kv_stores_document,
     render_values_yaml,
@@ -25,6 +24,7 @@ KV = "myapp"
 FILE = "payments"
 VALUES_PATH = "kv/payments.yaml"
 ROLES = {"read": ["app01.corp.example.com"]}
+ACCOUNT = build_k8s_service_account("vault", "payments", "dev")
 
 
 def _seed(bitbucket, *names, path=VALUES_PATH):
@@ -113,9 +113,7 @@ async def test_delete_call_order(bitbucket, woodpecker):
     await _delete(bitbucket, woodpecker)
 
     assert bitbucket.calls == [
-        "get_file_content",  # read the target file
-        "list_files",  # walk the values dir for kubernetesAuth referrers
-        "get_file_content",
+        "get_file_content",  # read the target file — and nothing else; no dir walk
         "get_last_commit",
         "create_branch",
         "put_file",
@@ -189,110 +187,80 @@ async def test_a_repeat_delete_is_404(bitbucket, woodpecker):
 
 
 # --------------------------------------------------------------------------- #
-# referential integrity
+# bindings go with the store
 #
-# A Kubernetes auth role names the stores it reaches. Deleting one out from under a role
-# would orphan the binding silently, and cascading into those roles would be a
-# multi-resource mutation hidden behind a single-resource URI — so this refuses instead,
-# and names the blockers.
+# A store's Kubernetes service accounts are nested inside it, so a delete removes them in
+# the same diff. There is nothing to orphan and nothing to refuse — which is why a delete
+# runs no values-dir scan at all, and why an earlier revision's 409 for a "still
+# referenced" store has no counterpart here.
 # --------------------------------------------------------------------------- #
-def _seed_role(bitbucket, path, store, role_name="myapp-ci", capability="read"):
-    document = build_kv_stores_document([])
-    document = add_kubernetes_auth_role(
-        document,
-        build_kubernetes_auth_role(
-            role_name,
-            "CI deployer",
-            ["vault-reader"],
-            ["payments"],
-            {capability: [store]},
-        ),
+def _seed_bound(bitbucket, *names, path=VALUES_PATH, accounts=None):
+    """Seed stores whose entries already carry a `k8sServiceAccounts` list."""
+    document = build_kv_stores_document(
+        [build_kv_store(n, "payments secrets", ROLES) for n in names]
     )
+    for store in document["kvStores"]:
+        store["roles"]["k8sServiceAccounts"] = list(
+            accounts if accounts is not None else [ACCOUNT]
+        )
     bitbucket.existing_files[path] = render_values_yaml(document)
 
 
-async def test_deleting_a_referenced_store_is_409(bitbucket, woodpecker):
-    _seed(bitbucket, KV)
-    _seed_role(bitbucket, "kv/platform.yaml", KV)
-
-    with pytest.raises(VaultOperationError) as error:
-        await _delete(bitbucket, woodpecker)
-
-    assert error.value.status_code == 409
-    assert "create_branch" not in bitbucket.calls
-
-
-async def test_the_409_names_the_referrers_and_their_file(bitbucket, woodpecker):
-    """The message is the actionable part: which roles, and where to find them."""
-    _seed(bitbucket, KV)
-    _seed_role(bitbucket, "kv/platform.yaml", KV)
-
-    with pytest.raises(VaultOperationError) as error:
-        await _delete(bitbucket, woodpecker)
-
-    assert error.value.message == (
-        f"{KV} is referenced by kubernetesAuth role(s) myapp-ci (kv/platform.yaml); "
-        f"delete those first"
-    )
-
-
-async def test_a_referrer_in_the_same_file_also_blocks(bitbucket, woodpecker):
-    _seed(bitbucket, KV)
-    bitbucket.existing_files[VALUES_PATH] = render_values_yaml(
-        add_kubernetes_auth_role(
-            yaml.safe_load(bitbucket.existing_files[VALUES_PATH]),
-            build_kubernetes_auth_role(
-                "myapp-ci", "d", ["vault-reader"], ["payments"], {"read": [KV]}
-            ),
-        )
-    )
-
-    with pytest.raises(VaultOperationError) as error:
-        await _delete(bitbucket, woodpecker)
-
-    assert error.value.status_code == 409
-    assert VALUES_PATH in error.value.message
-
-
-async def test_a_write_reference_blocks_too(bitbucket, woodpecker):
-    _seed(bitbucket, KV)
-    _seed_role(bitbucket, "kv/platform.yaml", KV, capability="write")
-
-    with pytest.raises(VaultOperationError) as error:
-        await _delete(bitbucket, woodpecker)
-
-    assert error.value.status_code == 409
-
-
-async def test_an_unreferenced_store_deletes_normally(bitbucket, woodpecker):
-    """A role pointing at a *different* store must not block this one."""
-    _seed(bitbucket, KV)
-    _seed_role(bitbucket, "kv/platform.yaml", "billing")
+async def test_deleting_a_bound_store_succeeds(bitbucket, woodpecker):
+    """No referential check stands in the way — the binding is part of what is removed."""
+    _seed_bound(bitbucket, KV)
 
     result = await _delete(bitbucket, woodpecker)
 
     assert result.status.value == "Succeeded"
 
 
-async def test_deleting_the_role_first_unblocks_the_store(bitbucket, woodpecker):
-    """The remedy the error message prescribes has to actually work."""
-    _seed(bitbucket, KV)
-    _seed_role(bitbucket, "kv/platform.yaml", KV)
-    del bitbucket.existing_files["kv/platform.yaml"]
+async def test_deleting_a_bound_store_removes_its_bindings(bitbucket, woodpecker):
+    _seed_bound(bitbucket, KV)
+
+    await _delete(bitbucket, woodpecker)
+
+    assert _committed(bitbucket) == {"kvStores": []}
+    assert "serviceAccount" not in bitbucket.committed[VALUES_PATH]
+
+
+async def test_deleting_one_store_leaves_a_siblings_bindings_alone(bitbucket, woodpecker):
+    _seed_bound(bitbucket, KV, "billing")
+
+    await _delete(bitbucket, woodpecker)
+
+    remaining = _committed(bitbucket)["kvStores"]
+    assert [s["name"] for s in remaining] == ["billing"]
+    assert remaining[0]["roles"]["k8sServiceAccounts"] == [ACCOUNT]
+
+
+async def test_delete_reads_only_the_addressed_file(bitbucket, woodpecker):
+    """The dir walk is gone: a binding elsewhere cannot reach this store, so nothing to scan."""
+    _seed_bound(bitbucket, KV)
+    _seed_bound(bitbucket, "elsewhere", path="kv/platform.yaml")
+
+    await _delete(bitbucket, woodpecker)
+
+    assert "list_files" not in bitbucket.calls
+    assert list(bitbucket.committed) == [VALUES_PATH]
+
+
+async def test_pull_request_only_delete_also_skips_the_scan(bitbucket):
+    """Both delete paths share `_prepare_delete`, so neither grew a scan back."""
+    _seed_bound(bitbucket, KV)
+    _seed_bound(bitbucket, "elsewhere", path="kv/platform.yaml")
+
+    result = await _delete_pr_only(bitbucket)
+
+    assert result.status.value == "Succeeded"
+    assert "list_files" not in bitbucket.calls
+
+
+async def test_a_binding_on_another_store_never_blocks(bitbucket, woodpecker):
+    """The same service account bound to two stores is normal; deleting one is unaffected."""
+    _seed_bound(bitbucket, KV, "billing")
 
     assert (await _delete(bitbucket, woodpecker)).status.value == "Succeeded"
-
-
-async def test_pull_request_only_delete_shares_the_409(bitbucket):
-    """Both delete paths go through the same preparation, so neither can skip the check."""
-    _seed(bitbucket, KV)
-    _seed_role(bitbucket, "kv/platform.yaml", KV)
-
-    with pytest.raises(VaultOperationError) as error:
-        await _delete_pr_only(bitbucket)
-
-    assert error.value.status_code == 409
-    assert "create_branch" not in bitbucket.calls
 
 
 async def test_delete_of_a_corrupt_file_is_reported(bitbucket, woodpecker):
@@ -387,8 +355,6 @@ async def test_pull_request_only_stops_at_the_pull_request(bitbucket):
     await _delete_pr_only(bitbucket)
 
     assert bitbucket.calls == [
-        "get_file_content",
-        "list_files",
         "get_file_content",
         "get_last_commit",
         "create_branch",

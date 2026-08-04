@@ -17,9 +17,6 @@ FILE_PATTERN = rf"^{_SEGMENT}$"
 # path — it is a value inside the document.
 KV_NAME_PATTERN = rf"^{_SEGMENT}$"
 
-# Hostnames granted a role. Permissive enough for internal names that carry no dot.
-FQDN_PATTERN = r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$"
-
 # The role keys the committed document may carry.
 #
 # `read` and `write` are separate keys — a store may carry either, or both (a host that only
@@ -33,19 +30,24 @@ FQDN_PATTERN = r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$"
 ALLOWED_ROLE_KEYS = frozenset({"read", "write"})
 
 # --------------------------------------------------------------------------- #
-# Kubernetes auth roles
+# Kubernetes service accounts
 #
-# A role's name is addressed as `{file}/{role_name}`, so it is single-segment for the same
-# reason `kv_name` is. `K8S_ROLE_NAME_PATTERN` duplicates `KV_NAME_PATTERN`'s value rather
-# than aliasing it: they are two independent namespaces that happen to agree today.
+# A binding is three scalars — `serviceAccount`, `namespace`, `cluster` — living inside the
+# store it reaches. It has no name, so those three *are* its identity, and it carries no
+# capability: what a bound workload may do with the store is the deploy pipeline's
+# business, the same boundary `roles` sits behind. No policy name, policy body, mount path
+# or engine version is generated anywhere in this service.
 # --------------------------------------------------------------------------- #
-K8S_ROLE_NAME_PATTERN = rf"^{_SEGMENT}$"
+
+# The OS4 cluster suffix the binding belongs to, e.g. `dev`. Required — unlike the rest of
+# the triple there is no Kubernetes rule to borrow, so this is our own single-segment shape.
 K8S_CLUSTER_PATTERN = rf"^{_SEGMENT}$"
+K8S_CLUSTER_MAX_LENGTH = 128
 
 # Kubernetes' own naming rules, not ours. A namespace is an RFC 1123 *label* (no dots, 63
-# chars); a ServiceAccount name is an RFC 1123 *subdomain* (dots allowed, 253). Neither may
-# contain uppercase — which is why `FQDN_PATTERN` is not reused here: it accepts uppercase,
-# so a request would pass validation and then be rejected at admission in the cluster.
+# chars); a ServiceAccount name is an RFC 1123 *subdomain* (dots allowed, 253) — genuinely
+# different limits. Neither may contain uppercase, so a permissive hostname-shaped pattern
+# would let a request pass here and be rejected at admission in the cluster instead.
 K8S_NAMESPACE_PATTERN = r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
 K8S_NAMESPACE_MAX_LENGTH = 63
 K8S_SERVICE_ACCOUNT_PATTERN = (
@@ -53,84 +55,43 @@ K8S_SERVICE_ACCOUNT_PATTERN = (
 )
 K8S_SERVICE_ACCOUNT_MAX_LENGTH = 253
 
-# A Vault duration string, passed through untouched.
-DURATION_PATTERN = r"^[0-9]+(s|m|h|d)$"
 
-# What a role may ask for over a KV store. Same values as `ALLOWED_ROLE_KEYS` today and
-# deliberately a separate frozenset: they are two pipeline contracts that happen to agree,
-# and k8s roles could plausibly become read-only without hosts following.
-#
-# This is also where the scope boundary is drawn. An entry names *stores* and a
-# *capability*; deriving the policy from that pair is the deploy pipeline's job. No policy
-# name, policy body, mount path or engine version is generated anywhere in this service.
-ALLOWED_KV_ACCESS_KEYS = frozenset({"read", "write"})
+def _validate_bound_name(
+    name: str, field: str, pattern: str, max_length: int
+) -> str:
+    """One Kubernetes name: non-blank, no wildcard, RFC 1123.
 
-
-def _validate_bound_names(
-    names: List[str], field: str, pattern: str, max_length: int
-) -> List[str]:
-    """One list of Kubernetes names: non-blank, unique, no wildcard, RFC 1123."""
-    cleaned: List[str] = []
-    for name in names:
-        stripped = name.strip() if isinstance(name, str) else name
-        if not stripped:
-            raise ValueError(f"{field} must not contain blank entries")
-        if "*" in stripped:
-            raise ValueError(
-                f"{field} must not contain '*': a wildcard binds every workload in the "
-                f"cluster to this role. List each name explicitly, or have a human make "
-                f"that grant by editing the values file directly."
-            )
-        if len(stripped) > max_length:
-            raise ValueError(
-                f"each {field} entry must be at most {max_length} characters"
-            )
-        if not re.fullmatch(pattern, stripped):
-            raise ValueError(
-                f"'{stripped}' is not a valid {field} entry; Kubernetes names are "
-                f"lowercase alphanumerics, dashes and (service accounts only) dots"
-            )
-        cleaned.append(stripped)
-
-    if not cleaned:
-        raise ValueError(f"{field} must list at least one name")
-    if len(set(cleaned)) != len(cleaned):
-        raise ValueError(f"{field} must not repeat a name")
-    return cleaned
-
-
-def _validate_access(access: Dict[str, List[str]]) -> Dict[str, List[str]]:
-    """At least one known capability, each naming at least one existing-shaped KV store.
-
-    Whether the stores actually exist is checked against the values repo by the operation;
-    this only rejects what cannot be a store name at all.
+    Singular, because the format repeats the whole triple per binding rather than crossing
+    a list of accounts with a list of namespaces — two namespaces is two entries.
     """
-    if not access:
-        raise ValueError("access must not be empty")
-
-    unknown = sorted(set(access) - ALLOWED_KV_ACCESS_KEYS)
-    if unknown:
-        allowed = ", ".join(sorted(ALLOWED_KV_ACCESS_KEYS))
-        raise ValueError(f"unknown access key(s) {unknown}; allowed: {allowed}")
-
-    cleaned: Dict[str, List[str]] = {}
-    for capability, stores in access.items():
-        stripped = [store.strip() for store in stores if store and store.strip()]
-        if not stripped:
-            raise ValueError(f"access '{capability}' must list at least one KV store")
-        if len(stripped) != len(stores):
-            raise ValueError(f"access '{capability}' must not contain blank store names")
-        if len(set(stripped)) != len(stripped):
-            raise ValueError(f"access '{capability}' must not repeat a KV store")
-        for store in stripped:
-            if not re.fullmatch(KV_NAME_PATTERN, store):
-                raise ValueError(f"'{store}' is not a valid KV store name")
-        cleaned[capability] = stripped
-    return cleaned
+    stripped = name.strip() if isinstance(name, str) else name
+    if not stripped:
+        raise ValueError(f"{field} must not be blank")
+    if "*" in stripped:
+        raise ValueError(
+            f"{field} must not contain '*': a wildcard binds every workload in the "
+            f"cluster to this store. Name it explicitly, or have a human make that grant "
+            f"by editing the values file directly."
+        )
+    if len(stripped) > max_length:
+        raise ValueError(f"{field} must be at most {max_length} characters")
+    if not re.fullmatch(pattern, stripped):
+        raise ValueError(
+            f"'{stripped}' is not a valid {field}; Kubernetes names are lowercase "
+            f"alphanumerics, dashes and (service accounts only) dots"
+        )
+    return stripped
 
 
 def _validate_roles(roles: Dict[str, List[str]]) -> Dict[str, List[str]]:
-    """At least one known role, each with at least one non-blank host."""
+    """At least one known role, each naming at least one non-blank principal.
+
+    A principal is whatever the deploy pipeline binds to a capability — the values files
+    carry LDAP distinguished names (`CN=…,OU=…,DC=…`) as well as bare hostnames, so the
+    entries are deliberately **unvalidated beyond non-blank and unique**. Any pattern
+    tight enough to describe one form rejects the other, and this service does not own
+    that vocabulary.
+    """
     if not roles:
         raise ValueError("roles must not be empty")
 
@@ -140,14 +101,16 @@ def _validate_roles(roles: Dict[str, List[str]]) -> Dict[str, List[str]]:
         raise ValueError(f"unknown role(s) {unknown}; allowed: {allowed}")
 
     cleaned: Dict[str, List[str]] = {}
-    for role, hosts in roles.items():
-        stripped = [host.strip() for host in hosts if host and host.strip()]
+    for role, principals in roles.items():
+        stripped = [
+            principal.strip() for principal in principals if principal and principal.strip()
+        ]
         if not stripped:
-            raise ValueError(f"role '{role}' must list at least one host")
-        if len(stripped) != len(hosts):
-            raise ValueError(f"role '{role}' must not contain blank hosts")
+            raise ValueError(f"role '{role}' must list at least one principal")
+        if len(stripped) != len(principals):
+            raise ValueError(f"role '{role}' must not contain blank principals")
         if len(set(stripped)) != len(stripped):
-            raise ValueError(f"role '{role}' must not repeat a host")
+            raise ValueError(f"role '{role}' must not repeat a principal")
         cleaned[role] = stripped
     return cleaned
 
@@ -171,10 +134,12 @@ class VaultKVCreate(BaseModel):
     model_config = {
         "json_schema_extra": {
             "example": {
-                "file": "payments",
-                "kv_name": "myapp",
-                "kv_description": "payments secrets",
-                "roles": {"read": ["app01.corp.example.com"]},
+                "file": "athena",
+                "kv_name": "athena-passwords",
+                "kv_description": "Passwords for athena",
+                "roles": {
+                    "write": ["CN=svc-athena,OU=ServiceAccounts,DC=corp,DC=example,DC=com"]
+                },
             }
         }
     }
@@ -212,10 +177,11 @@ class VaultKVCreate(BaseModel):
 
     roles: Dict[str, List[str]] = Field(
         ...,
-        examples=[{"read": ["app01.corp.example.com"]}],
+        examples=[{"write": ["CN=svc-athena,OU=ServiceAccounts,DC=corp,DC=example,DC=com"]}],
         description=(
-            "Hosts granted each role. At least one role with at least one host is "
-            f"required. Allowed roles: {', '.join(sorted(ALLOWED_ROLE_KEYS))}."
+            "Principals granted each role — an LDAP distinguished name or a hostname, "
+            "whichever the deploy pipeline expects. At least one role with at least one "
+            f"principal is required. Allowed roles: {', '.join(sorted(ALLOWED_ROLE_KEYS))}."
         ),
     )
 
@@ -241,8 +207,10 @@ class VaultKVUpdate(BaseModel):
     model_config = {
         "json_schema_extra": {
             "example": {
-                "kv_description": "payments secrets, rotated quarterly",
-                "roles": {"read": ["app01.corp.example.com", "app02.corp.example.com"]},
+                "kv_description": "Passwords for athena, rotated quarterly",
+                "roles": {
+                    "write": ["CN=svc-athena,OU=ServiceAccounts,DC=corp,DC=example,DC=com"]
+                },
             }
         }
     }
@@ -251,16 +219,19 @@ class VaultKVUpdate(BaseModel):
         default=None,
         min_length=1,
         max_length=256,
-        examples=["payments secrets, rotated quarterly"],
+        examples=["Passwords for athena, rotated quarterly"],
         description="Replacement description.",
     )
 
     roles: Optional[Dict[str, List[str]]] = Field(
         default=None,
-        examples=[{"read": ["app01.corp.example.com"]}],
+        examples=[
+            {"write": ["CN=svc-athena,OU=ServiceAccounts,DC=corp,DC=example,DC=com"]}
+        ],
         description=(
             "Replacement roles. Replaces the existing mapping wholesale rather than "
-            "merging into it, so a host can be removed by omitting it."
+            "merging into it, so a principal can be removed by omitting it. Does not "
+            "touch the store's k8sServiceAccounts."
         ),
     )
 
@@ -285,251 +256,81 @@ class VaultKVUpdate(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Kubernetes auth roles
+# Kubernetes service accounts
 #
-# A role lives under a second top-level key in the *same* values file as the stores it
-# reaches, so the two are edited together: one file, one optimistic-lock token, one pull
-# request, one deploy diff per app.
+# A binding is added to a store that already exists, so this request carries no `file` or
+# `kv_name` — both come from the URL path. There is no update model: an entry is three
+# scalars that together *are* its identity, so "editing" one is removing it and adding
+# another, and a PATCH would have nothing left to change.
 # --------------------------------------------------------------------------- #
-class VaultKubernetesAuthCreate(BaseModel):
-    """A create request: which file, the role's name, which workloads, and what they reach.
+class K8sServiceAccountCreate(BaseModel):
+    """One `(serviceAccount, namespace, cluster)` binding on a KV store.
 
-    `access` names KV stores and a capability. It is not a policy: what
-    `(store, capability)` means in Vault — the mount, the HCL, the policy name — is the
-    deploy pipeline's business, and none of it is modelled here.
+    All three are required and singular. The format repeats the whole triple per binding
+    rather than crossing lists, so binding one service account in two namespaces is two
+    requests — which also makes each one individually removable.
+
+    There is no capability field: listing a service account inside a store *is* the grant,
+    and what it may do with the store is the deploy pipeline's business.
     """
 
     model_config = {
         "json_schema_extra": {
             "example": {
-                "file": "payments",
-                "role_name": "myapp-ci",
-                "role_description": "CI deployer for the payments app",
-                "cluster": "prod-il-1",
-                "service_accounts": ["vault-reader"],
-                "namespaces": ["payments"],
-                "access": {"read": ["myapp"]},
-                "ttl": "24h",
+                "service_account": "vault",
+                "namespace": "athena",
+                "cluster": "dev",
             }
         }
     }
 
-    file: str = Field(
+    service_account: str = Field(
         ...,
-        max_length=128,
-        pattern=FILE_PATTERN,
-        examples=["payments"],
+        max_length=K8S_SERVICE_ACCOUNT_MAX_LENGTH,
+        examples=["vault"],
         description=(
-            "Values file the role is added to, committed as '<values dir>/<file>.yaml' — "
-            "the same file the KV stores live in. Created if it does not exist yet."
+            "ServiceAccount name allowed to reach this store. An RFC 1123 subdomain "
+            "(lowercase, dots allowed); '*' is rejected."
         ),
     )
 
-    role_name: str = Field(
+    namespace: str = Field(
         ...,
-        max_length=128,
-        pattern=K8S_ROLE_NAME_PATTERN,
-        examples=["myapp-ci"],
+        max_length=K8S_NAMESPACE_MAX_LENGTH,
+        examples=["athena"],
         description=(
-            "Name of the Kubernetes auth role. Unique within its file, and unique per "
-            "cluster across the values directory. May not contain a slash."
+            "Namespace that service account comes from. An RFC 1123 label (lowercase, no "
+            "dots); '*' is rejected."
         ),
     )
 
-    role_description: str = Field(
+    cluster: str = Field(
         ...,
-        min_length=1,
-        max_length=256,
-        examples=["CI deployer for the payments app"],
-        description="What this role is for. Recorded in the committed entry.",
-    )
-
-    cluster: Optional[str] = Field(
-        default=None,
-        max_length=128,
+        max_length=K8S_CLUSTER_MAX_LENGTH,
         pattern=K8S_CLUSTER_PATTERN,
-        examples=["prod-il-1"],
+        examples=["dev"],
         description=(
-            "Which Kubernetes auth mount the role belongs to. Optional: an estate with a "
-            "single mount has no cluster to name. Omitted from the committed entry when "
-            "absent, and not editable afterwards."
+            "OS4 cluster suffix the binding belongs to. Required — the same service "
+            "account and namespace in two clusters are two distinct bindings."
         ),
     )
 
-    service_accounts: List[str] = Field(
-        ...,
-        examples=[["vault-reader"]],
-        description=(
-            "ServiceAccount names allowed to assume this role. At least one is required; "
-            "'*' is rejected."
-        ),
-    )
-
-    namespaces: List[str] = Field(
-        ...,
-        examples=[["payments"]],
-        description=(
-            "Namespaces those service accounts may come from. At least one is required; "
-            "'*' is rejected."
-        ),
-    )
-
-    access: Dict[str, List[str]] = Field(
-        ...,
-        examples=[{"read": ["myapp"]}],
-        description=(
-            "KV stores this role reaches, per capability. Every store named must already "
-            "exist in the values directory. Allowed capabilities: "
-            f"{', '.join(sorted(ALLOWED_KV_ACCESS_KEYS))}."
-        ),
-    )
-
-    ttl: Optional[str] = Field(
-        default=None,
-        max_length=32,
-        pattern=DURATION_PATTERN,
-        examples=["24h"],
-        description="Optional token TTL, as a Vault duration string such as '24h'.",
-    )
-
-    @field_validator("role_description")
+    @field_validator("service_account")
     @classmethod
-    def not_blank(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("role_description must not be blank")
-        return v.strip()
-
-    @field_validator("service_accounts")
-    @classmethod
-    def valid_service_accounts(cls, v: List[str]) -> List[str]:
-        return _validate_bound_names(
+    def valid_service_account(cls, v: str) -> str:
+        return _validate_bound_name(
             v,
-            "service_accounts",
+            "service_account",
             K8S_SERVICE_ACCOUNT_PATTERN,
             K8S_SERVICE_ACCOUNT_MAX_LENGTH,
         )
 
-    @field_validator("namespaces")
+    @field_validator("namespace")
     @classmethod
-    def valid_namespaces(cls, v: List[str]) -> List[str]:
-        return _validate_bound_names(
-            v, "namespaces", K8S_NAMESPACE_PATTERN, K8S_NAMESPACE_MAX_LENGTH
+    def valid_namespace(cls, v: str) -> str:
+        return _validate_bound_name(
+            v, "namespace", K8S_NAMESPACE_PATTERN, K8S_NAMESPACE_MAX_LENGTH
         )
-
-    @field_validator("access")
-    @classmethod
-    def valid_access(cls, v: Dict[str, List[str]]) -> Dict[str, List[str]]:
-        return _validate_access(v)
-
-
-class VaultKubernetesAuthUpdate(BaseModel):
-    """Editable fields. Neither the name nor the cluster is one of them.
-
-    Both are part of the role's identity in Vault, so changing either is a delete plus a
-    create — the same reasoning that makes `kv_name` immutable. `file` and `role_name` come
-    from the URL path; the body carries only the change.
-    """
-
-    model_config = {
-        "json_schema_extra": {
-            "example": {
-                "namespaces": ["payments", "payments-staging"],
-                "access": {"read": ["myapp"]},
-            }
-        }
-    }
-
-    role_description: Optional[str] = Field(
-        default=None,
-        min_length=1,
-        max_length=256,
-        examples=["CI deployer for the payments app"],
-        description="Replacement description.",
-    )
-
-    service_accounts: Optional[List[str]] = Field(
-        default=None,
-        examples=[["vault-reader"]],
-        description=(
-            "Replacement service accounts. Replaces the existing list wholesale rather "
-            "than merging into it, so one can be removed by omitting it."
-        ),
-    )
-
-    namespaces: Optional[List[str]] = Field(
-        default=None,
-        examples=[["payments", "payments-staging"]],
-        description="Replacement namespaces. Replaces the existing list wholesale.",
-    )
-
-    access: Optional[Dict[str, List[str]]] = Field(
-        default=None,
-        examples=[{"read": ["myapp"]}],
-        description=(
-            "Replacement KV store access. Replaces the existing mapping wholesale, and "
-            "every store named must exist."
-        ),
-    )
-
-    ttl: Optional[str] = Field(
-        default=None,
-        max_length=32,
-        pattern=DURATION_PATTERN,
-        examples=["24h"],
-        description="Replacement token TTL.",
-    )
-
-    @field_validator("role_description")
-    @classmethod
-    def not_blank(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None and not v.strip():
-            raise ValueError("role_description must not be blank")
-        return v.strip() if v is not None else None
-
-    @field_validator("service_accounts")
-    @classmethod
-    def valid_service_accounts(cls, v: Optional[List[str]]) -> Optional[List[str]]:
-        if v is None:
-            return None
-        return _validate_bound_names(
-            v,
-            "service_accounts",
-            K8S_SERVICE_ACCOUNT_PATTERN,
-            K8S_SERVICE_ACCOUNT_MAX_LENGTH,
-        )
-
-    @field_validator("namespaces")
-    @classmethod
-    def valid_namespaces(cls, v: Optional[List[str]]) -> Optional[List[str]]:
-        if v is None:
-            return None
-        return _validate_bound_names(
-            v, "namespaces", K8S_NAMESPACE_PATTERN, K8S_NAMESPACE_MAX_LENGTH
-        )
-
-    @field_validator("access")
-    @classmethod
-    def valid_access(cls, v: Optional[Dict[str, List[str]]]) -> Optional[Dict[str, List[str]]]:
-        return _validate_access(v) if v is not None else None
-
-    @model_validator(mode="after")
-    def at_least_one_field(self) -> "VaultKubernetesAuthUpdate":
-        """An empty edit would open a pull request that changes nothing."""
-        if all(
-            value is None
-            for value in (
-                self.role_description,
-                self.service_accounts,
-                self.namespaces,
-                self.access,
-                self.ttl,
-            )
-        ):
-            raise ValueError(
-                "provide at least one of 'role_description', 'service_accounts', "
-                "'namespaces', 'access' or 'ttl'"
-            )
-        return self
 
 
 # --------------------------------------------------------------------------- #
@@ -550,13 +351,15 @@ class PipelineInfo(BaseModel):
 class VaultOperationResponse(BaseModel):
     """Outcome of the chain: pull request -> validation CI -> merge -> deploy CI.
 
-    One model for both resource kinds. A second one would double the trap below: a field
-    added here is silently omitted from every failure body unless
-    `VaultOperationError.to_response()` is updated too, because failures are *returned* as
-    a JSONResponse rather than validated against this model.
+    One model for every mutating route, stores and bindings alike. `(file, kv_name)`
+    addresses both: a binding is part of a store, so the store is the subject of a binding
+    operation too, and the message names the triple. There is no `role_name` — an earlier
+    revision modelled bindings as independently-named top-level roles, which the pipeline's
+    format does not have.
 
-    `kv_name` and `role_name` both default to `""` so each route fills in the coordinate it
-    has. Putting a role name in `kv_name` would be a lie every consumer had to learn.
+    The trap to remember: a field added here is silently omitted from every failure body
+    unless `VaultOperationError.to_response()` is updated too, because failures are
+    *returned* as a JSONResponse rather than validated against this model.
     """
 
     status: OperationStatus = Field(..., description="Succeeded or Failed.")
@@ -572,10 +375,6 @@ class VaultOperationResponse(BaseModel):
 
     kv_name: str = Field(
         default="", description="The KV store this request acted on, if any."
-    )
-
-    role_name: str = Field(
-        default="", description="The Kubernetes auth role this request acted on, if any."
     )
 
     pull_request: Optional[PullRequestInfo] = Field(

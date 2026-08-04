@@ -14,11 +14,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-# Top-level keys of the committed document. A file holds a *list* of named entries under
-# each of them, and the two are edited independently — one file, one optimistic-lock token,
-# one pull request per app.
+# The document's only top-level key: a *list* of named stores.
 KV_STORES_KEY = "kvStores"
-K8S_AUTH_KEY = "kubernetesAuth"
+
+# Kubernetes service accounts are **not** a second top-level key, and not a sibling of
+# `roles` either. They are a list under `roles`, level with `read`/`write` — two levels
+# inside the store. See the k8sServiceAccounts section at the bottom of this module.
+ROLES_KEY = "roles"
+K8S_SERVICE_ACCOUNTS_KEY = "k8sServiceAccounts"
 
 
 def slugify_mount_path(mount_path: str) -> str:
@@ -267,9 +270,22 @@ def update_kv_store(
 ) -> Dict[str, Any]:
     """Replace the description and/or roles of one store, leaving its siblings alone.
 
-    `roles` is replaced wholesale rather than merged: a caller that wants to drop a host
-    needs to be able to express it, and a merge would make removal impossible.
+    `roles` is replaced wholesale rather than merged: a caller that wants to drop a
+    principal needs to be able to express it, and a merge would make removal impossible.
+
+    **Except for `k8sServiceAccounts`, which is carried across.** The bindings live *under*
+    `roles`, level with `read`/`write`, so a wholesale replacement would delete every one of
+    them — and the update request body cannot express bindings at all, so there would be no
+    way to put them back in the same call. Nothing about editing who may read a secret says
+    anything about which workloads are bound to it; those are separate endpoints, and this
+    keeps them independent. The bindings are re-appended last, so the committed order is
+    unchanged.
     """
+    if roles is not None:
+        existing = k8s_service_accounts(find_kv_store(values, kv_name))
+        if existing:
+            roles = {**roles, K8S_SERVICE_ACCOUNTS_KEY: existing}
+
     return _update_entry(
         values, KV_STORES_KEY, kv_name, description=description, roles=roles
     )
@@ -286,174 +302,196 @@ def remove_kv_store(values: Dict[str, Any], kv_name: str) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# the `kubernetesAuth` key — the second kind of entry a values file can hold
+# the `k8sServiceAccounts` list — nested **inside `roles`**, level with read/write
 #
-# The shape below is a **proposal**: it is a guess at what the deploy pipeline wants, so
-# every guess sits behind exactly one name. `K8S_AUTH_KEY` is the top-level key,
-# `_K8S_AUTH_ENTRY_KEYS` is the request-field -> document-key table (including snake_case ->
-# camelCase), and `build_kubernetes_auth_role` is the only function that writes an entry.
-# Nothing outside this module knows a single key name of the format, so correcting it is a
-# one-line edit here — the same property `ALLOWED_ROLE_KEYS` has in `schemas.py`.
+# The pipeline's format binds a workload to a secret by listing the workload inside the
+# store it reaches, under the same `roles` mapping the principals live in:
 #
-# What is deliberately *not* here: a mount path, an engine version, a policy name or any
-# HCL. An entry names KV stores and a capability; deriving a policy from that pair is the
-# pipeline's business, and generating one here is the boundary an earlier version crossed.
+#     kvStores:
+#       - name: athena-passwords
+#         description: Passwords for athena
+#         roles:
+#           write:
+#             - CN=<CN>,OU=<OU>,DC=<DC>
+#           k8sServiceAccounts:          # <- level with `write`, not with `roles`
+#             - serviceAccount: "vault"
+#               namespace: "<NAMESPACE>"
+#               cluster: dev
+#
+# That depth has one sharp consequence: `roles` is no longer a homogeneous mapping of
+# capability -> principals, and replacing it wholesale (which is what a PATCH does) would
+# take every binding with it. `update_kv_store` therefore carries the existing bindings
+# across a `roles` replacement — see the note there. The request body cannot express
+# bindings at all, so a PATCH that silently dropped them would be pure data loss, and the
+# erase would have looked like a legitimate diff in the pull request.
+#
+# That direction is the whole design. Because the binding lives *in* the store, there is no
+# reference to dangle: deleting a store takes its bindings with it, so there is no
+# referential check, no cross-file scan and no orphan to refuse. An entry is three scalars
+# and carries no capability of its own — what a service account may *do* with the store is
+# the deploy pipeline's business, exactly as with `roles`.
+#
+# An entry has no name, so `(serviceAccount, namespace, cluster)` is its identity. That is
+# what `k8s_service_account_identity` exists for: nothing outside this module builds that
+# tuple by indexing the document.
 # --------------------------------------------------------------------------- #
-_K8S_AUTH_ENTRY_KEYS = {
-    "role_description": "description",
+_K8S_SA_ENTRY_KEYS = {
+    "service_account": "serviceAccount",
+    "namespace": "namespace",
     "cluster": "cluster",
-    "service_accounts": "serviceAccounts",
-    "namespaces": "namespaces",
-    "access": "access",
-    "ttl": "ttl",
 }
 
+# The identity tuple, in the order `_K8S_SA_ENTRY_KEYS` declares.
+K8sServiceAccountIdentity = Tuple[str, str, str]
 
-def _kubernetes_auth_fields(**fields: Any) -> Dict[str, Any]:
-    """Translate request fields to document keys, dropping the ones not supplied.
 
-    Insertion order is the caller's, and `render_values_yaml` preserves it, so the caller
-    decides how the entry reads in the pull request diff.
+class K8sServiceAccountNotFound(LookupError):
+    """No entry with that `(serviceAccount, namespace, cluster)` in this store."""
+
+
+def build_k8s_service_account(
+    service_account: str, namespace: str, cluster: str
+) -> Dict[str, str]:
+    """One entry in a store's ``k8sServiceAccounts`` list.
+
+    All three are required and singular — the format repeats the whole triple per binding
+    rather than crossing lists of accounts with lists of namespaces, so two namespaces means
+    two entries. This is the sole writer of these key names; change it and the pipeline
+    together.
     """
     return {
-        _K8S_AUTH_ENTRY_KEYS[field]: copy.deepcopy(value)
-        for field, value in fields.items()
-        if value is not None
+        _K8S_SA_ENTRY_KEYS["service_account"]: service_account,
+        _K8S_SA_ENTRY_KEYS["namespace"]: namespace,
+        _K8S_SA_ENTRY_KEYS["cluster"]: cluster,
     }
 
 
-def build_kubernetes_auth_role(
-    role_name: str,
-    role_description: str,
-    service_accounts: List[str],
-    namespaces: List[str],
-    access: Dict[str, List[str]],
-    cluster: Optional[str] = None,
-    ttl: Optional[str] = None,
-) -> Dict[str, Any]:
-    """One entry in the ``kubernetesAuth`` list.
+def k8s_service_accounts(store: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The binding list out of one **store entry**, tolerating an absent or empty key.
 
-    `cluster` and `ttl` are omitted entirely when absent rather than written as null — an
-    estate with a single Kubernetes auth mount has no cluster to name, and a key holding
-    null is harder for a pipeline to treat as "not specified" than a missing one.
+    Note the argument: a store, not a document — and note that it reaches *through* `roles`,
+    which is where the list lives. A store that binds nothing simply has no
+    `k8sServiceAccounts` key under `roles`, which is what `build_kv_store` produces. A store
+    whose `roles` is missing or malformed reads as no bindings rather than raising.
     """
-    return {
-        "name": role_name,
-        **_kubernetes_auth_fields(
-            role_description=role_description,
-            cluster=cluster,
-            service_accounts=service_accounts,
-            namespaces=namespaces,
-            access=access,
-            ttl=ttl,
-        ),
-    }
-
-
-def kubernetes_auth_roles(values: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """The role list out of a parsed document, tolerating an empty or absent key."""
-    return _entries(values, K8S_AUTH_KEY)
-
-
-def find_kubernetes_auth_role(
-    values: Dict[str, Any], role_name: str
-) -> Optional[Dict[str, Any]]:
-    """The role with this name, or None. Names are unique within a file."""
-    return _find_entry(values, K8S_AUTH_KEY, role_name)
-
-
-def kubernetes_auth_role_names(values: Optional[Dict[str, Any]]) -> List[str]:
-    """Every role name in a document, for the within-file uniqueness check."""
-    return _entry_names(values, K8S_AUTH_KEY)
-
-
-def kubernetes_auth_role_identities(
-    values: Optional[Dict[str, Any]],
-) -> List[Tuple[str, str]]:
-    """`(cluster, name)` for every role, with `""` standing in for an absent cluster.
-
-    The cross-file uniqueness key. It lives here rather than in the operation so that
-    "which fields identify a role" stays a format decision, changeable in one place.
-    """
-    return [
-        (str(entry.get(_K8S_AUTH_ENTRY_KEYS["cluster"]) or ""), entry["name"])
-        for entry in _entries(values, K8S_AUTH_KEY)
-        if isinstance(entry, dict) and entry.get("name")
-    ]
-
-
-def kubernetes_auth_role_stores(entry: Dict[str, Any]) -> List[str]:
-    """Every KV store name one role's `access` mentions, whatever the capability."""
-    access = entry.get(_K8S_AUTH_ENTRY_KEYS["access"])
-    if not isinstance(access, dict):
+    if not store:
         return []
-    return [
-        store
-        for stores in access.values()
-        if isinstance(stores, list)
-        for store in stores
-        if isinstance(store, str)
-    ]
+    roles = store.get(ROLES_KEY)
+    if not isinstance(roles, dict):
+        return []
+    accounts = roles.get(K8S_SERVICE_ACCOUNTS_KEY)
+    return list(accounts) if accounts else []
 
 
-def kv_store_referrers(values: Optional[Dict[str, Any]], kv_name: str) -> List[str]:
-    """Roles in this document whose `access` still names the given store.
+def k8s_service_account_identity(entry: Dict[str, Any]) -> K8sServiceAccountIdentity:
+    """`(serviceAccount, namespace, cluster)` for one entry, missing keys as `""`.
 
-    The only place the rule lives, so deleting a store can refuse with a 409 that names the
-    blockers rather than silently orphaning a binding. Malformed entries are skipped for
-    the same reason the name scan skips them: a hand-edited file must not wedge an
-    unrelated delete.
+    The only place the identity is assembled, so "which fields identify a binding" stays a
+    format decision changeable in one place.
     """
-    return [
-        entry["name"]
-        for entry in _entries(values, K8S_AUTH_KEY)
-        if isinstance(entry, dict)
-        and entry.get("name")
-        and kv_name in kubernetes_auth_role_stores(entry)
-    ]
-
-
-def add_kubernetes_auth_role(
-    values: Optional[Dict[str, Any]], role: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Append a role to a document, returning a **new** one.
-
-    Accepts None so the first role in a file creates it. A file started this way carries
-    only `kubernetesAuth` — no empty `kvStores: []` sibling it never asked for.
-    """
-    return _add_entry(values, K8S_AUTH_KEY, role)
-
-
-def update_kubernetes_auth_role(
-    values: Dict[str, Any],
-    role_name: str,
-    role_description: Optional[str] = None,
-    service_accounts: Optional[List[str]] = None,
-    namespaces: Optional[List[str]] = None,
-    access: Optional[Dict[str, List[str]]] = None,
-    ttl: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Replace the given fields on one role, leaving its siblings alone.
-
-    Neither `name` nor `cluster` is editable: in Vault both are part of the role's identity
-    — a rename or a cluster move is a delete plus a create, not a field edit. The three
-    list/mapping fields are replaced wholesale rather than merged, for the same reason
-    `roles` is on a KV store: a merge makes removal impossible.
-    """
-    return _update_entry(
-        values,
-        K8S_AUTH_KEY,
-        role_name,
-        **_kubernetes_auth_fields(
-            role_description=role_description,
-            service_accounts=service_accounts,
-            namespaces=namespaces,
-            access=access,
-            ttl=ttl,
-        ),
+    return (
+        str(entry.get(_K8S_SA_ENTRY_KEYS["service_account"]) or ""),
+        str(entry.get(_K8S_SA_ENTRY_KEYS["namespace"]) or ""),
+        str(entry.get(_K8S_SA_ENTRY_KEYS["cluster"]) or ""),
     )
 
 
-def remove_kubernetes_auth_role(values: Dict[str, Any], role_name: str) -> Dict[str, Any]:
-    """Drop one role from a document, leaving its siblings alone."""
-    return _remove_entry(values, K8S_AUTH_KEY, role_name)
+def k8s_service_account_identities(
+    store: Optional[Dict[str, Any]],
+) -> List[K8sServiceAccountIdentity]:
+    """Every binding's identity in one store. Malformed entries are skipped."""
+    return [
+        k8s_service_account_identity(entry)
+        for entry in k8s_service_accounts(store)
+        if isinstance(entry, dict)
+    ]
+
+
+def find_k8s_service_account(
+    store: Optional[Dict[str, Any]], identity: K8sServiceAccountIdentity
+) -> Optional[Dict[str, Any]]:
+    """The binding with that identity, or None."""
+    for entry in k8s_service_accounts(store):
+        if isinstance(entry, dict) and k8s_service_account_identity(entry) == identity:
+            return entry
+    return None
+
+
+def _mutate_store(
+    values: Dict[str, Any], kv_name: str, mutate: Any
+) -> Dict[str, Any]:
+    """Apply `mutate` to one store inside a deep copy of the document, and return it.
+
+    The nested counterpart of `_update_entry`: the same "copy the whole document, touch one
+    entry, never mutate the input" contract, so a caller can still diff old against new with
+    `yaml_data_equals`.
+    """
+    document = copy.deepcopy(values)
+    entries = _entries(document, KV_STORES_KEY)
+
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("name") == kv_name:
+            mutate(entry)
+            document[KV_STORES_KEY] = entries
+            return document
+
+    raise KVStoreNotFound(kv_name)
+
+
+def add_k8s_service_account(
+    values: Dict[str, Any], kv_name: str, account: Dict[str, str]
+) -> Dict[str, Any]:
+    """Append a binding to one store, returning a **new** document.
+
+    Raises `KVStoreNotFound` when the store is not in the file — unlike `add_kv_store` this
+    takes no `None`, because a binding cannot create the store it lives in.
+    """
+
+    def mutate(store: Dict[str, Any]) -> None:
+        roles = store.get(ROLES_KEY)
+        if not isinstance(roles, dict):
+            roles = {}
+            store[ROLES_KEY] = roles
+        # Appended after the capability keys, so the entry reads in the pull request diff
+        # the way the format spec writes it: principals first, then the workloads.
+        roles[K8S_SERVICE_ACCOUNTS_KEY] = k8s_service_accounts(store) + [
+            copy.deepcopy(account)
+        ]
+
+    return _mutate_store(values, kv_name, mutate)
+
+
+def remove_k8s_service_account(
+    values: Dict[str, Any], kv_name: str, identity: K8sServiceAccountIdentity
+) -> Dict[str, Any]:
+    """Drop one binding from one store, returning a **new** document.
+
+    Removing the last one **drops the key from `roles`** rather than leaving
+    `k8sServiceAccounts: []`. That is deliberately the opposite of `remove_kv_store`, and for
+    the opposite reason: `kvStores: []` is a meaningful statement by a file ("declare
+    nothing"), whereas a store with no bindings is just a store — exactly what
+    `build_kv_store` writes — so keeping an empty list would leave a diff a fresh create
+    would never produce. The `roles` mapping itself always stays, empty or not: it is a
+    required field of a store.
+    """
+
+    def mutate(store: Dict[str, Any]) -> None:
+        existing = k8s_service_accounts(store)
+        remaining = [
+            entry
+            for entry in existing
+            if not (
+                isinstance(entry, dict)
+                and k8s_service_account_identity(entry) == identity
+            )
+        ]
+        if len(remaining) == len(existing):
+            raise K8sServiceAccountNotFound(identity)
+
+        roles = store[ROLES_KEY]
+        if remaining:
+            roles[K8S_SERVICE_ACCOUNTS_KEY] = remaining
+        else:
+            roles.pop(K8S_SERVICE_ACCOUNTS_KEY, None)
+
+    return _mutate_store(values, kv_name, mutate)

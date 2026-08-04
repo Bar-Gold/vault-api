@@ -10,50 +10,69 @@ pipeline, merges, waits for the deploying pipeline, and returns
 `Successful creation of <kv name>`.
 
 **Scope boundary — read this first.** The service deliberately knows nothing about Vault. It
-commits a file holding two independent **lists**, KV stores and Kubernetes auth roles:
+commits a file holding a **list of KV stores**, each carrying the principals and the
+Kubernetes service accounts that reach it:
 
 ```yaml
 kvStores:
-  - name: myapp
-    description: payments secrets
+  - name: athena-passwords
+    description: Passwords for athena
     roles:
-      read:                  # `read` and `write` are separate keys; either, or both
-        - app01.corp.example.com
-      write:
-        - app02.corp.example.com
-  - name: billing            # several stores per file is the point
+      write:                         # `read`/`write` are separate keys; either, or both
+        - CN=<CN>,OU=<OU>,DC=<DC>    # LDAP DNs, *not* hostnames — see below
+      k8sServiceAccounts:            # INSIDE `roles`, level with `write` — not beside it
+        - serviceAccount: "vault"    # three scalars; the whole triple is the identity
+          namespace: "athena"
+          cluster: dev               # OS4 cluster suffix
+        - serviceAccount: "vault"    # "can be many service account"
+          namespace: "athena-staging"
+          cluster: dev
+  - name: billing                    # several stores per file is the point
     description: billing secrets
     roles:
       read:
-        - app03.corp.example.com
-
-kubernetesAuth:              # second top-level key, same file, edited independently
-  - name: myapp-ci
-    description: CI deployer for the payments app
-    cluster: prod-il-1       # optional
-    serviceAccounts:
-      - vault-reader
-    namespaces:
-      - payments
-    access:                  # names stores + a capability. NOT a policy.
-      read:
-        - myapp
-    ttl: 24h                 # optional
+        - CN=svc-billing,OU=ServiceAccounts,DC=corp,DC=example,DC=com
 ```
 
-**One file, many entries.** A create *appends* to `{VAULT_VALUES_DIR}/{file}.yaml`, creating
-the file only if it is the first entry in it. Nothing else in that file is touched — in
-particular a KV create must not erase `kubernetesAuth`, or vice versa; both directions are
-pinned by tests in `tests/test_helpers.py`.
+**A service account is nested inside the store it reaches — under `roles`, level with
+`read`/`write`.** That direction is the whole design, and it is what the deploy pipeline's
+format specifies. It removes a category of work rather than renaming one: nothing points at
+a binding from elsewhere, so there is **no referential rule, no cross-file uniqueness scan
+and no orphan to refuse** — deleting a store takes its bindings with it, in the same diff.
+
+**The depth has one sharp consequence.** `roles` is not a homogeneous mapping of capability
+to principals: one of its keys holds the bindings. A `PATCH` replaces `roles` wholesale, so
+it would erase every binding — and the update body cannot express bindings, so there would
+be no way to put them back in the same call. `update_kv_store` therefore **carries
+`k8sServiceAccounts` across a `roles` replacement**, re-appending it last so the committed
+order is unchanged. Editing who may read a secret says nothing about which workloads are
+bound to it; the two are separate endpoints and stay independent. Tests pin it, including
+that a no-op `roles` update still compares equal so the short circuit survives.
+
+> An earlier revision of this service modelled bindings as a second **top-level**
+> `kubernetesAuth` list of named roles pointing *back* at stores via
+> `access: {read: [<store>]}`. That was wrong about the format. Do not reintroduce it, and
+> do not go to git history for it: the top-level key, the role `name`, `ttl`, the per-role
+> `description`, the `access` mapping and the whole `_assert_no_referrers` 409 have no
+> counterpart in the real format.
+
+**One file, many stores.** A create *appends* to `{VAULT_VALUES_DIR}/{file}.yaml`, creating
+the file only if it is the first store in it. Nothing else in that file is touched, and a
+key this service does not recognise survives every transform — pinned by the `SIBLING_KEY`
+tests in `tests/test_helpers.py`.
 
 Mounts, KV engine versions, policies, HCL — none of it is modelled here. That is the deploy
-pipeline's business. `access: {read: [<store>]}` names a store and a capability; the
-*pipeline* derives the policy from that pair. Resist adding Vault semantics: an earlier
-version generated mounts and policy HCL, and it was removed on purpose — the deleted
+pipeline's business. A binding names a workload and nothing else; **it carries no
+capability at all** — listing a service account inside a store *is* the grant, and what it
+may then do is the pipeline's to decide. Resist adding Vault semantics: an earlier version
+generated mounts and policy HCL, and it was removed on purpose — the deleted
 `find_policy_name` + `policies: [...]` shape is exactly the line not to cross.
 
-**The `kubernetesAuth` shape is a proposal**, a guess at the pipeline's contract, so every
-format decision sits behind one name (see "Format isolation" below).
+**`roles` values are LDAP distinguished names**, not hostnames, and are deliberately
+**unvalidated** beyond non-blank and unique: any pattern tight enough to describe a DN
+rejects a bare hostname and vice versa, and this service does not own that vocabulary. A
+`FQDN_PATTERN` constant used to sit in `schemas.py` describing them as hostnames; it was
+never applied to anything and is gone.
 
 Built on the internal `tashtiot-apis-library` (base app, `BaseAPI`, `ExternalServiceError`)
 and follows the patterns of the reference `example-api` (sibling repo).
@@ -65,7 +84,7 @@ uv-managed (Python 3.12). Package indexes come from `uv.toml` (internal Artifact
 ```bash
 uv sync --group dev                 # install deps into .venv — ON-PREM ONLY, see below
 uv run --no-sync python -m app.main # serves on 0.0.0.0:5000 (--host/--port override)
-uv run --no-sync pytest             # everything under tests/ (547 tests, ~7s)
+uv run --no-sync pytest             # everything under tests/ (470 tests, ~8s)
 uv run --no-sync pytest tests/v1/vault                                        # one suite
 uv run --no-sync pytest tests/v1/vault/test_operations.py::test_happy_path_call_order  # one test
 docker build -t vault-api . && docker run -p 5000:5000 --env-file .env vault-api
@@ -110,21 +129,25 @@ on the base branch (so a repeat create hits the duplicate guard). Keep both if y
 | `GET /api/vault/v1/kv/{file}` | — | the whole values file, parsed YAML returned as-is (not a schema) |
 | `GET /api/vault/v1/kv/{file}/{kv_name}` | — | one entry out of that file's `kvStores` |
 | `PATCH /api/vault/v1/kv/{file}/{kv_name}` | `{kv_description?, roles?}` | edits one store; its siblings are untouched |
-| `DELETE /api/vault/v1/kv/{file}/{kv_name}` | — | removes one store, same chain as a create; 200. **409** if a `kubernetesAuth` entry still references it |
+| `DELETE /api/vault/v1/kv/{file}/{kv_name}` | — | removes one store **and its bindings**, same chain as a create; 200. No referential check exists |
 | `DELETE /api/vault/v1/kv/{file}/{kv_name}/pull-request` | — | steps 1-3 only: opens the removal PR and returns; 201 |
-| `POST /api/vault/v1/kubernetes-auth/` | `{file, role_name, role_description, cluster?, service_accounts, namespaces, access, ttl?}` | same chain; 201 |
-| `POST /api/vault/v1/kubernetes-auth/pull-request` | same body | steps 1-3 only; 201 |
-| `GET /api/vault/v1/kubernetes-auth/{file}` | — | the file's `kubernetesAuth` list (empty list, not 404, when it has none) |
-| `GET /api/vault/v1/kubernetes-auth/{file}/{role_name}` | — | one entry out of that list |
-| `PATCH /api/vault/v1/kubernetes-auth/{file}/{role_name}` | `{role_description?, service_accounts?, namespaces?, access?, ttl?}` | edits one role; `role_name` and `cluster` are **not** editable |
-| `DELETE /api/vault/v1/kubernetes-auth/{file}/{role_name}` | — | removes one role; 200. No referential check — a store with no role is valid |
-| `DELETE /api/vault/v1/kubernetes-auth/{file}/{role_name}/pull-request` | — | steps 1-3 only; 201 |
+| `POST /api/vault/v1/kv/{file}/{kv_name}/k8s-service-accounts` | `{service_account, namespace, cluster}` | appends one binding to that store; same chain; 201 |
+| `POST /api/vault/v1/kv/{file}/{kv_name}/k8s-service-accounts/pull-request` | same body | steps 1-3 only; 201 |
+| `GET /api/vault/v1/kv/{file}/{kv_name}/k8s-service-accounts` | — | that store's `k8sServiceAccounts` list (empty list, not 404, when it binds none) |
+| `DELETE /api/vault/v1/kv/{file}/{kv_name}/k8s-service-accounts` | `?service_account=&namespace=&cluster=` | removes one binding; 200 |
+| `DELETE /api/vault/v1/kv/{file}/{kv_name}/k8s-service-accounts/pull-request` | same query | steps 1-3 only; 201 |
 
-**Kubernetes auth gets its own prefix, not a segment under `/kv`.** `/kv/{file}/kubernetes-auth`
-and `/kv/kubernetes-auth/{file}` both put a fixed segment in a `{file}`/`{kv_name}` position,
-so a file or store actually named `kubernetes-auth` fights the endpoint for the URL and only
-registration order decides. A separate prefix has **zero** shadowing risk in either direction,
-and a test pins that a file named `kubernetes-auth` stays readable under `/kv`.
+**One router, one prefix.** A binding is a sub-resource of a store, not a resource kind of
+its own, so it hangs off `/{file}/{kv_name}` rather than getting a prefix of its own. There
+is no `API_K8S_AUTH_PREFIX` and no second router factory.
+
+**There is no `PATCH` on a binding.** Its three fields together *are* its identity, so
+"editing" one is a remove plus an add; a PATCH would have nothing left to change.
+
+**The delete identity travels as query parameters**, not a request body: DELETE bodies are
+widely dropped by proxies and clients. All three are required (a partial triple is a 422,
+not a wrong-binding delete) and carry the same patterns the POST body enforces, via
+`ServiceAccountQuery` / `NamespaceQuery` / `ClusterQuery` in `routes.py`.
 
 **`/pull-request` is a fixed segment registered before the `{file}` routes.** There is no POST
 on those paths today so nothing is ambiguous, but if one is ever added this route must keep
@@ -132,21 +155,24 @@ winning — otherwise a file named `pull-request` shadows the endpoint. A `GET` 
 is still a normal read of a file named `pull-request`; the two coexist, and a test pins it.
 The delete PR-only route has no such trap — three segments cannot collide with two — so a
 store *named* `pull-request` stays addressable at `DELETE /{file}/pull-request`; a test pins
-that too. It is still registered before `/{file}/{kv_name}`, for one rule. **Both rules apply
-identically to the `/kubernetes-auth` router**, which has the same two shapes.
+that too. It is still registered before `/{file}/{kv_name}`, for one rule.
 
-**Path parameters are pattern-validated**, not just body fields: `file`, `kv_name` and
-`role_name` carry `FILE_PATTERN` / `KV_NAME_PATTERN` / `K8S_ROLE_NAME_PATTERN` via
-`Annotated[str, Path(...)]` aliases (`FileParam`, `KVNameParam`, `RoleNameParam` in
-`routes.py`) on every `GET`/`PATCH`/`DELETE`. Nothing was exploitable without them —
-Starlette's path convertor is `[^/]+` — but a malformed `file` used to surface as an opaque
-Bitbucket 404 instead of a 422.
+**The `k8s-service-accounts` segment has no shadowing risk in either direction**, and tests
+pin both: a store literally named `k8s-service-accounts` stays deletable at
+`DELETE /{file}/k8s-service-accounts` (two segments against three), and a store named
+`pull-request` stays bindable at `/{file}/pull-request/k8s-service-accounts` (four segments
+against the delete-PR route's three). Segment count separates every pair.
 
-`API_PREFIX` (default `/api/vault/v1/kv`) and `API_K8S_AUTH_PREFIX` (default
-`/api/vault/v1/kubernetes-auth`) come from `app/v1/vault/conf.py`. Everything added for
-Kubernetes auth is **defaulted**, so `tests/conftest.py` needed no change — a new *required*
-setting would break every test at collection, because the config singletons are built at
-import time.
+**Path parameters are pattern-validated**, not just body fields: `file` and `kv_name` carry
+`FILE_PATTERN` / `KV_NAME_PATTERN` via `Annotated[str, Path(...)]` aliases (`FileParam`,
+`KVNameParam` in `routes.py`) on every `GET`/`PATCH`/`DELETE`. Nothing was exploitable
+without them — Starlette's path convertor is `[^/]+` — but a malformed `file` used to
+surface as an opaque Bitbucket 404 instead of a 422.
+
+`API_PREFIX` (default `/api/vault/v1/kv`) comes from `app/v1/vault/conf.py`. Everything
+added for service accounts is **defaulted**, so `tests/conftest.py` needed no change — a new
+*required* setting would break every test at collection, because the config singletons are
+built at import time.
 
 **The create request is exactly four fields** and `test_create_takes_exactly_four_fields` pins
 that: `file`, `kv_name`, `kv_description`, `roles`. There is no environment and no
@@ -161,55 +187,56 @@ lands in `{VAULT_VALUES_DIR}/{file}.yaml`:
 - `kv_name` is single-segment for a second reason: the routes address a store as
   `{file}/{kv_name}`, and a slash would make that split ambiguous. Multi-segment names were
   supported under the old one-file-per-KV layout and are not any more.
-- `roles` is **required**, at least one key with at least one host. `ALLOWED_ROLE_KEYS` in
-  `schemas.py` holds `read` and `write` as **separate** keys — a store may carry either or
+- `roles` is **required**, at least one key with at least one principal. `ALLOWED_ROLE_KEYS`
+  in `schemas.py` holds `read` and `write` as **separate** keys — a store may carry either or
   both. The combined string `read/write` is *not* a role and is rejected; `<read/write>` in
-  the format spec was a placeholder meaning "one of these", like `<name>` and `<FQDN>`
-  beside it. That frozenset is the only thing to change if the pipeline ever wants a
-  different set; everything else treats `roles` as an opaque mapping.
+  the format spec was a placeholder meaning "one of these", like `<CN>` and `<OU>` beside it.
+  That frozenset is the only thing to change if the pipeline ever wants a different set;
+  everything else treats `roles` as an opaque mapping, and the **values are not validated**
+  (see the LDAP note above).
 
-**Kubernetes auth validation is Kubernetes' rules, not ours.** `K8S_NAMESPACE_PATTERN` is an
+**Service account validation is Kubernetes' rules, not ours.** `K8S_NAMESPACE_PATTERN` is an
 RFC 1123 *label* (no dots, ≤63) and `K8S_SERVICE_ACCOUNT_PATTERN` an RFC 1123 *subdomain*
-(dots allowed, ≤253) — genuinely different limits. **Do not reuse `FQDN_PATTERN`**: it
-accepts uppercase, which the cluster rejects at admission, so a request would pass here and
-fail long after the PR merged. `*` in `service_accounts`/`namespaces` is **rejected** —
-`["*"]` binds every workload in the cluster, and that escalation should need a human editing
-the YAML, not an API call. `ALLOWED_KV_ACCESS_KEYS` is a separate frozenset from
-`ALLOWED_ROLE_KEYS` on purpose: two pipeline contracts that agree today and may not later.
+(dots allowed, ≤253) — genuinely different limits, so do not collapse them into one
+constant. Neither accepts uppercase, which the cluster rejects at admission: a looser
+pattern would let a request pass here and fail long after the PR merged. `*` in
+`service_account`/`namespace` is **rejected** — it would bind every workload in the cluster,
+and that escalation should need a human editing the YAML, not an API call. All three fields
+are **required**; `cluster` has no Kubernetes rule to borrow, so `K8S_CLUSTER_PATTERN` is our
+own single-segment shape.
 
-**Uniqueness differs between the two kinds.** A store name is global (unique across the
-whole values dir). A role is keyed on **`(cluster, name)`** across the dir, plus `name` alone
-within one file — a Vault k8s role is scoped to its auth mount, so `deployer` in two clusters
-is legitimate, but two in one file would make `{file}/{role_name}` unaddressable. `cluster` is
-**optional** (an estate with a single auth mount has none to name), so uniqueness keys on
-`(cluster or "", name)` — an absent cluster is its own coordinate, not a wildcard.
+**Uniqueness.** A store name is global — unique across the whole values dir, which is why a
+create walks every file. A **binding is unique only within its store**, on the whole
+`(serviceAccount, namespace, cluster)` triple: the same service account reaching two stores
+is the normal case (that is how one workload gets at two secrets), and the same account in
+two namespaces or two clusters is two distinct bindings. Nothing about a binding is
+dir-wide, so no binding operation walks the values dir.
 
 ### Format isolation — the one-line-edit inventory
 
-The `kubernetesAuth` shape is a guess, so each guess has exactly one home:
+The binding shape is the pipeline's, so each decision has exactly one home:
 
 | What could be wrong | Single place to change |
 |---|---|
-| the top-level key name | `K8S_AUTH_KEY` in `helpers.py` |
-| any entry field name, and camelCase vs snake_case | `_K8S_AUTH_ENTRY_KEYS` + `build_kubernetes_auth_role` in `helpers.py` |
-| the capability key set, the `access` semantics | `ALLOWED_KV_ACCESS_KEYS` in `schemas.py` |
-| whether `cluster` exists at all | `build_kubernetes_auth_role` + one optional schema field |
-| the k8s name patterns | the four `K8S_*_PATTERN` constants in `schemas.py` |
-| the branch prefix | `K8S_AUTH_BRANCH_PREFIX` in `conf.py` |
+| the nested key name, and which key it nests under | `K8S_SERVICE_ACCOUNTS_KEY` / `ROLES_KEY` in `helpers.py` |
+| any entry field name, and camelCase vs snake_case | `_K8S_SA_ENTRY_KEYS` + `build_k8s_service_account` in `helpers.py` |
+| which fields identify a binding | `k8s_service_account_identity` in `helpers.py` |
+| whether an emptied list is dropped or kept as `[]` | `remove_k8s_service_account` in `helpers.py` |
+| the k8s name patterns and limits | the `K8S_*_PATTERN` / `K8S_*_MAX_LENGTH` constants in `schemas.py` |
+| the branch prefix | `K8S_SA_BRANCH_PREFIX` in `conf.py` |
 
 **Nothing outside `helpers.py`/`schemas.py` knows a single document key name of this format** —
-`operations.py` reaches identities and referrers through `kubernetes_auth_role_identities` /
-`kv_store_referrers` rather than indexing `entry["cluster"]`. Keep it that way.
+`operations.py` reaches a binding's identity through `k8s_service_account_identity` rather
+than indexing `entry["cluster"]`. Keep it that way.
 
 ## Architecture
 
 **App composition (`app/main.py`).** `create_app()` is the single wiring point: it calls
 `general_create_app(enable_auth=True)`, constructs the Bitbucket and Woodpecker clients **once**
-from config, and injects them into `get_v1_vault_router(bitbucket, woodpecker)` **and**
-`get_v1_kubernetes_auth_router(bitbucket, woodpecker)`. Both routers share the same two
-connectors — the values file is shared, so the two resource kinds are two views of one repo,
-not two services. Connectors are never built per-request; the router factory closure is the
-injection seam (no FastAPI `Depends` for connectors).
+from config, and injects them into `get_v1_vault_router(bitbucket, woodpecker)` — one router,
+because a service account binding is a sub-resource of a store rather than a resource kind of
+its own. Connectors are never built per-request; the router factory closure is the injection
+seam (no FastAPI `Depends` for connectors).
 
 **Config is two-layered, all sourced from `.env`** (pydantic-settings `BaseSettings`):
 - `app/global_conf.py` — `BITBUCKET_*`, `WOODPECKER_*`, `VAULT_*`, `TEAM_NAME`,
@@ -226,12 +253,12 @@ declared here and read by nothing — leftovers from the removed Vault-semantics
 are gone; don't reintroduce them, and don't go looking for a Vault client.
 
 **Per-module layout** (`app/v1/vault/`): `conf.py`, `schemas.py`, `operations.py`, `routes.py` —
-the same four-file split the reference API uses. **Both resource kinds live in those same four
-files**; there is no `app/v1/kubernetes_auth/`. That is deliberate — the two kinds write the
-same document, share `_open_pull_request`/`_commit_via_pull_request`, `_walk_values_files` and
-`VaultOperationResponse`, and splitting them into packages would either duplicate that spine or
-turn it into a cross-package import. A third kind goes in the same way: a second router factory
-in `routes.py`, a `_prepare_*` pair in `operations.py`, a key in `helpers.py`.
+the same four-file split the reference API uses. **Stores and their bindings live in those
+same four files**; there is no `app/v1/kubernetes_auth/`. That is deliberate — they write the
+same document, share `_open_pull_request`/`_commit_via_pull_request` and
+`VaultOperationResponse`, and splitting them into packages would either duplicate that spine
+or turn it into a cross-package import. A genuinely new resource kind goes in the same way: a
+`_prepare_*` pair in `operations.py`, routes in `routes.py`, a key in `helpers.py`.
 
 There are **no `__init__.py` files anywhere** — implicit namespace packages, with
 `pythonpath = ["."]` and `package = false` in `pyproject.toml`. A new module needs no
@@ -258,23 +285,28 @@ of 502. Each client passes its own `detail_from_response` (Bitbucket digs throug
 
 **Shared helpers (`app/helpers.py`)** are pure. For `kvStores`: `build_kv_store` (one entry),
 `build_kv_stores_document`, `add_kv_store`, `read_kv_stores`, `find_kv_store`,
-`kv_store_names`, `update_kv_store`, `remove_kv_store`. For `kubernetesAuth`:
-`build_kubernetes_auth_role`, `add_kubernetes_auth_role`, `kubernetes_auth_roles`,
-`find_kubernetes_auth_role`, `kubernetes_auth_role_names`, `kubernetes_auth_role_identities`,
-`kubernetes_auth_role_stores`, `update_kubernetes_auth_role`, `remove_kubernetes_auth_role`,
-plus `kv_store_referrers` (the referential rule). Shared: `slugify_mount_path`,
-`build_branch_name`, `values_file_path`, `render_values_yaml`, `yaml_data_equals`.
+`kv_store_names`, `update_kv_store`, `remove_kv_store`. For `k8sServiceAccounts`:
+`build_k8s_service_account`, `k8s_service_accounts`, `k8s_service_account_identity`,
+`k8s_service_account_identities`, `find_k8s_service_account`, `add_k8s_service_account`,
+`remove_k8s_service_account`. Shared: `slugify_mount_path`, `build_branch_name`,
+`values_file_path`, `render_values_yaml`, `yaml_data_equals`.
 
-**The public names are thin wrappers over one key-parameterised private family** —
+**Note which argument each family takes.** The `kvStores` helpers take the parsed
+**document**; `k8s_service_accounts`, `k8s_service_account_identity(ies)` and
+`find_k8s_service_account` take **one store entry** and reach through its `roles` to the
+list. The two mutating ones — `add_k8s_service_account` / `remove_k8s_service_account` —
+take the document *and* a `kv_name`, since they have to find the store first. A store whose
+`roles` is missing or malformed reads as no bindings rather than raising.
+
+**The store helpers are thin wrappers over one key-parameterised private family** —
 `_entries` / `_find_entry` / `_entry_names` / `_add_entry` / `_update_entry` /
-`_remove_entry`, each taking the top-level key to act on (`KV_STORES_KEY` or
-`K8S_AUTH_KEY`). Every transform deepcopies the **whole document** and replaces only its own
-key, so the sibling key survives. That is not hypothetical tidiness: `add_kv_store` used to
-rebuild the document from the store list alone via `build_kv_stores_document`, which silently
-dropped every other key — data loss that became real the moment `kubernetesAuth` arrived, and
-the erase would have looked like a legitimate PR diff. Tests pin **both directions**: a k8s
-create must not erase `kvStores`, and a KV create must not erase `kubernetesAuth`. A third
-key goes in by parameterising, never by copy-pasting the family.
+`_remove_entry`, each taking the top-level key to act on. Every transform deepcopies the
+**whole document** and replaces only its own key, so a key it knows nothing about survives.
+That is not hypothetical tidiness: `add_kv_store` used to rebuild the document from the store
+list alone via `build_kv_stores_document`, which silently dropped every other key — and the
+erase would have looked like a legitimate PR diff. The `SIBLING_KEY` tests pin it with a key
+name the code has never heard of. The nested helpers get the same contract from
+`_mutate_store`, the nested counterpart of `_update_entry`.
 
 `add_kv_store`, `update_kv_store` and `remove_kv_store` take the parsed document and return
 a **new** one, never mutating the input. That is what lets the update operation diff old
@@ -289,12 +321,22 @@ transform; nothing that starts from a parsed document should call it.
 
 `read_kv_stores` tolerates `kvStores:` with nothing under it (parses to `None`) — an empty
 file, not a corrupt one. `kv_store_names` skips malformed entries so a hand-edited file
-cannot break the duplicate scan. The `kubernetesAuth` wrappers inherit all of this, plus:
-`add_kubernetes_auth_role(None, ...)` emits **only** `kubernetesAuth` — a file started by a
-role gets no `kvStores: []` sibling it never asked for; `build_kubernetes_auth_role` omits
-`cluster`/`ttl` entirely when absent rather than writing null; and `kv_store_referrers`
-skips malformed entries and matches whole store names, so `myapp-two` being referenced does
-not block deleting `myapp`.
+cannot break the duplicate scan.
+
+The binding helpers keep the same "new document, input untouched" contract, with three
+deliberate differences:
+- **`add_k8s_service_account` takes no `None`** and raises `KVStoreNotFound` for an unknown
+  store. Unlike `add_kv_store`, a binding cannot create the thing it lives in.
+- **`remove_k8s_service_account` drops the key from `roles` entirely** when the last binding
+  goes, rather than leaving `k8sServiceAccounts: []`. This is the *opposite* of
+  `remove_kv_store` and for the opposite reason: `kvStores: []` is a meaningful statement by
+  a file ("declare nothing"), whereas a store with no bindings is just a store — exactly what
+  `build_kv_store` writes — so an empty list would leave a diff no create would ever produce.
+  The `roles` mapping itself always stays. It raises `K8sServiceAccountNotFound`, which the
+  operations turn into a 404.
+- **`k8s_service_account_identity` tolerates missing keys** (they become `""`) and the
+  identity scans skip non-dict entries, so a hand-edited list cannot wedge an unrelated
+  removal.
 
 `render_values_yaml` uses a `SafeDumper` subclass that writes multi-line strings as `|`
 blocks — the default representer emits one escaped, width-wrapped scalar, which is
@@ -305,68 +347,61 @@ unreadable in the pull request diff a human is supposed to review. Only a multi-
 
 **Two shared helpers, nested.** `_open_pull_request` owns branch → commit → PR and both of
 their rollbacks (either failure deletes the branch). `_commit_via_pull_request` calls it and
-then adds the gates and the merge. **All eight mutating operations across both resource kinds
-go through them** — create/update/delete via `_commit_via_pull_request`, the four PR-only
-variants stopping at `_open_pull_request`. One implementation each means the rollback shape
-cannot drift between resource kinds, let alone between operations.
+then adds the gates and the merge. **All nine mutating operations go through them** — the
+five blocking ones via `_commit_via_pull_request`, the four PR-only variants stopping at
+`_open_pull_request`. One implementation each means the rollback shape cannot drift between
+operations.
 
-Both carry `kv_name` **and** `role_name`, defaulted to `""`; exactly one is set, by whichever
-kind is being written, and it is threaded into every `VaultOperationError` the chain raises
-so a failure names its subject in the right field.
+Both carry `kv_name`, defaulted to `""`, threaded into every `VaultOperationError` the chain
+raises so a failure names its subject. A binding operation passes the **store** it edits —
+that is what the diff touches, and a binding has no name of its own.
 
 The baseline watermark is taken **before** `_open_pull_request` and deliberately not folded
 into it — it has to precede the branch creation, and the PR-only paths have no use for it.
 
-`_prepare_create`, `_prepare_delete`, `_prepare_k8s_auth_create` and `_prepare_k8s_auth_delete`
+`_prepare_create`, `_prepare_delete`, `_prepare_k8s_sa_add` and `_prepare_k8s_sa_remove`
 are the per-operation shared pieces: each blocking path and its PR-only twin call the same one,
 which is why they cannot diverge on what is a 409 or a 404.
 
 `_walk_values_files(bitbucket)` is the single "read and parse every yaml under
-`VAULT_VALUES_DIR`, skipping unparseable ones with a warning" async generator. Three scans use
-it — the store-name scan, the role uniqueness scan and the delete's referential check — and
-each takes everything it needs from **one** pass (the k8s create answers both uniqueness and
-store-existence from the same walk).
+`VAULT_VALUES_DIR`, skipping unparseable ones with a warning" async generator. **One caller
+today** — the create's store-name scan, since store names are the only thing with a
+values-dir-wide namespace. It stays a separate generator so a second dir-wide question has
+somewhere to go.
 
 Update reads the file, applies `update_kv_store`, and **short-circuits when nothing changed**
 — returning success with `pull_request: null` rather than opening an empty PR. It always
 passes a `source_commit_id`; without that optimistic-lock token Bitbucket rejects an edit to
-an existing path as an attempted create.
+an existing path as an attempted create. It replaces `description`/`roles` only — and
+because the bindings live *under* `roles`, it explicitly **carries `k8sServiceAccounts`
+across** the replacement rather than letting the wholesale swap delete them.
 
-Delete applies `remove_kv_store` and takes the same chain. Two deliberate asymmetries with
-its neighbours: **no uniqueness scan** (that is a create-only concern — it walks the values
-dir, but for the referential check below, asking the opposite question) and **no
-`yaml_data_equals` short circuit** — if `remove_kv_store` did not raise, the document
-changed, so a removal is never a no-op. It always passes a `source_commit_id`; the file
-exists by definition. It is a **content edit, not a file removal**: the last store out leaves
-`kvStores: []` and the file in place, which keeps `GET /{file}` answering 200, lets a later
-create append normally, and needs no `delete_file` on the Bitbucket client (there isn't one).
+Delete applies `remove_kv_store` and takes the same chain, with **no scan of any kind**:
+uniqueness is a create-only concern, and there is nothing referential to check because a
+store's bindings are inside it — removing the store removes them in the same diff, with
+nothing left dangling. There is no `yaml_data_equals` short circuit either — if
+`remove_kv_store` did not raise, the document changed, so a removal is never a no-op. It
+always passes a `source_commit_id`; the file exists by definition. It is a **content edit,
+not a file removal**: the last store out leaves `kvStores: []` and the file in place, which
+keeps `GET /{file}` answering 200, lets a later create append normally, and needs no
+`delete_file` on the Bitbucket client (there isn't one).
 
-**Referential integrity (`_assert_no_referrers`).** A KV delete walks the whole values dir and
-returns **409** if any `kubernetesAuth` entry's `access` still names the store, with a message
-listing the roles and their file: `myapp is referenced by kubernetesAuth role(s) myapp-ci
-(kv/platform.yaml); delete those first`. Dir-wide, not file-scoped — a role in
-`kv/platform.yaml` may reach a store in `kv/payments.yaml`. Rejected alternatives: cascading
-into those roles (a multi-resource mutation hidden behind a single-resource URI, blast radius
-invisible in the request) and doing nothing (silent orphan). **The reverse direction has no
-check**: deleting a *role* never touches the stores, because a store with nothing pointing at
-it is perfectly valid.
+### The service-account chain
 
-### The Kubernetes auth chain
+`add_k8s_service_account_operation` and `remove_k8s_service_account_operation` reuse
+`_commit_via_pull_request` verbatim, so the rollback asymmetry and the point of no return are
+identical. What differs is only step 0, and mostly by **subtraction**:
 
-`create_kubernetes_auth_operation` differs from a KV create only in step 0, and its PR-only
-twin shares `_prepare_k8s_auth_create` the way both KV create paths share `_prepare_create`:
+0. `_require_store` — read the target file (missing → 404) and find the store in it (missing
+   → 404). An add then rejects a duplicate triple **within that store** → 409. That is the
+   whole of it: no values-dir walk, no store-existence check across files, no referential
+   rule. A remove instead 404s when the triple is not bound.
+1-6. identical to the KV create, with `K8S_SA_BRANCH_PREFIX` on the branch
+   (`vault-k8s-sa/payments-athena-passwords-3f2a1b09`) so a reviewer sees the change kind
+   first. The branch is keyed on the **store**, since the triple has no name to slug.
 
-0. **one walk, two questions** — `(cluster, name)` taken anywhere → 409; `name` taken in the
-   *target file* whatever the cluster → 409 (`{file}/{role_name}` would be ambiguous); and
-   every store named in `access` must already exist somewhere in the dir → 409. Same "check,
-   not a lock" semantics as the KV scan.
-1-6. identical to the KV create, with `K8S_AUTH_BRANCH_PREFIX` on the branch
-   (`vault-k8s-auth/payments-myapp-ci-3f2a1b09`) so a reviewer sees the change kind first.
-
-Update short-circuits on `yaml_data_equals` like the KV one, and **re-runs the store-existence
-check whenever `access` changes** — otherwise an edit could introduce the dangling reference a
-create refuses. It skips the walk entirely when `access` is untouched. Delete is the plain
-chain with no scan at all.
+Neither has a `yaml_data_equals` short circuit: an add that would be a no-op is the 409, and
+a remove that changed nothing already raised.
 
 **Ordering consequence worth knowing** (documented, not worked around): a caller who creates a
 store via `POST /kv/pull-request` and then immediately creates a role referencing it gets a
@@ -417,9 +452,10 @@ deliberate and both pinned by tests:
 consequences intact: CI still runs, and a repeat call opens a second removal PR because
 nothing was merged, so the store is still on the base branch and still deletable. The escape
 hatch matters more here than for a create — delete is the most destructive operation, and
-this is the variant that hands the decision to a reviewer. The two
-`*_kubernetes_auth_pull_request_operation` twins are the same shape again, with the same two
-consequences and the same "no Woodpecker client" rule.
+this is the variant that hands the decision to a reviewer.
+`add_k8s_service_account_pull_request_operation` and
+`remove_k8s_service_account_pull_request_operation` are the same shape again, with the same
+two consequences and the same "no Woodpecker client" rule.
 
 Two details that are easy to break:
 - **The version re-read before merging/declining.** Bitbucket's `version` is an optimistic lock
@@ -488,38 +524,37 @@ hangs until the timeout. Only `success` counts as success.
   is the escape hatch when that is unacceptable: it answers in one round-trip (~100ms against
   the stub) and hands the merge to a human.
 - Status codes: 201 creates and all four PR-only routes, 200 edits, deletes and reads,
-  409 duplicate / dangling `access` reference / still-referenced store, 404 unknown file,
-  store or role, 502 pipeline/transport failure, 504 pipeline or upstream timeout, 422 request
-  **or path parameter** validation. The rule across the whole table: an endpoint that opens a
-  PR and stops answers 201; one that runs the full chain answers 201 for a create and 200 for
-  an edit or a delete.
+  409 duplicate store name or duplicate binding, 404 unknown file, store or binding,
+  502 pipeline/transport failure, 504 pipeline or upstream timeout, 422 request, **path
+  parameter or query parameter** validation. The rule across the whole table: an endpoint
+  that opens a PR and stops answers 201; one that runs the full chain answers 201 for a
+  create or a bind and 200 for an edit, a delete or an unbind.
   Failures reuse `VaultOperationResponse` via `VaultOperationError.to_response()`; every
-  mutating route on **both** routers funnels through `_execute` in `routes.py`, which is the
-  single place that mapping lives.
+  mutating route funnels through `_execute` in `routes.py`, which is the single place that
+  mapping lives.
 - **`routes.py` has two funnels, not one.** `_execute` is for mutations; the `GET`s go through
   **`_read`**, which differs in both directions: an upstream **404 stays a 404** (a missing
   file is the caller's mistake, not a bad gateway), and its failure body is a bare
   `{"status", "error"}` dict rather than a `VaultOperationResponse` — the reads return raw
   parsed YAML on success, so there is no response model for a failure to match. Adding a read
   means using `_read`; putting a read through `_execute` turns every unknown file into a 502.
-- **One response model for both kinds**, `VaultOperationResponse` (renamed from
-  `VaultKVOperationResponse` — wire-compatible; only the OpenAPI schema title changed). It
-  carries `kv_name` **and** `role_name`, both `""`-defaulted, so each route fills in the
-  coordinate it has. Two models would have doubled the trap below; putting a role name in
-  `kv_name` would have been a lie every consumer had to learn.
+- **One response model for every mutating route**, `VaultOperationResponse` (renamed from
+  `VaultKVOperationResponse` — wire-compatible; only the OpenAPI schema title changed).
+  `(file, kv_name)` addresses stores and bindings alike: a binding is part of a store, so the
+  store is the subject of a binding operation too, and the message names the triple. There is
+  no `role_name` field — the earlier revision had one, and it went with the format.
 - **Failures are `return`ed as a `JSONResponse`, not raised.** So the POST decorator's
   `status_code=201` and `response_model=` describe the success path only — FastAPI does not
   validate or document the failure bodies. Adding a field to `VaultOperationResponse` means
-  the failure path silently omits it unless `to_response()` is updated too — that is exactly
-  what `role_name` would have hit.
+  the failure path silently omits it unless `to_response()` is updated too.
 - The committed entries are the contract with the deploy pipeline — change `build_kv_store` /
-  `build_kubernetes_auth_role` and the pipeline together. Both are the *sole* writers of their
+  `build_k8s_service_account` and the pipeline together. Both are the *sole* writers of their
   own key names.
-- Tests: 547 of them. `tests/test_helpers.py` (pure, no library import), `tests/clients/` (both
+- Tests: 470 of them. `tests/test_helpers.py` (pure, no library import), `tests/clients/` (both
   clients plus `http.py`'s error mapping, against their real REST shapes via respx),
   `tests/v1/vault/` (schemas, the chain + rollbacks with duck-typed fakes from `tests/fakes.py`,
-  and routes end-to-end through `TestClient`; `test_kubernetes_auth_*.py` mirror the KV files
-  one-for-one). Two conftest details to respect:
+  and routes end-to-end through `TestClient`; `test_k8s_service_account_*.py` mirror the KV
+  files one-for-one). Two conftest details to respect:
   - `tests/conftest.py` sets `os.environ` **before** any `app.*` import (its own `import jwt` /
     `import pytest` sit below the env block behind `# noqa: E402`) because the config singletons
     are built at import time. Adding a required setting means adding it there, above that line.
@@ -550,13 +585,13 @@ hangs until the timeout. Only `success` counts as success.
   `GET`/`PATCH` already answer for a store that is not there. **This depends on the deploy
   pipeline reading an empty list as "prune everything this file declared"** — if it cannot,
   the Bitbucket client needs a `delete_file` it does not have today.
-- **The `kubernetes-auth` endpoints that were deleted are not the ones that exist now.** The
-  old pair (plus `groups`) edited a `policies` list that a create never writes, so they
-  returned 422 unconditionally against every file this service produces. The current ones bind
-  by `access: {read: [<store>]}` — a *coordinate*, not a generated policy — which is why they
-  could be built rather than reinstated. Do not go back to git history for them, and the rule
-  stands: no policy *generation* in this service, ever. If the pipeline ever wants policies in
-  the committed file, that is still the pipeline's output, not this service's.
+- **Two earlier Kubernetes shapes are gone; neither is a source to copy from.** The first
+  edited a `policies` list a create never writes, so it 422'd against every file this service
+  produces. The second modelled bindings as a top-level `kubernetesAuth` list of named roles
+  pointing back at stores via `access: {read: [<store>]}`; it worked, but the format nests
+  bindings inside the store instead. Do not go back to git history for either. The rule that
+  survived both: no policy *generation* in this service, ever. If the pipeline ever wants
+  policies in the committed file, that is still the pipeline's output, not this service's.
 - **`groups` is still gone** and has no replacement.
 - Commits are expected to be **Conventional Commits** (`feat:`, `fix:`, `test:`, `feat!:` for a
   breaking change) — follow the existing `git log`. There is no changelog tooling: a `cliff.toml`

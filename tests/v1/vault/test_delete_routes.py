@@ -6,8 +6,7 @@ Two shapes live on the same prefix here — `/{file}/{kv_name}` and
 import yaml
 
 from app.helpers import (
-    add_kubernetes_auth_role,
-    build_kubernetes_auth_role,
+    build_k8s_service_account,
     build_kv_store,
     build_kv_stores_document,
     render_values_yaml,
@@ -91,26 +90,18 @@ def test_delete_of_a_missing_store_returns_404(client, auth_headers, bitbucket):
     assert "not defined in" in response.json()["error"]
 
 
-def test_deleting_a_referenced_store_returns_409(client, auth_headers, bitbucket):
-    """Refusing beats orphaning the binding — and the message says how to unblock it."""
-    _seed(bitbucket, KV)
-    bitbucket.existing_files["kv/platform.yaml"] = render_values_yaml(
-        add_kubernetes_auth_role(
-            build_kv_stores_document([]),
-            build_kubernetes_auth_role(
-                "myapp-ci", "CI deployer", ["vault-reader"], ["payments"], {"read": [KV]}
-            ),
-        )
-    )
+def test_deleting_a_bound_store_succeeds(client, auth_headers, bitbucket):
+    """Bindings are nested in the store, so there is nothing left behind to refuse over."""
+    document = build_kv_stores_document([build_kv_store(KV, "payments secrets", ROLES)])
+    document["kvStores"][0]["roles"]["k8sServiceAccounts"] = [
+        build_k8s_service_account("vault", "payments", "dev")
+    ]
+    bitbucket.existing_files[VALUES_PATH] = render_values_yaml(document)
 
     response = client.delete(STORE_URL, headers=auth_headers)
 
-    assert response.status_code == 409
-    assert response.json()["error"] == (
-        f"{KV} is referenced by kubernetesAuth role(s) myapp-ci (kv/platform.yaml); "
-        f"delete those first"
-    )
-    assert "create_branch" not in bitbucket.calls
+    assert response.status_code == 200
+    assert _committed(bitbucket) == {"kvStores": []}
 
 
 def test_delete_failed_validation_returns_502(client, auth_headers, bitbucket, woodpecker):

@@ -9,26 +9,25 @@ import pytest
 import yaml
 
 from app.helpers import (
+    K8sServiceAccountNotFound,
     KVStoreNotFound,
-    add_kubernetes_auth_role,
+    add_k8s_service_account,
     add_kv_store,
     build_branch_name,
-    build_kubernetes_auth_role,
+    build_k8s_service_account,
     build_kv_store,
     build_kv_stores_document,
-    find_kubernetes_auth_role,
+    find_k8s_service_account,
     find_kv_store,
-    kubernetes_auth_role_identities,
-    kubernetes_auth_role_names,
-    kubernetes_auth_roles,
+    k8s_service_account_identities,
+    k8s_service_account_identity,
+    k8s_service_accounts,
     kv_store_names,
-    kv_store_referrers,
     read_kv_stores,
-    remove_kubernetes_auth_role,
+    remove_k8s_service_account,
     remove_kv_store,
     render_values_yaml,
     slugify_mount_path,
-    update_kubernetes_auth_role,
     update_kv_store,
     values_file_path,
     yaml_data_equals,
@@ -36,10 +35,11 @@ from app.helpers import (
 
 ROLES = {"read": ["app01.corp.example.com"]}
 
-# A plausible second top-level key. Nothing in the code knows this name — that is the
-# point: the transforms must carry it through without understanding it.
-SIBLING_KEY = "kubernetesAuth"
-SIBLING_VALUE = [{"name": "myapp-ci", "namespaces": ["payments"]}]
+# A top-level key nothing in the code knows about — that is the point: the transforms must
+# carry it through without understanding it, so a key the pipeline adds later survives an
+# edit made by this service.
+SIBLING_KEY = "someKeyWeDoNotKnow"
+SIBLING_VALUE = [{"name": "whatever", "shape": ["unknown"]}]
 
 
 def _store(name="myapp", description="payments secrets", roles=None):
@@ -356,7 +356,7 @@ def test_a_sibling_top_level_key_is_deep_copied_out_of_the_input():
     result = add_kv_store(original, _store(name="two"))
     result[SIBLING_KEY][0]["name"] = "changed"
 
-    assert original[SIBLING_KEY][0]["name"] == "myapp-ci"
+    assert original[SIBLING_KEY][0]["name"] == "whatever"
 
 
 def test_reads_ignore_a_sibling_top_level_key():
@@ -365,7 +365,7 @@ def test_reads_ignore_a_sibling_top_level_key():
 
     assert kv_store_names(document) == ["one"]
     assert [s["name"] for s in read_kv_stores(document)] == ["one"]
-    assert find_kv_store(document, "myapp-ci") is None
+    assert find_kv_store(document, "whatever") is None
 
 
 # --------------------------------------------------------------------------- #
@@ -388,275 +388,328 @@ def test_a_no_op_update_compares_equal():
 
 
 # --------------------------------------------------------------------------- #
-# Kubernetes auth roles
+# Kubernetes service accounts
 #
-# The second kind of entry. It goes through the same key-parameterised family, so the
-# contracts above (new document, input untouched, siblings preserved) are inherited rather
-# than reimplemented — these check the *format*: which keys are written, and how the two
-# kinds coexist in one file.
+# Nested inside a store, not beside it. These check the *format* — which keys are written,
+# what identifies an entry — and the nesting contract: editing a store's bindings must not
+# disturb the store's own fields or its siblings.
 # --------------------------------------------------------------------------- #
-ACCESS = {"read": ["myapp"]}
+def _account(service_account="vault", namespace="payments", cluster="dev"):
+    return build_k8s_service_account(service_account, namespace, cluster)
 
 
-def _role(name="myapp-ci", cluster="prod-il-1", **overrides):
-    values = {
-        "role_name": name,
-        "role_description": "CI deployer",
-        "service_accounts": ["vault-reader"],
-        "namespaces": ["payments"],
-        "access": ACCESS,
-        "cluster": cluster,
-    }
-    values.update(overrides)
-    return build_kubernetes_auth_role(**values)
+def _store_with_accounts(name="myapp", accounts=None):
+    store = _store(name=name)
+    store["roles"]["k8sServiceAccounts"] = list(
+        accounts if accounts is not None else [_account()]
+    )
+    return store
 
 
-def _roles_document(*names):
-    return {"kubernetesAuth": [_role(name=n) for n in names]}
+def _bound_document(*names):
+    return {"kvStores": [_store_with_accounts(name=n) for n in names]}
 
 
-def test_build_role_translates_to_the_document_keys():
-    """snake_case request fields, camelCase document keys — translated in one place."""
-    assert _role() == {
-        "name": "myapp-ci",
-        "description": "CI deployer",
-        "cluster": "prod-il-1",
-        "serviceAccounts": ["vault-reader"],
-        "namespaces": ["payments"],
-        "access": {"read": ["myapp"]},
+def test_build_account_translates_to_the_document_keys():
+    """The camelCase key names are the contract with the deploy pipeline."""
+    assert build_k8s_service_account("vault", "athena", "dev") == {
+        "serviceAccount": "vault",
+        "namespace": "athena",
+        "cluster": "dev",
     }
 
 
-def test_build_role_writes_nothing_about_policies():
-    """The scope boundary: a role names stores and a capability, never a policy."""
-    entry = _role(ttl="24h")
+def test_build_account_writes_nothing_about_policies():
+    """The scope boundary: an entry is a coordinate, never a generated policy."""
+    entry = build_k8s_service_account("vault", "athena", "dev")
 
-    assert "policies" not in entry
-    assert entry["access"] == {"read": ["myapp"]}
-    assert set(entry) <= {
-        "name",
-        "description",
-        "cluster",
-        "serviceAccounts",
-        "namespaces",
-        "access",
-        "ttl",
-    }
+    assert set(entry) == {"serviceAccount", "namespace", "cluster"}
+    for forbidden in ("policies", "policy", "mount", "access", "capabilities", "ttl"):
+        assert forbidden not in entry
 
 
-def test_build_role_omits_an_absent_cluster_and_ttl():
-    """A key holding null is harder for a pipeline to read as "not specified"."""
-    entry = _role(cluster=None)
+def test_build_account_keeps_all_three_parts_required():
+    """No key is omitted the way an absent cluster used to be — the triple is the identity."""
+    entry = build_k8s_service_account("vault", "athena", "dev")
 
-    assert "cluster" not in entry
-    assert "ttl" not in entry
-
-
-def test_build_role_keeps_ttl_when_given():
-    assert _role(ttl="24h")["ttl"] == "24h"
+    assert all(entry.values())
 
 
-def test_build_role_copies_the_lists_it_is_given():
-    """A caller mutating its own input must not reach into the built entry."""
-    accounts = ["vault-reader"]
-    entry = build_kubernetes_auth_role(
-        "myapp-ci", "d", accounts, ["payments"], {"read": ["myapp"]}
-    )
-    accounts.append("other")
+def test_accounts_read_out_of_a_store():
+    store = _store_with_accounts(accounts=[_account(), _account(namespace="other")])
 
-    assert entry["serviceAccounts"] == ["vault-reader"]
+    assert [a["namespace"] for a in k8s_service_accounts(store)] == ["payments", "other"]
 
 
-def test_role_reads_mirror_the_store_reads():
-    document = _roles_document("one", "two")
+@pytest.mark.parametrize(
+    "empty",
+    [
+        None,
+        {},
+        _store(),
+        {"roles": {}},
+        {"roles": {"k8sServiceAccounts": None}},
+        {"roles": {"k8sServiceAccounts": []}},
+        {"roles": "not a mapping"},
+    ],
+)
+def test_accounts_tolerate_a_store_that_binds_nothing(empty):
+    """A store with no bindings simply has no key — what `build_kv_store` writes.
 
-    assert [r["name"] for r in kubernetes_auth_roles(document)] == ["one", "two"]
-    assert kubernetes_auth_role_names(document) == ["one", "two"]
-    assert find_kubernetes_auth_role(document, "two")["name"] == "two"
-    assert find_kubernetes_auth_role(document, "nope") is None
-
-
-@pytest.mark.parametrize("empty", [None, {}, {"kubernetesAuth": None}])
-def test_role_reads_tolerate_an_empty_document(empty):
-    assert kubernetes_auth_roles(empty) == []
-    assert kubernetes_auth_role_names(empty) == []
-
-
-def test_role_identities_pair_cluster_with_name():
-    """The cross-file uniqueness key."""
-    assert kubernetes_auth_role_identities(_roles_document("one")) == [
-        ("prod-il-1", "one")
-    ]
-
-
-def test_role_identities_use_an_empty_cluster_when_absent():
-    """`cluster` is optional, so its absence is itself a coordinate, not a wildcard."""
-    document = {"kubernetesAuth": [_role(cluster=None)]}
-
-    assert kubernetes_auth_role_identities(document) == [("", "myapp-ci")]
+    A missing or malformed `roles` reads as no bindings too, rather than raising: the list
+    is reached *through* `roles`, and a hand-edited file must not wedge a scan.
+    """
+    assert k8s_service_accounts(empty) == []
 
 
-def test_role_identities_skip_malformed_entries():
-    document = {"kubernetesAuth": [{"name": "ok"}, "just a string", {"no": "name"}]}
-
-    assert kubernetes_auth_role_identities(document) == [("", "ok")]
+def test_identity_is_the_triple_in_order():
+    assert k8s_service_account_identity(_account()) == ("vault", "payments", "dev")
 
 
-def test_add_role_to_a_missing_file_starts_the_list():
-    assert add_kubernetes_auth_role(None, _role())["kubernetesAuth"] == [_role()]
+def test_identity_uses_empty_strings_for_missing_parts():
+    """A hand-edited entry missing a key must not raise mid-scan."""
+    assert k8s_service_account_identity({"serviceAccount": "vault"}) == ("vault", "", "")
 
 
-def test_a_file_started_by_a_role_carries_no_empty_store_list():
-    """It never asked for a `kvStores: []` sibling, so it must not get one."""
-    assert list(add_kubernetes_auth_role(None, _role())) == ["kubernetesAuth"]
+def test_identities_skip_malformed_entries():
+    store = _store_with_accounts(accounts=[_account(), "just a string"])
+
+    assert k8s_service_account_identities(store) == [("vault", "payments", "dev")]
 
 
-def test_update_role_replaces_lists_wholesale():
-    """Merging would make removing a namespace impossible."""
-    updated = update_kubernetes_auth_role(
-        _roles_document("one"), "one", namespaces=["other"]
-    )
+def test_find_returns_the_matching_binding():
+    store = _store_with_accounts(accounts=[_account(), _account(cluster="prod")])
 
-    assert updated["kubernetesAuth"][0]["namespaces"] == ["other"]
+    assert find_k8s_service_account(store, ("vault", "payments", "prod"))["cluster"] == "prod"
 
 
-def test_update_role_leaves_omitted_fields_alone():
-    updated = update_kubernetes_auth_role(
-        _roles_document("one"), "one", namespaces=["other"]
+def test_find_returns_none_when_absent():
+    assert find_k8s_service_account(_store_with_accounts(), ("nope", "payments", "dev")) is None
+
+
+def test_find_matches_on_the_whole_triple_not_the_name():
+    """Same account, different namespace, is a different binding."""
+    store = _store_with_accounts()
+
+    assert find_k8s_service_account(store, ("vault", "other", "dev")) is None
+
+
+# --------------------------------------------------------------------------- #
+# adding a binding
+# --------------------------------------------------------------------------- #
+def test_add_starts_the_list_on_a_store_that_had_none():
+    result = add_k8s_service_account(_document("one"), "one", _account())
+
+    assert result["kvStores"][0]["roles"]["k8sServiceAccounts"] == [_account()]
+
+
+def test_add_appends_after_the_existing_bindings():
+    result = add_k8s_service_account(
+        _bound_document("one"), "one", _account(namespace="other")
     )
 
-    assert updated["kubernetesAuth"][0]["serviceAccounts"] == ["vault-reader"]
-    assert updated["kubernetesAuth"][0]["access"] == ACCESS
+    assert [
+        a["namespace"] for a in result["kvStores"][0]["roles"]["k8sServiceAccounts"]
+    ] == ["payments", "other"]
 
 
-def test_update_role_never_touches_the_name_or_the_cluster():
-    """Both identify the role in Vault, so changing either is a delete plus a create."""
-    updated = update_kubernetes_auth_role(
-        _roles_document("one"), "one", role_description="new"
+def test_add_leaves_the_stores_own_fields_alone():
+    result = add_k8s_service_account(_document("one"), "one", _account())
+    store = result["kvStores"][0]
+
+    assert store["name"] == "one"
+    assert store["description"] == "payments secrets"
+    assert store["roles"]["read"] == ROLES["read"]
+
+
+def test_add_leaves_sibling_stores_alone():
+    result = add_k8s_service_account(_document("one", "two"), "one", _account())
+
+    assert "k8sServiceAccounts" not in result["kvStores"][1]["roles"]
+
+
+def test_add_does_not_mutate_its_input():
+    original = _document("one")
+    add_k8s_service_account(original, "one", _account())
+
+    assert "k8sServiceAccounts" not in original["kvStores"][0]["roles"]
+
+
+def test_add_deep_copies_so_later_edits_do_not_leak():
+    account = _account()
+    result = add_k8s_service_account(_document("one"), "one", account)
+    account["namespace"] = "changed"
+
+    assert (
+        result["kvStores"][0]["roles"]["k8sServiceAccounts"][0]["namespace"] == "payments"
     )
 
-    assert updated["kubernetesAuth"][0]["name"] == "one"
-    assert updated["kubernetesAuth"][0]["cluster"] == "prod-il-1"
 
-
-def test_update_role_does_not_mutate_its_input():
-    original = _roles_document("one")
-    update_kubernetes_auth_role(original, "one", role_description="new")
-
-    assert original["kubernetesAuth"][0]["description"] == "CI deployer"
-
-
-def test_update_of_an_absent_role_raises():
+def test_add_to_an_absent_store_raises():
+    """A binding cannot create the store it lives in — unlike `add_kv_store(None, ...)`."""
     with pytest.raises(KVStoreNotFound):
-        update_kubernetes_auth_role(_roles_document("one"), "nope", ttl="1h")
+        add_k8s_service_account(_document("one"), "nope", _account())
 
 
-def test_remove_role_drops_only_the_named_one():
-    result = remove_kubernetes_auth_role(_roles_document("one", "two"), "one")
+# --------------------------------------------------------------------------- #
+# removing a binding
+# --------------------------------------------------------------------------- #
+def test_remove_drops_only_the_matching_binding():
+    document = {"kvStores": [_store_with_accounts(accounts=[_account(), _account(cluster="prod")])]}
+    result = remove_k8s_service_account(document, "myapp", ("vault", "payments", "dev"))
 
-    assert [r["name"] for r in result["kubernetesAuth"]] == ["two"]
+    assert [
+        a["cluster"] for a in result["kvStores"][0]["roles"]["k8sServiceAccounts"]
+    ] == ["prod"]
 
 
-def test_remove_of_an_absent_role_raises():
+def test_removing_the_last_binding_drops_the_key_entirely():
+    """Deliberately unlike `remove_kv_store`, which leaves `kvStores: []` behind.
+
+    A store with no bindings is just a store — exactly what a fresh create writes — so an
+    empty list would leave a diff no create would ever produce.
+    """
+    result = remove_k8s_service_account(
+        _bound_document("one"), "one", ("vault", "payments", "dev")
+    )
+
+    assert "k8sServiceAccounts" not in result["kvStores"][0]["roles"]
+    assert result["kvStores"][0] == _store(name="one")
+
+
+def test_remove_does_not_mutate_its_input():
+    original = _bound_document("one")
+    remove_k8s_service_account(original, "one", ("vault", "payments", "dev"))
+
+    assert original["kvStores"][0]["roles"]["k8sServiceAccounts"] == [_account()]
+
+
+def test_remove_leaves_sibling_stores_alone():
+    document = {"kvStores": [_store_with_accounts(name="one"), _store_with_accounts(name="two")]}
+    result = remove_k8s_service_account(document, "one", ("vault", "payments", "dev"))
+
+    assert result["kvStores"][1]["roles"]["k8sServiceAccounts"] == [_account()]
+
+
+def test_remove_of_an_absent_binding_raises():
+    with pytest.raises(K8sServiceAccountNotFound):
+        remove_k8s_service_account(_bound_document("one"), "one", ("nope", "payments", "dev"))
+
+
+def test_remove_from_a_store_that_binds_nothing_raises():
+    with pytest.raises(K8sServiceAccountNotFound):
+        remove_k8s_service_account(_document("one"), "one", ("vault", "payments", "dev"))
+
+
+def test_remove_from_an_absent_store_raises_store_not_found():
     with pytest.raises(KVStoreNotFound):
-        remove_kubernetes_auth_role(_roles_document("one"), "nope")
+        remove_k8s_service_account(_document("one"), "nope", ("vault", "payments", "dev"))
+
+
+def test_remove_survives_a_hand_edited_list():
+    """A malformed neighbour must not wedge an otherwise valid removal."""
+    document = {"kvStores": [_store_with_accounts(accounts=[_account(), "junk"])]}
+    result = remove_k8s_service_account(document, "myapp", ("vault", "payments", "dev"))
+
+    assert result["kvStores"][0]["roles"]["k8sServiceAccounts"] == ["junk"]
 
 
 # --------------------------------------------------------------------------- #
-# referrers — the rule a KV delete consults
-# --------------------------------------------------------------------------- #
-def test_referrers_names_the_roles_that_reach_a_store():
-    assert kv_store_referrers(_roles_document("one", "two"), "myapp") == ["one", "two"]
-
-
-def test_referrers_is_empty_for_an_unreferenced_store():
-    assert kv_store_referrers(_roles_document("one"), "billing") == []
-
-
-@pytest.mark.parametrize("empty", [None, {}, {"kvStores": []}])
-def test_referrers_of_a_document_with_no_roles_is_empty(empty):
-    assert kv_store_referrers(empty, "myapp") == []
-
-
-def test_referrers_looks_under_every_capability():
-    document = {"kubernetesAuth": [_role(access={"write": ["billing"]})]}
-
-    assert kv_store_referrers(document, "billing") == ["myapp-ci"]
-
-
-def test_referrers_matches_a_whole_name_not_a_prefix():
-    """A substring match would block deleting `app` because `app-two` is referenced."""
-    document = {"kubernetesAuth": [_role(access={"read": ["myapp-two"]})]}
-
-    assert kv_store_referrers(document, "myapp") == []
-
-
-def test_referrers_survives_a_hand_edited_file():
-    """A malformed entry must not wedge an unrelated delete."""
-    document = {
-        "kubernetesAuth": [
-            "just a string",
-            {"name": "no-access"},
-            {"name": "bad-access", "access": "not a mapping"},
-            {"name": "bad-stores", "access": {"read": "not a list"}},
-            _role(access={"read": ["myapp"]}),
-        ]
-    }
-
-    assert kv_store_referrers(document, "myapp") == ["myapp-ci"]
-
-
-# --------------------------------------------------------------------------- #
-# the two kinds sharing one file
+# the store and its bindings in one file
 #
-# The sibling-preservation tests above use a synthetic key; these use the real thing in
-# both directions, because a create of either kind erasing the other would sail through CI
-# looking like a legitimate diff.
+# The nesting is the whole design: a binding has nowhere to dangle from, so removing a
+# store removes its bindings in the same diff.
 # --------------------------------------------------------------------------- #
-def _shared_document():
-    return add_kubernetes_auth_role(_document("myapp"), _role())
+def test_removing_a_store_takes_its_bindings_with_it():
+    result = remove_kv_store(_bound_document("one", "two"), "one")
+
+    assert [s["name"] for s in result["kvStores"]] == ["two"]
+    assert "one" not in render_values_yaml(result)
 
 
-def test_adding_a_role_preserves_the_kv_stores():
-    result = add_kubernetes_auth_role(_document("myapp"), _role())
+def test_editing_only_the_description_leaves_the_bindings_alone():
+    result = update_kv_store(_bound_document("one"), "one", description="new")
 
-    assert [s["name"] for s in result["kvStores"]] == ["myapp"]
-    assert kubernetes_auth_role_names(result) == ["myapp-ci"]
-
-
-def test_adding_a_store_preserves_the_roles():
-    result = add_kv_store(_shared_document(), _store(name="billing"))
-
-    assert [s["name"] for s in result["kvStores"]] == ["myapp", "billing"]
-    assert kubernetes_auth_role_names(result) == ["myapp-ci"]
+    assert result["kvStores"][0]["description"] == "new"
+    assert result["kvStores"][0]["roles"]["k8sServiceAccounts"] == [_account()]
 
 
-def test_editing_either_kind_preserves_the_other():
-    document = _shared_document()
+def test_replacing_roles_wholesale_still_keeps_the_bindings():
+    """The trap of nesting under `roles`: a wholesale replace would erase every binding.
 
-    assert kubernetes_auth_role_names(
-        update_kv_store(document, "myapp", description="new")
-    ) == ["myapp-ci"]
-    assert kv_store_names(
-        update_kubernetes_auth_role(document, "myapp-ci", ttl="1h")
-    ) == ["myapp"]
+    The update body cannot express bindings, so dropping them here would be data loss with
+    no way to undo it in the same call — and the erase would look like a legitimate diff.
+    """
+    result = update_kv_store(
+        _bound_document("one"), "one", roles={"read": ["CN=someone-else"]}
+    )
+    roles = result["kvStores"][0]["roles"]
 
-
-def test_removing_either_kind_preserves_the_other():
-    document = _shared_document()
-
-    assert kubernetes_auth_role_names(remove_kv_store(document, "myapp")) == ["myapp-ci"]
-    assert kv_store_names(remove_kubernetes_auth_role(document, "myapp-ci")) == ["myapp"]
+    assert roles["read"] == ["CN=someone-else"]
+    assert "write" not in roles
+    assert roles["k8sServiceAccounts"] == [_account()]
 
 
-def test_a_shared_file_round_trips_through_yaml():
-    document = _shared_document()
+def test_replacing_roles_on_an_unbound_store_adds_no_empty_list():
+    result = update_kv_store(_document("one"), "one", roles={"read": ["CN=x"]})
+
+    assert "k8sServiceAccounts" not in result["kvStores"][0]["roles"]
+
+
+def test_the_carried_bindings_stay_last_in_the_mapping():
+    """Principals first, then workloads — the order the format spec writes them in."""
+    result = update_kv_store(
+        _bound_document("one"), "one", roles={"read": ["CN=x"], "write": ["CN=y"]}
+    )
+
+    assert list(result["kvStores"][0]["roles"]) == ["read", "write", "k8sServiceAccounts"]
+
+
+def test_a_no_op_roles_update_on_a_bound_store_compares_equal():
+    """Carrying the bindings across must not by itself look like a change."""
+    document = _bound_document("one")
+    updated = update_kv_store(document, "one", roles=ROLES)
+
+    assert yaml_data_equals(document, updated)
+
+
+def test_binding_edits_leave_the_stores_principals_alone():
+    result = add_k8s_service_account(_bound_document("one"), "one", _account(cluster="prod"))
+
+    assert result["kvStores"][0]["roles"]["read"] == ROLES["read"]
+
+
+def test_a_bound_store_round_trips_through_yaml():
+    document = _bound_document("one")
 
     assert yaml.safe_load(render_values_yaml(document)) == document
 
 
-def test_a_shared_file_renders_both_keys_at_the_top_level():
-    rendered = render_values_yaml(_shared_document())
+def test_a_bound_store_renders_the_list_inside_the_store():
+    """The nesting has to survive serialisation — this is the shape the pipeline reads."""
+    parsed = yaml.safe_load(render_values_yaml(_bound_document("one")))
 
-    assert rendered.startswith("kvStores:\n")
-    assert "\nkubernetesAuth:\n" in rendered
+    assert "k8sServiceAccounts" not in parsed
+    assert "k8sServiceAccounts" not in parsed["kvStores"][0]
+    assert parsed["kvStores"][0]["roles"]["k8sServiceAccounts"] == [_account()]
+
+
+def test_a_bound_store_renders_the_keys_in_a_readable_order():
+    """Name and description first, then roles, then bindings — as the format shows them."""
+    rendered = render_values_yaml(_bound_document("one"))
+
+    assert rendered.index("name:") < rendered.index("roles:")
+    assert rendered.index("roles:") < rendered.index("k8sServiceAccounts:")
+
+
+def test_the_bindings_render_one_level_inside_roles():
+    """Level with `read`/`write`, not with `roles` — the indentation is the format."""
+    lines = render_values_yaml(_bound_document("one")).splitlines()
+    read = next(line for line in lines if line.strip().startswith("read:"))
+    accounts = next(
+        line for line in lines if line.strip().startswith("k8sServiceAccounts:")
+    )
+
+    indent = lambda line: len(line) - len(line.lstrip())  # noqa: E731
+
+    assert indent(accounts) == indent(read)
