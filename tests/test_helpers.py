@@ -10,21 +10,36 @@ import yaml
 
 from app.helpers import (
     KVStoreNotFound,
+    add_kubernetes_auth_role,
     add_kv_store,
     build_branch_name,
+    build_kubernetes_auth_role,
     build_kv_store,
     build_kv_stores_document,
+    find_kubernetes_auth_role,
     find_kv_store,
+    kubernetes_auth_role_identities,
+    kubernetes_auth_role_names,
+    kubernetes_auth_roles,
     kv_store_names,
+    kv_store_referrers,
     read_kv_stores,
+    remove_kubernetes_auth_role,
+    remove_kv_store,
     render_values_yaml,
     slugify_mount_path,
+    update_kubernetes_auth_role,
     update_kv_store,
     values_file_path,
     yaml_data_equals,
 )
 
 ROLES = {"read": ["app01.corp.example.com"]}
+
+# A plausible second top-level key. Nothing in the code knows this name — that is the
+# point: the transforms must carry it through without understanding it.
+SIBLING_KEY = "kubernetesAuth"
+SIBLING_VALUE = [{"name": "myapp-ci", "namespaces": ["payments"]}]
 
 
 def _store(name="myapp", description="payments secrets", roles=None):
@@ -33,6 +48,12 @@ def _store(name="myapp", description="payments secrets", roles=None):
 
 def _document(*names):
     return build_kv_stores_document([_store(name=n) for n in names])
+
+
+def _document_with_sibling(*names):
+    document = _document(*names)
+    document[SIBLING_KEY] = [dict(entry) for entry in SIBLING_VALUE]
+    return document
 
 
 # --------------------------------------------------------------------------- #
@@ -235,6 +256,118 @@ def test_update_of_an_absent_store_raises():
         update_kv_store(_document("one"), "nope", description="new")
 
 
+def test_update_copies_the_roles_it_is_given():
+    """A caller mutating its own input must not reach into the returned document."""
+    hosts = ["a.example.com"]
+    updated = update_kv_store(_document("one"), "one", roles={"read": hosts})
+    hosts.append("b.example.com")
+
+    assert updated["kvStores"][0]["roles"]["read"] == ["a.example.com"]
+
+
+# --------------------------------------------------------------------------- #
+# removing
+#
+# Same contract as the edit: a new document, the input untouched, and a name that is not
+# there is an error rather than a silent success.
+# --------------------------------------------------------------------------- #
+def test_remove_drops_only_the_named_store():
+    result = remove_kv_store(_document("one", "two", "three"), "two")
+
+    assert [s["name"] for s in result["kvStores"]] == ["one", "three"]
+
+
+def test_remove_does_not_mutate_its_input():
+    original = _document("one", "two")
+    remove_kv_store(original, "two")
+
+    assert [s["name"] for s in original["kvStores"]] == ["one", "two"]
+
+
+def test_remove_deep_copies_so_later_edits_do_not_leak():
+    original = _document("one", "two")
+    result = remove_kv_store(original, "two")
+    result["kvStores"][0]["description"] = "changed"
+
+    assert original["kvStores"][0]["description"] == "payments secrets"
+
+
+def test_removing_the_last_store_leaves_an_empty_list():
+    """The file stays and keeps its key: an empty list is a file that declares nothing."""
+    result = remove_kv_store(_document("only"), "only")
+
+    assert result == {"kvStores": []}
+
+
+def test_an_emptied_file_renders_and_reads_back_as_empty():
+    """`kvStores: []` has to survive the round trip, or a later create cannot append."""
+    rendered = render_values_yaml(remove_kv_store(_document("only"), "only"))
+
+    assert rendered == "kvStores: []\n"
+    assert read_kv_stores(yaml.safe_load(rendered)) == []
+
+
+def test_remove_of_an_absent_store_raises():
+    with pytest.raises(KVStoreNotFound):
+        remove_kv_store(_document("one"), "nope")
+
+
+def test_remove_from_an_empty_file_raises():
+    with pytest.raises(KVStoreNotFound):
+        remove_kv_store({"kvStores": []}, "nope")
+
+
+# --------------------------------------------------------------------------- #
+# sibling top-level keys
+#
+# The document is a mapping, not just a store list. Every transform replaces its own key
+# and copies the rest through, so a key it knows nothing about survives — rebuilding the
+# document from the store list alone would erase it, and the erase would look like a
+# legitimate diff in the pull request.
+# --------------------------------------------------------------------------- #
+def test_add_preserves_a_sibling_top_level_key():
+    result = add_kv_store(_document_with_sibling("one"), _store(name="two"))
+
+    assert result[SIBLING_KEY] == SIBLING_VALUE
+    assert [s["name"] for s in result["kvStores"]] == ["one", "two"]
+
+
+def test_update_preserves_a_sibling_top_level_key():
+    result = update_kv_store(_document_with_sibling("one"), "one", description="new")
+
+    assert result[SIBLING_KEY] == SIBLING_VALUE
+
+
+def test_remove_preserves_a_sibling_top_level_key():
+    result = remove_kv_store(_document_with_sibling("one", "two"), "two")
+
+    assert result[SIBLING_KEY] == SIBLING_VALUE
+
+
+def test_emptying_the_stores_preserves_a_sibling_top_level_key():
+    """Deleting the last store must not take the rest of the file with it."""
+    result = remove_kv_store(_document_with_sibling("only"), "only")
+
+    assert result == {"kvStores": [], SIBLING_KEY: SIBLING_VALUE}
+
+
+def test_a_sibling_top_level_key_is_deep_copied_out_of_the_input():
+    original = _document_with_sibling("one")
+    result = add_kv_store(original, _store(name="two"))
+    result[SIBLING_KEY][0]["name"] = "changed"
+
+    assert original[SIBLING_KEY][0]["name"] == "myapp-ci"
+
+
+def test_reads_ignore_a_sibling_top_level_key():
+    """The scans read `kvStores` and nothing else, so a shared file scans correctly."""
+    document = _document_with_sibling("one")
+
+    assert kv_store_names(document) == ["one"]
+    assert [s["name"] for s in read_kv_stores(document)] == ["one"]
+    assert find_kv_store(document, "myapp-ci") is None
+
+
 # --------------------------------------------------------------------------- #
 # comparison
 # --------------------------------------------------------------------------- #
@@ -252,3 +385,278 @@ def test_a_no_op_update_compares_equal():
     updated = update_kv_store(document, "one", description="payments secrets")
 
     assert yaml_data_equals(document, updated)
+
+
+# --------------------------------------------------------------------------- #
+# Kubernetes auth roles
+#
+# The second kind of entry. It goes through the same key-parameterised family, so the
+# contracts above (new document, input untouched, siblings preserved) are inherited rather
+# than reimplemented — these check the *format*: which keys are written, and how the two
+# kinds coexist in one file.
+# --------------------------------------------------------------------------- #
+ACCESS = {"read": ["myapp"]}
+
+
+def _role(name="myapp-ci", cluster="prod-il-1", **overrides):
+    values = {
+        "role_name": name,
+        "role_description": "CI deployer",
+        "service_accounts": ["vault-reader"],
+        "namespaces": ["payments"],
+        "access": ACCESS,
+        "cluster": cluster,
+    }
+    values.update(overrides)
+    return build_kubernetes_auth_role(**values)
+
+
+def _roles_document(*names):
+    return {"kubernetesAuth": [_role(name=n) for n in names]}
+
+
+def test_build_role_translates_to_the_document_keys():
+    """snake_case request fields, camelCase document keys — translated in one place."""
+    assert _role() == {
+        "name": "myapp-ci",
+        "description": "CI deployer",
+        "cluster": "prod-il-1",
+        "serviceAccounts": ["vault-reader"],
+        "namespaces": ["payments"],
+        "access": {"read": ["myapp"]},
+    }
+
+
+def test_build_role_writes_nothing_about_policies():
+    """The scope boundary: a role names stores and a capability, never a policy."""
+    entry = _role(ttl="24h")
+
+    assert "policies" not in entry
+    assert entry["access"] == {"read": ["myapp"]}
+    assert set(entry) <= {
+        "name",
+        "description",
+        "cluster",
+        "serviceAccounts",
+        "namespaces",
+        "access",
+        "ttl",
+    }
+
+
+def test_build_role_omits_an_absent_cluster_and_ttl():
+    """A key holding null is harder for a pipeline to read as "not specified"."""
+    entry = _role(cluster=None)
+
+    assert "cluster" not in entry
+    assert "ttl" not in entry
+
+
+def test_build_role_keeps_ttl_when_given():
+    assert _role(ttl="24h")["ttl"] == "24h"
+
+
+def test_build_role_copies_the_lists_it_is_given():
+    """A caller mutating its own input must not reach into the built entry."""
+    accounts = ["vault-reader"]
+    entry = build_kubernetes_auth_role(
+        "myapp-ci", "d", accounts, ["payments"], {"read": ["myapp"]}
+    )
+    accounts.append("other")
+
+    assert entry["serviceAccounts"] == ["vault-reader"]
+
+
+def test_role_reads_mirror_the_store_reads():
+    document = _roles_document("one", "two")
+
+    assert [r["name"] for r in kubernetes_auth_roles(document)] == ["one", "two"]
+    assert kubernetes_auth_role_names(document) == ["one", "two"]
+    assert find_kubernetes_auth_role(document, "two")["name"] == "two"
+    assert find_kubernetes_auth_role(document, "nope") is None
+
+
+@pytest.mark.parametrize("empty", [None, {}, {"kubernetesAuth": None}])
+def test_role_reads_tolerate_an_empty_document(empty):
+    assert kubernetes_auth_roles(empty) == []
+    assert kubernetes_auth_role_names(empty) == []
+
+
+def test_role_identities_pair_cluster_with_name():
+    """The cross-file uniqueness key."""
+    assert kubernetes_auth_role_identities(_roles_document("one")) == [
+        ("prod-il-1", "one")
+    ]
+
+
+def test_role_identities_use_an_empty_cluster_when_absent():
+    """`cluster` is optional, so its absence is itself a coordinate, not a wildcard."""
+    document = {"kubernetesAuth": [_role(cluster=None)]}
+
+    assert kubernetes_auth_role_identities(document) == [("", "myapp-ci")]
+
+
+def test_role_identities_skip_malformed_entries():
+    document = {"kubernetesAuth": [{"name": "ok"}, "just a string", {"no": "name"}]}
+
+    assert kubernetes_auth_role_identities(document) == [("", "ok")]
+
+
+def test_add_role_to_a_missing_file_starts_the_list():
+    assert add_kubernetes_auth_role(None, _role())["kubernetesAuth"] == [_role()]
+
+
+def test_a_file_started_by_a_role_carries_no_empty_store_list():
+    """It never asked for a `kvStores: []` sibling, so it must not get one."""
+    assert list(add_kubernetes_auth_role(None, _role())) == ["kubernetesAuth"]
+
+
+def test_update_role_replaces_lists_wholesale():
+    """Merging would make removing a namespace impossible."""
+    updated = update_kubernetes_auth_role(
+        _roles_document("one"), "one", namespaces=["other"]
+    )
+
+    assert updated["kubernetesAuth"][0]["namespaces"] == ["other"]
+
+
+def test_update_role_leaves_omitted_fields_alone():
+    updated = update_kubernetes_auth_role(
+        _roles_document("one"), "one", namespaces=["other"]
+    )
+
+    assert updated["kubernetesAuth"][0]["serviceAccounts"] == ["vault-reader"]
+    assert updated["kubernetesAuth"][0]["access"] == ACCESS
+
+
+def test_update_role_never_touches_the_name_or_the_cluster():
+    """Both identify the role in Vault, so changing either is a delete plus a create."""
+    updated = update_kubernetes_auth_role(
+        _roles_document("one"), "one", role_description="new"
+    )
+
+    assert updated["kubernetesAuth"][0]["name"] == "one"
+    assert updated["kubernetesAuth"][0]["cluster"] == "prod-il-1"
+
+
+def test_update_role_does_not_mutate_its_input():
+    original = _roles_document("one")
+    update_kubernetes_auth_role(original, "one", role_description="new")
+
+    assert original["kubernetesAuth"][0]["description"] == "CI deployer"
+
+
+def test_update_of_an_absent_role_raises():
+    with pytest.raises(KVStoreNotFound):
+        update_kubernetes_auth_role(_roles_document("one"), "nope", ttl="1h")
+
+
+def test_remove_role_drops_only_the_named_one():
+    result = remove_kubernetes_auth_role(_roles_document("one", "two"), "one")
+
+    assert [r["name"] for r in result["kubernetesAuth"]] == ["two"]
+
+
+def test_remove_of_an_absent_role_raises():
+    with pytest.raises(KVStoreNotFound):
+        remove_kubernetes_auth_role(_roles_document("one"), "nope")
+
+
+# --------------------------------------------------------------------------- #
+# referrers — the rule a KV delete consults
+# --------------------------------------------------------------------------- #
+def test_referrers_names_the_roles_that_reach_a_store():
+    assert kv_store_referrers(_roles_document("one", "two"), "myapp") == ["one", "two"]
+
+
+def test_referrers_is_empty_for_an_unreferenced_store():
+    assert kv_store_referrers(_roles_document("one"), "billing") == []
+
+
+@pytest.mark.parametrize("empty", [None, {}, {"kvStores": []}])
+def test_referrers_of_a_document_with_no_roles_is_empty(empty):
+    assert kv_store_referrers(empty, "myapp") == []
+
+
+def test_referrers_looks_under_every_capability():
+    document = {"kubernetesAuth": [_role(access={"write": ["billing"]})]}
+
+    assert kv_store_referrers(document, "billing") == ["myapp-ci"]
+
+
+def test_referrers_matches_a_whole_name_not_a_prefix():
+    """A substring match would block deleting `app` because `app-two` is referenced."""
+    document = {"kubernetesAuth": [_role(access={"read": ["myapp-two"]})]}
+
+    assert kv_store_referrers(document, "myapp") == []
+
+
+def test_referrers_survives_a_hand_edited_file():
+    """A malformed entry must not wedge an unrelated delete."""
+    document = {
+        "kubernetesAuth": [
+            "just a string",
+            {"name": "no-access"},
+            {"name": "bad-access", "access": "not a mapping"},
+            {"name": "bad-stores", "access": {"read": "not a list"}},
+            _role(access={"read": ["myapp"]}),
+        ]
+    }
+
+    assert kv_store_referrers(document, "myapp") == ["myapp-ci"]
+
+
+# --------------------------------------------------------------------------- #
+# the two kinds sharing one file
+#
+# The sibling-preservation tests above use a synthetic key; these use the real thing in
+# both directions, because a create of either kind erasing the other would sail through CI
+# looking like a legitimate diff.
+# --------------------------------------------------------------------------- #
+def _shared_document():
+    return add_kubernetes_auth_role(_document("myapp"), _role())
+
+
+def test_adding_a_role_preserves_the_kv_stores():
+    result = add_kubernetes_auth_role(_document("myapp"), _role())
+
+    assert [s["name"] for s in result["kvStores"]] == ["myapp"]
+    assert kubernetes_auth_role_names(result) == ["myapp-ci"]
+
+
+def test_adding_a_store_preserves_the_roles():
+    result = add_kv_store(_shared_document(), _store(name="billing"))
+
+    assert [s["name"] for s in result["kvStores"]] == ["myapp", "billing"]
+    assert kubernetes_auth_role_names(result) == ["myapp-ci"]
+
+
+def test_editing_either_kind_preserves_the_other():
+    document = _shared_document()
+
+    assert kubernetes_auth_role_names(
+        update_kv_store(document, "myapp", description="new")
+    ) == ["myapp-ci"]
+    assert kv_store_names(
+        update_kubernetes_auth_role(document, "myapp-ci", ttl="1h")
+    ) == ["myapp"]
+
+
+def test_removing_either_kind_preserves_the_other():
+    document = _shared_document()
+
+    assert kubernetes_auth_role_names(remove_kv_store(document, "myapp")) == ["myapp-ci"]
+    assert kv_store_names(remove_kubernetes_auth_role(document, "myapp-ci")) == ["myapp"]
+
+
+def test_a_shared_file_round_trips_through_yaml():
+    document = _shared_document()
+
+    assert yaml.safe_load(render_values_yaml(document)) == document
+
+
+def test_a_shared_file_renders_both_keys_at_the_top_level():
+    rendered = render_values_yaml(_shared_document())
+
+    assert rendered.startswith("kvStores:\n")
+    assert "\nkubernetesAuth:\n" in rendered

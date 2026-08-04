@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from app.v1.vault.schemas import VaultKVCreate
+from app.v1.vault.schemas import VaultKubernetesAuthCreate, VaultKVCreate
 from tests.fakes import FakeBitbucket, FakeWoodpecker, make_pipeline
 
 
@@ -13,6 +13,20 @@ def payload():
         kv_name="myapp",
         kv_description="payments secrets",
         roles={"read": ["app01.corp.example.com"]},
+    )
+
+
+@pytest.fixture
+def role_payload():
+    """A Kubernetes auth role reaching the store the `payload` fixture creates."""
+    return VaultKubernetesAuthCreate(
+        file="payments",
+        role_name="myapp-ci",
+        role_description="CI deployer for the payments app",
+        cluster="prod-il-1",
+        service_accounts=["vault-reader"],
+        namespaces=["payments"],
+        access={"read": ["myapp"]},
     )
 
 

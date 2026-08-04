@@ -25,6 +25,19 @@ class VaultV1StaticSettings(BaseSettings):
         default_factory=lambda: ["v1 - Vault KV Operations"],
     )
 
+    # Its own prefix rather than a fixed segment under /kv: anything nested there would sit
+    # in a `{file}` or `{kv_name}` position, so a file or store actually named
+    # "kubernetes-auth" would fight it for the URL and only registration order would decide.
+    API_K8S_AUTH_PREFIX: str = Field(
+        description="Root path under which the Kubernetes auth API is served",
+        default="/api/vault/v1/kubernetes-auth",
+    )
+
+    API_K8S_AUTH_TAGS: List[str] = Field(
+        description="Tags used for OpenAPI documentation grouping",
+        default_factory=lambda: ["v1 - Vault Kubernetes Auth Operations"],
+    )
+
     # --- The GitOps repo holding the Vault values files ---
     VAULT_VALUES_REPO_PROJECT_KEY: str = Field(
         ..., description="Bitbucket project key of the Vault values repo."
@@ -48,6 +61,13 @@ class VaultV1StaticSettings(BaseSettings):
     BRANCH_PREFIX: str = Field(
         default="vault-kv",
         description="Prefix for the short-lived branch a create request commits to.",
+    )
+
+    # A separate prefix so a reviewer can tell the kind of change from the branch name
+    # alone, before opening the diff.
+    K8S_AUTH_BRANCH_PREFIX: str = Field(
+        default="vault-k8s-auth",
+        description="Prefix for the branch a Kubernetes auth change commits to.",
     )
 
     PR_REVIEWERS: List[str] = Field(
