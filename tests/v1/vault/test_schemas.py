@@ -1,8 +1,15 @@
 """Request validation — the cheapest place to stop a bad name, file or role."""
+import re
+
 import pytest
 from pydantic import ValidationError
 
-from app.v1.vault.schemas import ALLOWED_ROLE_KEYS, VaultKVCreate, VaultKVUpdate
+from app.v1.vault.schemas import (
+    ALLOWED_ROLE_KEYS,
+    FILE_PATTERN,
+    VaultKVCreate,
+    VaultKVUpdate,
+)
 
 ROLES = {"read": ["app01.corp.example.com"]}
 
@@ -172,6 +179,79 @@ def test_create_takes_exactly_four_fields():
         "kv_description",
         "roles",
     }
+
+
+# --------------------------------------------------------------------------- #
+# `file` is optional, and defaults to the store's own name
+#
+# A caller should not have to remember which file their store lives in, so the normal
+# request is three fields. That makes an unrecognised field sharper than it used to be: a
+# mistyped `file` no longer fails on a missing required field, so every request model
+# forbids extras rather than dropping them.
+# --------------------------------------------------------------------------- #
+def test_file_defaults_to_the_store_name():
+    payload = VaultKVCreate(
+        kv_name="athena-passwords", kv_description="d", roles=ROLES
+    )
+
+    assert payload.file == "athena-passwords"
+
+
+def test_an_explicit_file_is_kept():
+    payload = VaultKVCreate(
+        file="athena", kv_name="athena-passwords", kv_description="d", roles=ROLES
+    )
+
+    assert payload.file == "athena"
+
+
+def test_the_defaulted_file_is_still_a_legal_file_name():
+    """`kv_name` and `file` carry the same single-segment shape, so this always holds."""
+    payload = VaultKVCreate(kv_name="a-b-c9", kv_description="d", roles=ROLES)
+
+    assert re.fullmatch(FILE_PATTERN, payload.file)
+
+
+def test_an_explicit_null_file_also_defaults():
+    payload = VaultKVCreate(
+        file=None, kv_name="athena-passwords", kv_description="d", roles=ROLES
+    )
+
+    assert payload.file == "athena-passwords"
+
+
+def test_a_malformed_explicit_file_is_still_rejected():
+    with pytest.raises(ValidationError):
+        VaultKVCreate(file="Bad_File", kv_name="ok", kv_description="d", roles=ROLES)
+
+
+def test_an_unknown_create_field_is_rejected():
+    """Ignoring it would answer 201 for a request nobody meant to send."""
+    with pytest.raises(ValidationError):
+        VaultKVCreate(
+            kv_name="ok", kv_description="d", roles=ROLES, environment="prod"
+        )
+
+
+def test_a_mistyped_file_is_rejected_rather_than_silently_defaulted():
+    """The reason `extra: forbid` matters more now than it did: `fil` would otherwise be
+    dropped and the store would land in kv/ok.yaml instead of kv/athena.yaml."""
+    with pytest.raises(ValidationError):
+        VaultKVCreate(fil="athena", kv_name="ok", kv_description="d", roles=ROLES)
+
+
+def test_an_unknown_update_field_is_rejected():
+    with pytest.raises(ValidationError):
+        VaultKVUpdate(kv_description="new", file="athena")
+
+
+def test_an_unknown_binding_field_is_rejected():
+    from app.v1.vault.schemas import K8sServiceAccountCreate
+
+    with pytest.raises(ValidationError):
+        K8sServiceAccountCreate(
+            service_account="vault", namespace="athena", cluster="dev", capability="read"
+        )
 
 
 # --------------------------------------------------------------------------- #

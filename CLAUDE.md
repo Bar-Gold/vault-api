@@ -4,10 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A FastAPI service that **writes a file to a Bitbucket repo and watches the Woodpecker
-pipelines that act on it**. A create request opens a pull request, waits for the validating
-pipeline, merges, waits for the deploying pipeline, and returns
-`Successful creation of <kv name>`.
+A FastAPI service that **writes a file to a Bitbucket repo and watches the builds that
+act on it**. A create request opens a pull request, waits for the validating build,
+merges, waits for the deploying build, and returns `Successful creation of <kv name>`.
+
+**Bitbucket is the only upstream.** The gates are not read from the CI server: a CI
+server posts its result *into* Bitbucket against the commit it built, and Bitbucket keeps
+one result per key per commit — that store is exactly what a pull request's **Builds**
+tab renders. So a gate is "ask Bitbucket which builds it holds for this sha". There is no
+Woodpecker client, no CI token, no repo id, and no pipeline-matching heuristic; the
+pipelines still run, they are simply observed through the forge.
 
 **Scope boundary — read this first.** The service deliberately knows nothing about Vault. It
 commits a file holding a **list of KV stores**, each carrying the principals and the
@@ -84,7 +90,7 @@ uv-managed (Python 3.12). Package indexes come from `uv.toml` (internal Artifact
 ```bash
 uv sync --group dev                 # install deps into .venv — ON-PREM ONLY, see below
 uv run --no-sync python -m app.main # serves on 0.0.0.0:5000 (--host/--port override)
-uv run --no-sync pytest             # everything under tests/ (470 tests, ~8s)
+uv run --no-sync pytest             # everything under tests/ (486 tests, ~7s)
 uv run --no-sync pytest tests/v1/vault                                        # one suite
 uv run --no-sync pytest tests/v1/vault/test_operations.py::test_happy_path_call_order  # one test
 docker build -t vault-api . && docker run -p 5000:5000 --env-file .env vault-api
@@ -99,23 +105,29 @@ Docs at `http://localhost:5000/docs`, Prometheus metrics at `/metrics` (both pro
 library's `general_create_app`). `asyncio_mode = "auto"` is set in `pyproject.toml`, so async
 tests need no `@pytest.mark.asyncio`. There is no linter/formatter configured.
 
-**Driving the real chain locally: `tools/stub_upstreams.py`.** A single FastAPI process that
-impersonates both Bitbucket Server and Woodpecker, so the whole create chain runs over real
-HTTP with no Docker, licence or network. Everything except the two upstreams is real code —
-use it before reaching for more mocks.
+**Driving the real chain locally: `tools/stub_upstreams.py`.** A single FastAPI process
+impersonating Bitbucket Server, so the whole create chain runs over real HTTP with no
+Docker, licence or network. It fakes the CI server's *side effect* rather than the CI
+server: opening or merging a pull request attaches `INPROGRESS` build statuses to the
+relevant commit, which then settle. Everything except that upstream is real code — use it
+before reaching for more mocks.
 
 ```bash
 uv run --no-sync python tools/stub_upstreams.py --port 9000     # terminal 1
-# terminal 2: point BITBUCKET_URL/WOODPECKER_URL at it (full env in the module docstring)
+# terminal 2: point BITBUCKET_URL at it (full env in the module docstring)
 curl -X POST 127.0.0.1:9000/__control -d '{"validation":"failure"}'  # or "hang" -> 504
-curl 127.0.0.1:9000/__state       # branches, PRs, pipelines, and every commit made
+curl 127.0.0.1:9000/__state       # branches, PRs, build statuses, every commit made
 curl -X POST 127.0.0.1:9000/__reset
 ```
 
-`validation`/`deploy` take `success` | `failure` | `hang`; `polls` is how many status polls a
-pipeline stays non-terminal. The stub reproduces the two traps on purpose: a PR's `version` is
-bumped on every CI status change (so a stale version 409s at merge), and a merge lands the file
-on the base branch (so a repeat create hits the duplicate guard). Keep both if you extend it.
+`validation`/`deploy` take `success` | `failure` | `hang`; `polls` is how many reads a build
+stays `INPROGRESS`; `workflows` is how many build statuses one pipeline posts against a
+commit, which is what makes the "wait for the slowest one" path reachable. The stub
+reproduces three traps on purpose: a PR's `version` is bumped on every build-status change
+(so a stale version 409s at merge), a merge lands the file on the base branch (so a repeat
+create hits the duplicate guard), and commit ids are **hex** rather than derived from the
+branch name — a branch name contains slashes, which would silently become extra URL path
+segments in the builds endpoint. Keep all three if you extend it.
 
 `.woodpecker/build.yaml` runs the suite on push to `master` and builds/pushes the image on git
 **tags** only, passing `APP_VERSION=${CI_COMMIT_TAG}` as a build arg (it surfaces in the Swagger UI).
@@ -124,21 +136,39 @@ on the base branch (so a repeat create hits the duplicate guard). Keep both if y
 
 | Route | Body | Notes |
 |-------|------|-------|
-| `POST /api/vault/v1/kv/` | `{file, kv_name, kv_description, roles}` | the chain below; blocks until the deploy pipeline ends |
+| `POST /api/vault/v1/kv/` | `{file, kv_name, kv_description, roles}` | the chain below; blocks until the deploy build ends |
 | `POST /api/vault/v1/kv/pull-request` | same body | steps 1-3 only: opens the PR and returns. No CI wait, no merge |
-| `GET /api/vault/v1/kv/{file}` | — | the whole values file, parsed YAML returned as-is (not a schema) |
-| `GET /api/vault/v1/kv/{file}/{kv_name}` | — | one entry out of that file's `kvStores` |
-| `PATCH /api/vault/v1/kv/{file}/{kv_name}` | `{kv_description?, roles?}` | edits one store; its siblings are untouched |
-| `DELETE /api/vault/v1/kv/{file}/{kv_name}` | — | removes one store **and its bindings**, same chain as a create; 200. No referential check exists |
-| `DELETE /api/vault/v1/kv/{file}/{kv_name}/pull-request` | — | steps 1-3 only: opens the removal PR and returns; 201 |
-| `POST /api/vault/v1/kv/{file}/{kv_name}/k8s-service-accounts` | `{service_account, namespace, cluster}` | appends one binding to that store; same chain; 201 |
-| `POST /api/vault/v1/kv/{file}/{kv_name}/k8s-service-accounts/pull-request` | same body | steps 1-3 only; 201 |
-| `GET /api/vault/v1/kv/{file}/{kv_name}/k8s-service-accounts` | — | that store's `k8sServiceAccounts` list (empty list, not 404, when it binds none) |
-| `DELETE /api/vault/v1/kv/{file}/{kv_name}/k8s-service-accounts` | `?service_account=&namespace=&cluster=` | removes one binding; 200 |
-| `DELETE /api/vault/v1/kv/{file}/{kv_name}/k8s-service-accounts/pull-request` | same query | steps 1-3 only; 201 |
+| `GET /api/vault/v1/kv/files/{file}` | — | the whole values file, parsed YAML returned as-is (not a schema). **The only route that names a file** |
+| `GET /api/vault/v1/kv/{kv_name}` | — | one store, found wherever it lives |
+| `PATCH /api/vault/v1/kv/{kv_name}` | `{kv_description?, roles?}` | edits one store; its siblings are untouched |
+| `DELETE /api/vault/v1/kv/{kv_name}` | — | removes one store **and its bindings**, same chain as a create; 200. No referential check exists |
+| `DELETE /api/vault/v1/kv/{kv_name}/pull-request` | — | steps 1-3 only: opens the removal PR and returns; 201 |
+| `POST /api/vault/v1/kv/{kv_name}/k8s-service-accounts` | `{service_account, namespace, cluster}` | appends one binding to that store; same chain; 201 |
+| `POST /api/vault/v1/kv/{kv_name}/k8s-service-accounts/pull-request` | same body | steps 1-3 only; 201 |
+| `GET /api/vault/v1/kv/{kv_name}/k8s-service-accounts` | — | that store's `k8sServiceAccounts` list (empty list, not 404, when it binds none) |
+| `DELETE /api/vault/v1/kv/{kv_name}/k8s-service-accounts` | `?service_account=&namespace=&cluster=` | removes one binding; 200 |
+| `DELETE /api/vault/v1/kv/{kv_name}/k8s-service-accounts/pull-request` | same query | steps 1-3 only; 201 |
+
+**A store is addressed by name alone.** A caller should not have to remember which file
+their store was grouped into, and does not have to: a store name is unique across the
+whole values directory — the create enforces exactly that — so the name *is* the address.
+`_resolve_store` in `operations.py` turns a name into `(file, path, document, store)` in
+two steps, so the common case does not pay for the general one:
+
+1. read `<values dir>/<kv_name>.yaml` — the file a create with no `file` writes — and use
+   it *if the store is actually in there*. One call, and it answers for every store made
+   the normal way. A file named after one store while holding another falls through.
+2. otherwise walk the directory, which is what finds a store grouped under another name.
+
+A store in no file at all is the 404. **If the walk skipped an unparseable file, the 404
+names it** — otherwise a broken values file reads as a deleted store and sends an operator
+after the wrong problem. The conventional path needs no such note: `_read_document` reports
+its own YAML error. Note the cost: a *grouped* store now costs a listing plus a read per
+file on every read, edit, delete and binding operation. That is the price of the name being
+the address, and the step-1 fast path is what keeps it off the normal layout.
 
 **One router, one prefix.** A binding is a sub-resource of a store, not a resource kind of
-its own, so it hangs off `/{file}/{kv_name}` rather than getting a prefix of its own. There
+its own, so it hangs off `/{kv_name}` rather than getting a prefix of its own. There
 is no `API_K8S_AUTH_PREFIX` and no second router factory.
 
 **There is no `PATCH` on a binding.** Its three fields together *are* its identity, so
@@ -149,34 +179,53 @@ widely dropped by proxies and clients. All three are required (a partial triple 
 not a wrong-binding delete) and carry the same patterns the POST body enforces, via
 `ServiceAccountQuery` / `NamespaceQuery` / `ClusterQuery` in `routes.py`.
 
-**`/pull-request` is a fixed segment registered before the `{file}` routes.** There is no POST
-on those paths today so nothing is ambiguous, but if one is ever added this route must keep
-winning — otherwise a file named `pull-request` shadows the endpoint. A `GET` on the same URL
-is still a normal read of a file named `pull-request`; the two coexist, and a test pins it.
-The delete PR-only route has no such trap — three segments cannot collide with two — so a
-store *named* `pull-request` stays addressable at `DELETE /{file}/pull-request`; a test pins
-that too. It is still registered before `/{file}/{kv_name}`, for one rule.
+**`/pull-request` is a fixed segment registered before the `{kv_name}` routes.** There is no
+POST on those paths today so nothing is ambiguous, but if one is ever added this route must
+keep winning — otherwise a store named `pull-request` shadows the endpoint. A `GET` on the
+same URL is still a normal read of a store named `pull-request`; the two coexist, and a test
+pins it. The delete PR-only route has no such trap — two segments cannot collide with one —
+so a store *named* `pull-request` stays addressable at `DELETE /pull-request`; a test pins
+that too. It is still registered before `/{kv_name}`, for one rule.
+
+**`GET /files/{file}` is the one route that still names a file**, and it is two segments
+against a store read's one, so a store named `files` stays readable at `GET /files` — a
+test pins it. The one genuine collision is `GET /files/k8s-service-accounts`, which could
+also parse as the bindings of a store named `files`; `/files/{file}` is registered first and
+wins.
 
 **The `k8s-service-accounts` segment has no shadowing risk in either direction**, and tests
 pin both: a store literally named `k8s-service-accounts` stays deletable at
-`DELETE /{file}/k8s-service-accounts` (two segments against three), and a store named
-`pull-request` stays bindable at `/{file}/pull-request/k8s-service-accounts` (four segments
-against the delete-PR route's three). Segment count separates every pair.
+`DELETE /k8s-service-accounts` (one segment against two), and a store named `pull-request`
+stays bindable at `/pull-request/k8s-service-accounts` (a different literal in the second
+position from the delete-PR route's). Segment count or literal separates every pair.
 
-**Path parameters are pattern-validated**, not just body fields: `file` and `kv_name` carry
-`FILE_PATTERN` / `KV_NAME_PATTERN` via `Annotated[str, Path(...)]` aliases (`FileParam`,
-`KVNameParam` in `routes.py`) on every `GET`/`PATCH`/`DELETE`. Nothing was exploitable
-without them — Starlette's path convertor is `[^/]+` — but a malformed `file` used to
-surface as an opaque Bitbucket 404 instead of a 422.
+**Path parameters are pattern-validated**, not just body fields: `kv_name` carries
+`KV_NAME_PATTERN` and `file` (on the whole-file read alone) carries `FILE_PATTERN`, via
+`Annotated[str, Path(...)]` aliases (`KVNameParam`, `FileParam` in `routes.py`). Nothing was
+exploitable without them — Starlette's path convertor is `[^/]+` — but a malformed `file`
+used to surface as an opaque Bitbucket 404 instead of a 422.
 
 `API_PREFIX` (default `/api/vault/v1/kv`) comes from `app/v1/vault/conf.py`. Everything
 added for service accounts is **defaulted**, so `tests/conftest.py` needed no change — a new
 *required* setting would break every test at collection, because the config singletons are
 built at import time.
 
-**The create request is exactly four fields** and `test_create_takes_exactly_four_fields` pins
-that: `file`, `kv_name`, `kv_description`, `roles`. There is no environment and no
-infra-coordinates `metadata` block.
+**The create request is three required fields plus one optional**, and
+`test_create_takes_exactly_four_fields` pins the set: `kv_name`, `kv_description`, `roles`,
+and `file`. There is no environment and no infra-coordinates `metadata` block.
+
+**`file` is optional, and omitting it is the normal case.** A `model_validator(mode="after")`
+on `VaultKVCreate` fills it with `kv_name`, so nothing downstream knows it could be absent —
+and the substitution needs no validation of its own, because `KV_NAME_PATTERN` and
+`FILE_PATTERN` are the same single-segment shape. Give it explicitly only to group several
+stores into one file, which the format is built for. This is the **only** request that
+mentions a file.
+
+**Every request model sets `extra: "forbid"`**, and `file` being optional is what makes that
+load-bearing rather than tidy. Pydantic's default is to ignore an unrecognised field, so a
+mistyped `fil` used to fail on the missing required `file` and now would silently fall back
+to naming the file after the store — a 201 for a store in the wrong place. Same reasoning
+for the field that is *not* there: sending `environment` is a 422, not a quiet drop.
 
 **`file` is the path-traversal guard now, not `kv_name`.** That inverted when the format
 changed — `kv_name` became a value inside the document while `file` became the thing that
@@ -184,9 +233,9 @@ lands in `{VAULT_VALUES_DIR}/{file}.yaml`:
 
 - `FILE_PATTERN` and `KV_NAME_PATTERN` are both a **single segment** of `[a-z0-9]`/dashes. No
   slash, so no directory can be escaped or created, and `..` cannot match.
-- `kv_name` is single-segment for a second reason: the routes address a store as
-  `{file}/{kv_name}`, and a slash would make that split ambiguous. Multi-segment names were
-  supported under the old one-file-per-KV layout and are not any more.
+- `kv_name` is single-segment for a second reason: it *is* the route's address, and a slash
+  would turn one store into two path segments. Multi-segment names were supported under the
+  old one-file-per-KV layout and are not any more.
 - `roles` is **required**, at least one key with at least one principal. `ALLOWED_ROLE_KEYS`
   in `schemas.py` holds `read` and `write` as **separate** keys — a store may carry either or
   both. The combined string `read/write` is *not* a role and is rejected; `<read/write>` in
@@ -206,7 +255,7 @@ are **required**; `cluster` has no Kubernetes rule to borrow, so `K8S_CLUSTER_PA
 own single-segment shape.
 
 **Uniqueness.** A store name is global — unique across the whole values dir, which is why a
-create walks every file. A **binding is unique only within its store**, on the whole
+create walks every file, and what makes the name a sufficient address everywhere else. A **binding is unique only within its store**, on the whole
 `(serviceAccount, namespace, cluster)` triple: the same service account reaching two stores
 is the normal case (that is how one workload gets at two secrets), and the same account in
 two namespaces or two clusters is two distinct bindings. Nothing about a binding is
@@ -232,15 +281,18 @@ than indexing `entry["cluster"]`. Keep it that way.
 ## Architecture
 
 **App composition (`app/main.py`).** `create_app()` is the single wiring point: it calls
-`general_create_app(enable_auth=True)`, constructs the Bitbucket and Woodpecker clients **once**
-from config, and injects them into `get_v1_vault_router(bitbucket, woodpecker)` — one router,
-because a service account binding is a sub-resource of a store rather than a resource kind of
-its own. Connectors are never built per-request; the router factory closure is the injection
-seam (no FastAPI `Depends` for connectors).
+`general_create_app(enable_auth=True)`, constructs the Bitbucket client **once** from config,
+and injects it into `get_v1_vault_router(bitbucket)` — one client, because the CI gates read
+Bitbucket's build statuses, and one router, because a service account binding is a
+sub-resource of a store rather than a resource kind of its own. Connectors are never built
+per-request; the router factory closure is the injection seam (no FastAPI `Depends` for
+connectors).
 
 **Config is two-layered, all sourced from `.env`** (pydantic-settings `BaseSettings`):
-- `app/global_conf.py` — `BITBUCKET_*`, `WOODPECKER_*`, `VAULT_*`, `TEAM_NAME`,
-  `HTTP_TIMEOUT_SECONDS`, `VERIFY_SSL`.
+- `app/global_conf.py` — `BITBUCKET_*`, `HTTP_TIMEOUT_SECONDS`, `VERIFY_SSL`. There are
+  deliberately no CI-server settings anywhere: `WOODPECKER_URL`/`_TOKEN`/`_REPO_ID` are gone,
+  and the `CI_*` knobs below now bound the **build-status polling**. Their names still say
+  PIPELINE because a pipeline is still what is being waited on; only the place we ask changed.
 - `app/v1/vault/conf.py` — `API_PREFIX`, `API_TAGS`, values-repo layout, PR shaping, `CI_*` timeouts.
 - `AUTH_*` / `AUTH_SSO_*` are **not** declared here — the library reads them from the environment.
 
@@ -264,9 +316,9 @@ There are **no `__init__.py` files anywhere** — implicit namespace packages, w
 `pythonpath = ["."]` and `package = false` in `pyproject.toml`. A new module needs no
 `__init__.py`; adding empty ones is churn.
 
-**Clients (`app/clients/`).** `BitbucketClient` and `WoodpeckerClient` wrap the library's
-`BaseAPI` async client. Bitbucket is hand-rolled rather than using the library's `Git` connector
-because `Git` exposes no pull-request operations, and PRs are the entire point here. Both go
+**Clients (`app/clients/`).** `BitbucketClient` — the only one — wraps the library's `BaseAPI`
+async client. It is hand-rolled rather than using the library's `Git` connector because `Git`
+exposes no pull-request operations, and PRs are the entire point here. It goes
 through **`app/clients/http.py`** — `request()` is the single funnel that raises the library's
 `ExternalServiceError` (`ExternalServiceError(service_name, status_code, detail=None)`) for
 three cases:
@@ -277,11 +329,32 @@ three cases:
 | any other `httpx.RequestError` (DNS, connect, TLS) | `502` |
 | non-2xx response | the upstream's own status |
 
-Never call `self._client.request` directly from a client — a bare `httpx.RequestError` escapes
-past the routes' `except ExternalServiceError` and the caller gets an opaque 500. The `504`
-is load-bearing: `routes.py` keys off `external_error.status_code == 504` to answer 504 instead
-of 502. Each client passes its own `detail_from_response` (Bitbucket digs through
+Never call `self._client.request` directly — a bare `httpx.RequestError` escapes past the
+routes' `except ExternalServiceError` and the caller gets an opaque 500. The `504` is
+load-bearing: `routes.py` keys off `external_error.status_code == 504` to answer 504 instead
+of 502. The client passes its own `detail_from_response` (digging through
 `{"errors": [{"message": ...}]}`); `default_detail` is the fallback.
+
+**The build-status half of the client is the CI gate.** `get_build_statuses(commit_id)` reads
+`GET {api}/commits/{commitId}/builds` (Bitbucket **7.4+**; the older, non-repo-scoped
+`/rest/build-status/1.0/commits/{commitId}` is the one-line fallback if the instance predates
+it). `await_builds` is two-phase, and the split is not cosmetic:
+
+- **phase 1, `find_builds`** — wait for *at least one* build. The forge webhook is
+  asynchronous, so a freshly pushed commit has no builds for a few seconds; an empty list can
+  never mean "finished".
+- **phase 2, `wait_for_builds`** — wait until every build has left `INPROGRESS`.
+
+`PENDING_BUILD_STATES` is `{INPROGRESS}` and `SUCCESSFUL_BUILD_STATE` is `SUCCESSFUL`. Those
+are separate constants on purpose: `CANCELLED` and `UNKNOWN` are **terminal but not success**,
+so a gate keyed off "not FAILED" would merge both. A gate passes only when *every* build
+succeeded — Bitbucket stores one result per key per commit, so a pipeline with several
+workflows lands several rows.
+
+**Known consequence, documented rather than worked around:** a CI server that posts one
+status per workflow may not post them all at once, so a gate that sees a single finished
+build while a sibling has yet to appear returns early. Bitbucket's own required-builds merge
+check is the backstop if that matters for a given repo.
 
 **Shared helpers (`app/helpers.py`)** are pure. For `kvStores`: `build_kv_store` (one entry),
 `build_kv_stores_document`, `add_kv_store`, `read_kv_stores`, `find_kv_store`,
@@ -383,7 +456,7 @@ nothing left dangling. There is no `yaml_data_equals` short circuit either — i
 `remove_kv_store` did not raise, the document changed, so a removal is never a no-op. It
 always passes a `source_commit_id`; the file exists by definition. It is a **content edit,
 not a file removal**: the last store out leaves `kvStores: []` and the file in place, which
-keeps `GET /{file}` answering 200, lets a later create append normally, and needs no
+keeps `GET /files/{file}` answering 200, lets a later create append normally, and needs no
 `delete_file` on the Bitbucket client (there isn't one).
 
 ### The service-account chain
@@ -392,10 +465,11 @@ keeps `GET /{file}` answering 200, lets a later create append normally, and need
 `_commit_via_pull_request` verbatim, so the rollback asymmetry and the point of no return are
 identical. What differs is only step 0, and mostly by **subtraction**:
 
-0. `_require_store` — read the target file (missing → 404) and find the store in it (missing
-   → 404). An add then rejects a duplicate triple **within that store** → 409. That is the
-   whole of it: no values-dir walk, no store-existence check across files, no referential
-   rule. A remove instead 404s when the triple is not bound.
+0. `_resolve_store` — find the store by name (in no file → 404). An add then rejects a
+   duplicate triple **within that store** → 409. That is the whole of it: the values-dir walk
+   that may happen is *resolution*, not a uniqueness scan, and there is no store-existence
+   check across files and no referential rule. A remove instead 404s when the triple is not
+   bound.
 1-6. identical to the KV create, with `K8S_SA_BRANCH_PREFIX` on the branch
    (`vault-k8s-sa/payments-athena-passwords-3f2a1b09`) so a reviewer sees the change kind
    first. The branch is keyed on the **store**, since the triple has no name to slug.
@@ -420,9 +494,11 @@ base-branch-only visibility that makes a repeat `/pull-request` open a second PR
    `get_last_commit` supplies the optimistic-lock token
 2. `create_branch` → `put_file`
 3. `create_pull_request`
-4. **gate 1**: `await_pipeline` on the `pull_request` event
+4. **gate 1**: `await_builds` on `pull_request.from_commit` (`fromRef.latestCommit`) — the
+   sha the PR's Builds tab shows
 5. `get_pull_request` (re-read for the current `version`) → `merge_pull_request`
-6. **gate 2**: `await_pipeline` on the `push` event
+6. **gate 2**: `await_builds` on the merge commit (`properties.mergeCommit.id`, falling back
+   to `get_branch_head(base)` — not every merge strategy reports one)
 
 There is **no transaction**; each step hand-rolls its own rollback:
 
@@ -438,11 +514,11 @@ There is **no transaction**; each step hand-rolls its own rollback:
 logged and never raised over the original error.
 
 `create_kv_pull_request_operation` runs steps 0-3, then returns 201 with the PR `OPEN`. It
-takes **no Woodpecker client** — the argument would be dead weight. Two consequences, both
-deliberate and both pinned by tests:
+opens **no gate at all** — `_open_pull_request` never touches build statuses. Two
+consequences, both deliberate and both pinned by tests:
 
 - **Opening a PR still triggers CI in the forge.** The endpoint does not suppress the
-  validation pipeline; it just does not wait for it. The response's pipeline fields are `null`
+  validation pipeline; it just does not wait for it. The response's build fields are `null`
   because nothing was *observed*, not because nothing ran.
 - **A repeat call opens a second PR.** The name scan reads the base branch, and an unmerged
   PR is not there, so it cannot see the first one. Catching it would mean listing open PRs —
@@ -455,24 +531,22 @@ hatch matters more here than for a create — delete is the most destructive ope
 this is the variant that hands the decision to a reviewer.
 `add_k8s_service_account_pull_request_operation` and
 `remove_k8s_service_account_pull_request_operation` are the same shape again, with the same
-two consequences and the same "no Woodpecker client" rule.
+two consequences and the same "no gate" rule.
 
 Two details that are easy to break:
 - **The version re-read before merging/declining.** Bitbucket's `version` is an optimistic lock
   that CI status updates bump; merging with the stale one from `create_pull_request` 409s.
-- **The pipeline watermarks — there are two.** `_latest_pipeline_number` is called twice:
-  `baseline` before the branch is created, and `merge_baseline` again immediately before the
-  merge. Both matchers reject `number <= min_number`. The second one matters because by then the
-  validation pipeline exists; reusing `baseline` would let `deploy_pipeline_matcher` latch onto it
-  (or onto a rebuild) and report the wrong result. Either degrades to `0` if the list call fails.
-
-Matchers are pure and separately tested: `pull_request_pipeline_matcher` looks for the branch in
-`branch`/`ref`/`refspec` (Woodpecker records it differently per forge); `deploy_pipeline_matcher`
-prefers the merge commit sha and falls back to the base branch.
-
-Woodpecker statuses: anything in `PENDING_STATUSES` (`pending`, `running`, `blocked`,
-`waiting_on_deps`) is non-terminal — `blocked` means awaiting human approval, so it correctly
-hangs until the timeout. Only `success` counts as success.
+- **There is exactly one watermark left, and it is not a pre-flight one.** The old
+  `baseline`/`merge_baseline` pipeline-number pair is gone: each gate names a commit that did
+  not exist until this request created it, so nothing older can be mistaken for ours. What
+  survives is `exclude_keys` on gate 2. A **fast-forward merge** leaves the base branch
+  pointing at the very commit the pull request built, so gate 1's results are already sitting
+  on gate 2's sha; without excluding the keys gate 1 saw, gate 2 would open on its
+  predecessor's answer and call the deploy a success before it started. It is applied *only*
+  when `merge_commit == from_commit`, so a normal merge commit excludes nothing.
+- **Gate 1 needs `from_commit`.** If Bitbucket reports no `fromRef.latestCommit` there is no
+  sha to watch, and merging unvalidated is not the fallback — the chain declines the PR and
+  deletes the branch, exactly as a red build would.
 
 ## Auth & config provider
 
@@ -525,7 +599,7 @@ hangs until the timeout. Only `success` counts as success.
   the stub) and hands the merge to a human.
 - Status codes: 201 creates and all four PR-only routes, 200 edits, deletes and reads,
   409 duplicate store name or duplicate binding, 404 unknown file, store or binding,
-  502 pipeline/transport failure, 504 pipeline or upstream timeout, 422 request, **path
+  502 build/transport failure, 504 build or upstream timeout, 422 request, **path
   parameter or query parameter** validation. The rule across the whole table: an endpoint
   that opens a PR and stops answers 201; one that runs the full chain answers 201 for a
   create or a bind and 200 for an edit, a delete or an unbind.
@@ -543,6 +617,13 @@ hangs until the timeout. Only `success` counts as success.
   `(file, kv_name)` addresses stores and bindings alike: a binding is part of a store, so the
   store is the subject of a binding operation too, and the message names the triple. There is
   no `role_name` field — the earlier revision had one, and it went with the format.
+- **The CI outcome is reported as `validation_builds` / `deploy_builds`** — **lists** of
+  `BuildInfo{key, state, name, url}`, replacing the single `validation_pipeline` /
+  `deploy_pipeline` `{number, status, link}`. Lists because Bitbucket stores one result per
+  key per commit, so a multi-workflow pipeline lands several; `key` rather than `number`
+  because the key is what identifies a build to Bitbucket, and it is what tells two workflows
+  apart (`ci/woodpecker/pr/build` vs `ci/woodpecker/push/deploy`). This is a wire-breaking
+  change from the Woodpecker-era shape.
 - **Failures are `return`ed as a `JSONResponse`, not raised.** So the POST decorator's
   `status_code=201` and `response_model=` describe the success path only — FastAPI does not
   validate or document the failure bodies. Adding a field to `VaultOperationResponse` means
@@ -550,8 +631,9 @@ hangs until the timeout. Only `success` counts as success.
 - The committed entries are the contract with the deploy pipeline — change `build_kv_store` /
   `build_k8s_service_account` and the pipeline together. Both are the *sole* writers of their
   own key names.
-- Tests: 470 of them. `tests/test_helpers.py` (pure, no library import), `tests/clients/` (both
-  clients plus `http.py`'s error mapping, against their real REST shapes via respx),
+- Tests: 486 of them. `tests/test_helpers.py` (pure, no library import), `tests/clients/` (the
+  Bitbucket client — repo operations *and* build statuses — plus `http.py`'s error mapping,
+  against the real REST shapes via respx),
   `tests/v1/vault/` (schemas, the chain + rollbacks with duck-typed fakes from `tests/fakes.py`,
   and routes end-to-end through `TestClient`; `test_k8s_service_account_*.py` mirror the KV
   files one-for-one). Two conftest details to respect:
@@ -560,9 +642,9 @@ hangs until the timeout. Only `success` counts as success.
     are built at import time. Adding a required setting means adding it there, above that line.
     It also blanks the optional `AUTH_*` knobs so a developer `.env` cannot change outcomes, and
     zeroes the `CI_*` timeouts to keep the suite fast.
-  - `tests/v1/vault/conftest.py`'s `client` fixture monkeypatches `app.main.BitbucketClient` and
-    `app.main.WoodpeckerClient` — the classes, not instances. That works only because
-    `create_app()` is the sole construction site; keep it that way.
+  - `tests/v1/vault/conftest.py`'s `client` fixture monkeypatches `app.main.BitbucketClient` —
+    the class, not an instance. That works only because `create_app()` is the sole
+    construction site; keep it that way.
 
   **Steering the fakes** (`tests/fakes.py`) — this is how a new operation test is written:
   - `FakeBitbucket(existing_files={path: yaml})` is the repo's whole state, keyed on the
@@ -574,10 +656,13 @@ hangs until the timeout. Only `success` counts as success.
     what pins the call *order*, not just the outcome.
   - `FakeBitbucket.get_pull_request` bumps `version` on every call, reproducing the real
     optimistic-lock trap. A test that skips the re-read has to be seen to break.
-  - `FakeWoodpecker(results=[...])` is a **queue** popped once per `await_pipeline`, so
-    element 0 is the validation gate and element 1 the deploy gate; an `Exception` in the
-    list is raised instead of returned, which is how a timeout or a red pipeline is staged.
-    Running dry is an `AssertionError`, so an unexpected extra gate fails loudly.
+  - `FakeBitbucket(builds=[...])` is a **queue** popped once per `await_builds`, so element 0
+    is the validation gate and element 1 the deploy gate; an `Exception` in the list is raised
+    instead of returned, which is how a timeout or a red build is staged. Running dry is an
+    `AssertionError`, so an unexpected extra gate fails loudly. Both gates default to green,
+    and `passing()` / `failing()` are the shorthands. `bitbucket.awaited_commits` and
+    `bitbucket.excluded_keys` record what each gate was opened on — that is what pins gate 1
+    to the PR's commit and gate 2 to the merge commit.
 - **Delete is a content edit, not a file removal**, and it ships in two variants
   (`delete_kv_store_operation`, `delete_kv_store_pull_request_operation`) that reuse
   `_commit_via_pull_request` / `_open_pull_request` unchanged. Removing the last store leaves

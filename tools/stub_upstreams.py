@@ -1,33 +1,40 @@
-"""Local stand-in for Bitbucket Server + Woodpecker, so the whole create chain can be
-exercised over real HTTP without Docker, a licence or network access.
+"""Local stand-in for Bitbucket Server, so the whole create chain can be exercised over
+real HTTP without Docker, a licence or network access.
 
-Point the service at it and everything except the upstreams is real code:
+One upstream is now enough: the CI gates read the build statuses a pipeline posts *into*
+Bitbucket — the pull request's Builds tab — so there is no CI server to impersonate. What
+the stub fakes instead is the CI server's side effect: opening a pull request or merging
+one attaches an `INPROGRESS` build status to the relevant commit, which then settles.
+
+Point the service at it and everything except the upstream is real code:
 
     # terminal 1
     uv run --no-sync python tools/stub_upstreams.py --port 9000
 
     # terminal 2
     BITBUCKET_URL=http://127.0.0.1:9000 BITBUCKET_TOKEN=x \
-    WOODPECKER_URL=http://127.0.0.1:9000 WOODPECKER_TOKEN=x \
     VAULT_VALUES_REPO_PROJECT_KEY=INFRA VAULT_VALUES_REPO_SLUG=vault-values \
-    WOODPECKER_REPO_ID=42 CI_POLL_INTERVAL_SECONDS=1 \
+    CI_POLL_INTERVAL_SECONDS=1 \
     uv run --no-sync python -m app.main --port 5055
 
 Then drive scenarios:
 
     curl -X POST 127.0.0.1:9000/__control -H 'Content-Type: application/json' \
          -d '{"validation":"failure"}'          # -> 502, PR declined, branch deleted
-    curl 127.0.0.1:9000/__state                 # inspect branches / PRs / pipelines
+    curl 127.0.0.1:9000/__state                 # inspect branches / PRs / builds
 
-`validation` and `deploy` accept `success`, `failure` or `hang` (never reaches a terminal
-status, so the service should answer 504). `polls` is how many status polls a pipeline stays
-non-terminal before settling.
+`validation` and `deploy` accept `success`, `failure` or `hang` (never leaves INPROGRESS,
+so the service should answer 504). `polls` is how many reads a build stays INPROGRESS
+before settling. `workflows` is how many build statuses a pipeline posts against one
+commit, which is what makes the "wait for the slowest one" path reachable.
 
-Deliberately faithful in two places, because they are the easy things to break:
-  * a pull request's `version` is bumped every time its pipeline changes state, so merging
+Deliberately faithful in three places, because they are the easy things to break:
+  * a pull request's `version` is bumped every time a build status changes, so merging
     with the version handed back by create -> 409, exactly like the real optimistic lock;
-  * a merge writes the file onto the base branch, so a second create for the same mount
-    hits the duplicate guard and gets a 409.
+  * a merge writes the file onto the base branch, so a second create for the same store
+    hits the duplicate guard and gets a 409;
+  * `fromRef.latestCommit` moves with each commit on the branch, because that sha is what
+    the validation gate watches.
 """
 
 import argparse
@@ -39,6 +46,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 BASE_BRANCH = "master"
+# Merge commits get their own sha space so they are obvious in /__state and can never
+# collide with a branch commit — the deploy gate keys off exactly this value.
+MERGE_COMMIT_BASE = 0xDEAD0000
 
 
 def _error(status_code: int, message: str) -> JSONResponse:
@@ -69,29 +79,24 @@ def _parse_multipart(body: bytes, content_type: str) -> Dict[str, str]:
 
 
 @dataclass
-class Pipeline:
-    number: int
-    event: str
-    status: str = "pending"
-    branch: str = ""
-    ref: str = ""
-    refspec: str = ""
-    commit: str = ""
+class Build:
+    """One row of the Builds tab: a key, a state, and the commit it hangs off."""
+
+    key: str
+    commit: str
+    state: str = "INPROGRESS"
     remaining: int = 1
-    final: str = "success"
+    final: str = "SUCCESSFUL"
     hang: bool = False
     pull_request_id: Optional[int] = None
 
     def as_api(self) -> Dict[str, Any]:
         return {
-            "number": self.number,
-            "status": self.status,
-            "event": self.event,
-            "branch": self.branch,
-            "ref": self.ref,
-            "refspec": self.refspec,
-            "commit": self.commit,
-            "link": f"http://127.0.0.1/pipelines/{self.number}",
+            "key": self.key,
+            "state": self.state,
+            "name": f"vault-values {self.key}",
+            "url": f"http://127.0.0.1/builds/{self.key}",
+            "buildNumber": "1",
         }
 
 
@@ -102,6 +107,7 @@ class PullRequest:
     title: str
     from_branch: str
     to_branch: str
+    from_commit: str
     state: str = "OPEN"
     merge_commit: Optional[str] = None
     description: str = ""
@@ -113,7 +119,7 @@ class PullRequest:
             "version": self.version,
             "title": self.title,
             "state": self.state,
-            "fromRef": {"displayId": self.from_branch},
+            "fromRef": {"displayId": self.from_branch, "latestCommit": self.from_commit},
             "toRef": {"displayId": self.to_branch},
             "links": {"self": [{"href": f"http://127.0.0.1/pull-requests/{self.id}"}]},
         }
@@ -127,32 +133,49 @@ class State:
     branches: Dict[str, str] = field(default_factory=lambda: {BASE_BRANCH: "base-sha"})
     files: Dict[str, Dict[str, str]] = field(default_factory=lambda: {BASE_BRANCH: {}})
     pulls: Dict[int, PullRequest] = field(default_factory=dict)
-    pipelines: List[Pipeline] = field(default_factory=list)
+    # Build statuses, keyed by the commit they were reported against.
+    builds: Dict[str, List[Build]] = field(default_factory=dict)
     # Every commit the service made, in order, so the message can be inspected too.
     commits: List[Dict[str, str]] = field(default_factory=list)
     control: Dict[str, Any] = field(
-        default_factory=lambda: {"validation": "success", "deploy": "success", "polls": 1}
+        default_factory=lambda: {
+            "validation": "success",
+            "deploy": "success",
+            "polls": 1,
+            "workflows": 1,
+        }
     )
     next_pull_id: int = 100
-    next_pipeline: int = 1
+    next_commit: int = 1
 
-    def add_pipeline(self, event: str, which: str, **kwargs: Any) -> Pipeline:
+    def new_commit_id(self, branch: str) -> str:
+        # Hex, like a real sha — *not* derived from the branch name, which contains
+        # slashes and would silently turn into extra URL path segments.
+        commit_id = f"{self.next_commit:040x}"
+        self.next_commit += 1
+        self.branches[branch] = commit_id
+        return commit_id
+
+    def report_builds(
+        self, commit: str, which: str, event: str, pull_request_id: Optional[int] = None
+    ) -> None:
+        """What the CI server does on a webhook: attach one build status per workflow."""
         outcome = self.control[which]
-        pipeline = Pipeline(
-            number=self.next_pipeline,
-            event=event,
-            remaining=int(self.control["polls"]),
-            final="success" if outcome == "success" else "failure",
-            hang=(outcome == "hang"),
-            **kwargs,
-        )
-        self.next_pipeline += 1
-        self.pipelines.append(pipeline)
-        return pipeline
+        for index in range(int(self.control["workflows"])):
+            self.builds.setdefault(commit, []).append(
+                Build(
+                    key=f"ci/woodpecker/{event}/workflow-{index + 1}",
+                    commit=commit,
+                    remaining=int(self.control["polls"]),
+                    final="SUCCESSFUL" if outcome == "success" else "FAILED",
+                    hang=(outcome == "hang"),
+                    pull_request_id=pull_request_id,
+                )
+            )
 
 
 state = State()
-app = FastAPI(title="Bitbucket + Woodpecker stub")
+app = FastAPI(title="Bitbucket stub")
 
 
 # --------------------------------------------------------------------------- #
@@ -175,7 +198,7 @@ async def reset() -> Dict[str, str]:
 async def get_state() -> Dict[str, Any]:
     return {
         "control": state.control,
-        "branches": sorted(state.branches),
+        "branches": state.branches,
         "files_on_base": sorted(state.files.get(BASE_BRANCH, {})),
         "commits": state.commits,
         "pull_requests": [
@@ -184,6 +207,7 @@ async def get_state() -> Dict[str, Any]:
                 "version": p.version,
                 "state": p.state,
                 "from": p.from_branch,
+                "from_commit": p.from_commit,
                 "to": p.to_branch,
                 "title": p.title,
                 "description": p.description,
@@ -191,9 +215,10 @@ async def get_state() -> Dict[str, Any]:
             }
             for p in state.pulls.values()
         ],
-        "pipelines": [
-            {"number": p.number, "event": p.event, "status": p.status} for p in state.pipelines
-        ],
+        "builds": {
+            commit: [{"key": b.key, "state": b.state} for b in builds]
+            for commit, builds in state.builds.items()
+        },
     }
 
 
@@ -234,16 +259,18 @@ async def put_file(key: str, slug: str, path: str, request: Request):
     if branch not in state.branches:
         return _error(404, f"Branch {branch} does not exist")
     state.files.setdefault(branch, {})[path] = fields.get("content", "")
+    commit_id = state.new_commit_id(branch)
     state.commits.append(
         {
             "branch": branch,
+            "id": commit_id,
             "path": path,
             "message": fields.get("message", ""),
             # Present on edits, absent on creates — worth seeing in /__state.
             "source_commit_id": fields.get("sourceCommitId", ""),
         }
     )
-    return {"id": f"commit-{branch}", "message": fields.get("message", "")}
+    return {"id": commit_id, "message": fields.get("message", "")}
 
 
 @app.get("/rest/api/1.0/projects/{key}/repos/{slug}/files/{directory:path}")
@@ -281,9 +308,12 @@ async def list_files(
 async def list_commits(
     key: str, slug: str, path: Optional[str] = None, until: Optional[str] = None, limit: int = 25
 ):
-    """History for a path — the edit flow reads the newest id as its optimistic-lock token."""
+    """History — used for the edit flow's optimistic-lock token *and*, without a `path`,
+    for the head of the base branch when a merge reports no merge commit."""
     ref = (until or BASE_BRANCH).replace("refs/heads/", "")
-    if path and path not in state.files.get(ref, {}):
+    if path is None:
+        return {"values": [{"id": state.branches.get(ref, "base-sha")}], "size": 1}
+    if path not in state.files.get(ref, {}):
         return {"values": [], "size": 0}
     return {"values": [{"id": f"commit-{ref}-{len(state.commits)}"}], "size": 1}
 
@@ -295,6 +325,42 @@ async def get_raw(key: str, slug: str, path: str, at: Optional[str] = None):
     if body is None:
         return _error(404, f"{path} not found on {ref}")
     return PlainTextResponse(body)
+
+
+# --------------------------------------------------------------------------- #
+# Bitbucket — build statuses
+# --------------------------------------------------------------------------- #
+@app.get("/rest/api/1.0/projects/{key}/repos/{slug}/commits/{commit_id}/builds")
+async def get_builds(key: str, slug: str, commit_id: str, start: int = 0, limit: int = 100):
+    """A commit's Builds tab, settling one poll at a time.
+
+    Reading is what advances a build here — the same trick the pipeline poller used —
+    so `polls` controls how many reads it stays INPROGRESS.
+    """
+    builds = state.builds.get(commit_id, [])
+    for build in builds:
+        if build.hang or build.state != "INPROGRESS":
+            continue
+        if build.remaining > 0:
+            build.remaining -= 1
+            continue
+        build.state = build.final
+        # A build status update bumps the PR version, invalidating any stale copy.
+        pull = state.pulls.get(build.pull_request_id or -1)
+        if pull is not None:
+            pull.version += 1
+
+    page = builds[start : start + limit]
+    next_start = start + limit
+    is_last = next_start >= len(builds)
+    body: Dict[str, Any] = {
+        "values": [b.as_api() for b in page],
+        "size": len(page),
+        "isLastPage": is_last,
+    }
+    if not is_last:
+        body["nextPageStart"] = next_start
+    return body
 
 
 # --------------------------------------------------------------------------- #
@@ -310,6 +376,7 @@ async def create_pull_request(key: str, slug: str, body: Dict[str, Any]) -> Dict
         title=body.get("title", ""),
         from_branch=from_branch,
         to_branch=to_branch,
+        from_commit=state.branches.get(from_branch, "base-sha"),
         description=body.get("description", ""),
         reviewers=[
             r.get("user", {}).get("name", "") for r in body.get("reviewers", []) or []
@@ -317,16 +384,9 @@ async def create_pull_request(key: str, slug: str, body: Dict[str, Any]) -> Dict
     )
     state.next_pull_id += 1
     state.pulls[pull.id] = pull
-    # The forge webhook fires here — this is the pipeline that gates the merge.
-    state.add_pipeline(
-        "pull_request",
-        "validation",
-        branch=from_branch,
-        ref=f"refs/pull-requests/{pull.id}/from",
-        refspec=f"{from_branch}:{to_branch}",
-        commit=f"sha-{from_branch}",
-        pull_request_id=pull.id,
-    )
+    # The forge webhook fires here — this is the build that gates the merge, and it lands
+    # on the source branch head, which is what the PR's Builds tab shows.
+    state.report_builds(pull.from_commit, "validation", "pr", pull_request_id=pull.id)
     return pull.as_api()
 
 
@@ -351,17 +411,11 @@ async def merge_pull_request(key: str, slug: str, pull_id: int, version: int = -
 
     pull.state = "MERGED"
     pull.version += 1
-    pull.merge_commit = f"merge-sha-{pull_id}"
+    pull.merge_commit = f"{MERGE_COMMIT_BASE + pull_id:040x}"
+    state.branches[BASE_BRANCH] = pull.merge_commit
     # Land the change on the base branch, so a repeat create hits the duplicate guard.
     state.files.setdefault(BASE_BRANCH, {}).update(state.files.get(pull.from_branch, {}))
-    state.add_pipeline(
-        "push",
-        "deploy",
-        branch=BASE_BRANCH,
-        ref=f"refs/heads/{BASE_BRANCH}",
-        commit=pull.merge_commit,
-        pull_request_id=pull.id,
-    )
+    state.report_builds(pull.merge_commit, "deploy", "push", pull_request_id=pull.id)
     return pull.as_api()
 
 
@@ -377,37 +431,8 @@ async def decline_pull_request(key: str, slug: str, pull_id: int, version: int =
     return pull.as_api()
 
 
-# --------------------------------------------------------------------------- #
-# Woodpecker
-# --------------------------------------------------------------------------- #
-@app.get("/api/repos/{repo_id}/pipelines")
-async def list_pipelines(repo_id: str, page: int = 1, perPage: int = 50) -> List[Dict[str, Any]]:
-    return [p.as_api() for p in sorted(state.pipelines, key=lambda p: -p.number)][:perPage]
-
-
-@app.get("/api/repos/{repo_id}/pipelines/{number}")
-async def get_pipeline(repo_id: str, number: int):
-    for pipeline in state.pipelines:
-        if pipeline.number != number:
-            continue
-        if pipeline.hang:
-            pipeline.status = "running"
-        elif pipeline.status not in ("success", "failure"):
-            if pipeline.remaining > 0:
-                pipeline.remaining -= 1
-                pipeline.status = "running"
-            else:
-                pipeline.status = pipeline.final
-                # A CI status update bumps the PR version, invalidating any stale copy.
-                pull = state.pulls.get(pipeline.pull_request_id or -1)
-                if pull is not None:
-                    pull.version += 1
-        return pipeline.as_api()
-    return JSONResponse({"message": f"pipeline {number} not found"}, status_code=404)
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Bitbucket + Woodpecker stub.")
+    parser = argparse.ArgumentParser(description="Bitbucket stub.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9000)
     args = parser.parse_args()

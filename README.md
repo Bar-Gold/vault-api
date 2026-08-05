@@ -1,12 +1,18 @@
 # vault-api
 
-A FastAPI service that **writes a file to a Bitbucket repo and watches the Woodpecker
-pipelines that act on it**, built on the internal **`tashtiot-apis-library`** and following
-the patterns in the reference `example-api`.
+A FastAPI service that **writes a file to a Bitbucket repo and watches the builds that act
+on it**, built on the internal **`tashtiot-apis-library`** and following the patterns in the
+reference `example-api`.
 
 A create request is not a direct write to Vault. It opens a pull request against the values
-repo, waits for CI to validate it, merges it, and waits for the deploy pipeline that applies
+repo, waits for CI to validate it, merges it, and waits for the deploy build that applies
 the change — then answers `Successful creation of <kv name>`.
+
+**Bitbucket is the only upstream.** The CI gates are read from Bitbucket's own build-status
+store — the thing a pull request's **Builds** tab renders — rather than from the CI server's
+API. A CI server posts its result *into* Bitbucket against the commit it built, so watching
+CI is just "ask Bitbucket which builds it holds for this sha". There is no CI URL, token or
+repo id to configure; the pipelines still run, they are simply observed through the forge.
 
 **The service knows nothing about Vault.** It appends an entry to a values file — a KV store
 or a Kubernetes auth role — and reports what the pipelines did with it; mounts, engine
@@ -87,10 +93,10 @@ POST /api/vault/v1/kv/
   ├─ 1. create branch  vault-kv/<file>-<kv-name>-<rand>
   ├─ 2. commit         kv/<file>.yaml   (append to kvStores; create if first)
   ├─ 3. open pull request -> base branch
-  ├─ 4. WAIT for the Woodpecker `pull_request` pipeline  ── fails ──> decline PR + delete branch -> 502
-  │                                                      ── times out ─> decline PR + delete branch -> 504
+  ├─ 4. WAIT for the builds on the PR's commit           ── red ────> decline PR + delete branch -> 502
+  │       (Bitbucket: fromRef.latestCommit)              ── times out ─> decline PR + delete branch -> 504
   ├─ 5. merge the pull request                           ── fails ──> leave PR open              -> 502
-  ├─ 6. WAIT for the Woodpecker `push` pipeline          ── fails ──> report (already merged)    -> 502
+  ├─ 6. WAIT for the builds on the merge commit          ── red ────> report (already merged)    -> 502
   │                                                      ── times out ─> report (already merged) -> 504
   └─ 201 {"status":"Succeeded","message":"Successful creation of myapp", ...}
 ```
@@ -102,16 +108,23 @@ alternative — but it has two consequences:
 - any proxy/ingress in front of this service needs a read timeout larger than
   `CI_PIPELINE_START_TIMEOUT_SECONDS + 2 × CI_PIPELINE_TIMEOUT_SECONDS`;
 - **step 5 is the point of no return.** Steps 1–4 are fully rolled back on failure. Once the PR
-  is merged, a failing deploy pipeline is *reported*, not undone — un-merging needs a revert PR,
+  is merged, a failing deploy build is *reported*, not undone — un-merging needs a revert PR,
   which is a human decision. The error message says so explicitly.
+
+**What a gate actually reads.** `GET /rest/api/1.0/projects/{k}/repos/{s}/commits/{sha}/builds`
+(Bitbucket 7.4+), polled until every build on that commit has left `INPROGRESS`. `SUCCESSFUL`
+is the only pass — `CANCELLED` and `UNKNOWN` are terminal *and* failures. A commit can carry
+several builds (Bitbucket keeps one per key, so one per workflow), and **all** of them must be
+green. An empty list is never "finished": the forge webhook is asynchronous, so the gate first
+waits for at least one build to be reported (`CI_PIPELINE_START_TIMEOUT_SECONDS`) and only then
+for them to settle (`CI_PIPELINE_TIMEOUT_SECONDS`).
 
 ### Request
 
 ```jsonc
 POST /api/vault/v1/kv/
 {
-  "file": "athena",                // which values file; ^[a-z0-9]+(-[a-z0-9]+)*$
-  "kv_name": "athena-passwords",   // unique across ALL files; same pattern, no slash
+  "kv_name": "athena-passwords",   // unique across ALL files; ^[a-z0-9]+(-[a-z0-9]+)*$
   "kv_description": "Passwords for athena",
   "roles": {                       // required: >=1 role with >=1 principal
     "write": ["CN=svc-athena,OU=ServiceAccounts,DC=corp,DC=example,DC=com"],
@@ -120,10 +133,22 @@ POST /api/vault/v1/kv/
 }
 ```
 
-`file` is the only field that reaches a filesystem path, and its pattern blocks `..` and
-slashes, so a request can never escape the values directory. `kv_name` is a value inside the
-document; it is single-segment because the read/update routes address a store as
-`{file}/{kv_name}`.
+**Three fields. `file` is optional and you normally leave it out** — it defaults to the
+store's own name, so this request lands in `kv/athena-passwords.yaml`. Send it only to group
+several stores into one file:
+
+```jsonc
+{"file": "athena", "kv_name": "athena-certs", ...}   // -> appended to kv/athena.yaml
+```
+
+Either way **the file is created if it does not exist, and if it does, the store is appended
+to its `kvStores` list — nothing already in the file is overwritten**, including keys this
+service does not recognise.
+
+This is the *only* request that mentions a file at all. `file` is the only field that
+reaches a filesystem path, and its pattern blocks `..` and slashes, so a request can never
+escape the values directory. `kv_name` is single-segment because it *is* the address every
+other route uses.
 
 ### The committed file (`kv/payments.yaml`)
 
@@ -180,34 +205,44 @@ one rejects the other.
 | Route | Purpose | Success |
 |-------|---------|---------|
 | `POST /api/vault/v1/kv/pull-request` | open the pull request and stop — no CI wait, no merge | `201` |
-| `GET /api/vault/v1/kv/{file}` | the whole values file (404 if absent) | `200` |
-| `GET /api/vault/v1/kv/{file}/{kv_name}` | one store out of it | `200` |
-| `PATCH /api/vault/v1/kv/{file}/{kv_name}` | change one store's `description` and/or `roles` | `200` |
-| `DELETE /api/vault/v1/kv/{file}/{kv_name}` | remove one store, through the same chain | `200` |
-| `DELETE /api/vault/v1/kv/{file}/{kv_name}/pull-request` | open the removal pull request and stop | `201` |
-| `POST /api/vault/v1/kv/{file}/{kv_name}/k8s-service-accounts` | bind a service account to that store | `201` |
-| `POST /api/vault/v1/kv/{file}/{kv_name}/k8s-service-accounts/pull-request` | open the pull request and stop | `201` |
-| `GET /api/vault/v1/kv/{file}/{kv_name}/k8s-service-accounts` | that store's bindings | `200` |
-| `DELETE /api/vault/v1/kv/{file}/{kv_name}/k8s-service-accounts` | unbind one, by `?service_account=&namespace=&cluster=` | `200` |
-| `DELETE /api/vault/v1/kv/{file}/{kv_name}/k8s-service-accounts/pull-request` | open the removal pull request and stop | `201` |
+| `GET /api/vault/v1/kv/{kv_name}` | one store, wherever it lives | `200` |
+| `PATCH /api/vault/v1/kv/{kv_name}` | change one store's `description` and/or `roles` | `200` |
+| `DELETE /api/vault/v1/kv/{kv_name}` | remove one store, through the same chain | `200` |
+| `DELETE /api/vault/v1/kv/{kv_name}/pull-request` | open the removal pull request and stop | `201` |
+| `POST /api/vault/v1/kv/{kv_name}/k8s-service-accounts` | bind a service account to that store | `201` |
+| `POST /api/vault/v1/kv/{kv_name}/k8s-service-accounts/pull-request` | open the pull request and stop | `201` |
+| `GET /api/vault/v1/kv/{kv_name}/k8s-service-accounts` | that store's bindings | `200` |
+| `DELETE /api/vault/v1/kv/{kv_name}/k8s-service-accounts` | unbind one, by `?service_account=&namespace=&cluster=` | `200` |
+| `DELETE /api/vault/v1/kv/{kv_name}/k8s-service-accounts/pull-request` | open the removal pull request and stop | `201` |
+| `GET /api/vault/v1/kv/files/{file}` | a whole values file (404 if absent) | `200` |
 
-`file` and `kv_name` are pattern-checked in the URL as well as in a create body, so a
-malformed one is a `422` here rather than an opaque Bitbucket `404` two calls later. The
-unbind query parameters carry the same patterns the bind body enforces.
+**Every one of these addresses a store by name alone.** You do not have to remember which
+file it went into: a store name is unique across the whole values directory — the create
+enforces that — so the name is a sufficient address. The service looks in
+`kv/<kv_name>.yaml` first and walks the directory only if the store was grouped elsewhere.
+A store that is in no file is a `404`, and if a file could not be parsed the `404` names
+it, so a broken file never reads as a deleted store.
 
-`GET /api/vault/v1/kv/{file}` returns *the file* — every store, each with its own bindings —
-as parsed YAML, unchanged.
+`GET /files/{file}` is the one route that still names a file — an operator's view of the
+repo. It returns *the file* — every store, each with its own bindings — as parsed YAML,
+unchanged. It is two segments against a store read's one, so a store named `files` is
+still readable at `GET /files`.
+
+`kv_name` is pattern-checked in the URL as well as in a create body, and so is `file` on
+the route that takes one, so a malformed value is a `422` here rather than an opaque
+Bitbucket `404` two calls later. The unbind query parameters carry the same patterns the
+bind body enforces.
 
 ### `POST /pull-request` — the non-blocking half
 
 Same body as a create, same uniqueness check, same commit, same pull request — then it
-**returns**, answering `201` in one round-trip instead of blocking for two pipelines:
+**returns**, answering `201` in one round-trip instead of blocking for two builds:
 
 ```jsonc
 {"file": "athena", "kv_name": "athena-passwords", "kv_description": "Passwords for athena",
  "roles": {"write": ["CN=svc-athena,OU=ServiceAccounts,DC=corp,DC=example,DC=com"]}}
 // -> 201 {"status":"Succeeded", "pull_request":{"id":42,"state":"OPEN"},
-//         "validation_pipeline":null, "deploy_pipeline":null}
+//         "validation_builds":null, "deploy_builds":null}
 ```
 
 Nothing reaches the base branch — a human reviews and merges. Rollbacks still apply: a failed
@@ -216,7 +251,7 @@ commit or a failed PR deletes the branch it created.
 Two behaviours to know, both intentional:
 
 - **CI still runs.** Opening a pull request triggers the validation pipeline in the forge like
-  any other PR. This endpoint simply does not *wait* for it, which is why the pipeline fields
+  any other PR. This endpoint simply does not *wait* for it, which is why the build fields
   come back `null` — nothing was observed, not nothing happened.
 - **Calling it twice for the same name opens two pull requests.** The name scan reads the base
   branch, and an unmerged PR is not on it. Reviewers close the loser.
@@ -248,7 +283,8 @@ Same pull request → CI → merge → CI chain, same rollbacks, same point of n
 worth knowing:
 
 - **Only the named entry goes.** Its siblings in the file are written back untouched.
-- **Deleting the last store leaves the file behind**, holding `kvStores: []`. `GET /{file}`
+- **Deleting the last store leaves the file behind**, holding `kvStores: []`.
+  `GET /files/{file}`
   keeps answering `200`, and a later create appends to it normally. *This assumes the deploy
   pipeline reads an empty list as "remove everything this file declared"* — if it cannot,
   the file has to be deleted instead, which needs a Bitbucket call this service does not make
@@ -256,7 +292,7 @@ worth knowing:
 - **A repeat delete is `404`**, the same answer `GET` and `PATCH` already give for a store
   that is not there. The *state* is idempotent; the status code tells you which call did the
   work. A client whose connection dropped mid-delete cannot tell "already gone" from "never
-  existed" — confirm with `GET /{file}`.
+  existed" — confirm with `GET /{kv_name}`.
 - **`DELETE .../pull-request` is the escape hatch**, answering `201` in one round-trip and
   leaving the removal for a reviewer to merge. It matters more here than for a create: this
   is the destructive one. Nothing reaches the base branch, so calling it twice opens two
@@ -328,8 +364,8 @@ There is no FastAPI `Depends` for connectors — the factory closure is the inje
 
 ### Two-layer configuration
 
-- **`app/global_conf.py`** (`global_config`) — cross-cutting: `BITBUCKET_*`, `WOODPECKER_*`,
-  `HTTP_TIMEOUT_SECONDS`, `VERIFY_SSL`.
+- **`app/global_conf.py`** (`global_config`) — cross-cutting: `BITBUCKET_*`,
+  `HTTP_TIMEOUT_SECONDS`, `VERIFY_SSL`. No CI-server settings: the gates read Bitbucket.
 - **`app/v1/vault/conf.py`** (`config`) — the module's own: `API_PREFIX`, `API_TAGS`, the values
   repo layout, PR shaping and the `CI_*` timeouts.
 
@@ -341,7 +377,6 @@ environment itself.
 | Client | Built on | Why |
 |--------|----------|-----|
 | `app/clients/bitbucket.py` | library `BaseAPI` | the library's `Git` connector does file CRUD on a default ref but exposes no **pull-request** operations, and PRs are the whole point of this service |
-| `app/clients/woodpecker.py` | library `BaseAPI` | no Woodpecker connector exists in the library |
 
 Both normalise every non-2xx into the library's `ExternalServiceError`, which the routes map to
 a 502 — the same failure contract the reference API uses. `BaseAPI` defaults `verify=False`;
@@ -353,7 +388,7 @@ a 502 — the same failure contract the reference API uses. `BaseAPI` defaults `
 |------|----------------|
 | `conf.py` | the module's `BaseSettings` + `config` singleton (both API prefixes, both branch prefixes) |
 | `schemas.py` | pydantic request/response models (`VaultKVCreate` is a flat four-field body); one `VaultOperationResponse` for both resource kinds |
-| `operations.py` | the create/update/delete chain for both kinds, the rollbacks and the pipeline matchers; receives connectors as arguments |
+| `operations.py` | the create/update/delete chain for both kinds and the rollbacks; receives the connector as an argument |
 | `routes.py` | `get_v1_vault_router(...)`, prefixed with `config.API_PREFIX`; stores and their bindings both hang off it |
 
 `app/helpers.py` holds the pure functions: branch/file naming, both entry shapes, YAML
@@ -384,7 +419,6 @@ app/
   helpers.py         # naming, values-file shape, YAML rendering (pure)
   clients/
     bitbucket.py     # branch / file / pull-request REST client
-    woodpecker.py    # pipeline discovery + polling
     http.py          # the single funnel that raises ExternalServiceError
   v1/vault/          # conf, schemas, operations, routes
 tests/
@@ -393,20 +427,22 @@ tests/
   v1/vault/          # schemas, the chains + rollbacks, routes end-to-end
                      #   test_k8s_service_account_*.py mirror the KV files one-for-one
 tools/
-  stub_upstreams.py  # local Bitbucket + Woodpecker stand-in (see below)
+  stub_upstreams.py  # local Bitbucket stand-in, build statuses included (see below)
 ```
 
 ### Driving the chain locally
 
-`tools/stub_upstreams.py` impersonates both upstreams in one process, so the whole create
-chain runs over real HTTP with no Docker, licence or network:
+`tools/stub_upstreams.py` impersonates Bitbucket — repo *and* build statuses — so the whole
+create chain runs over real HTTP with no Docker, licence or network. It fakes the CI server's
+side effect rather than the CI server: opening or merging a pull request attaches `INPROGRESS`
+build statuses to the relevant commit, which then settle.
 
 ```bash
 uv run --no-sync python tools/stub_upstreams.py --port 9000     # terminal 1
-# terminal 2: point BITBUCKET_URL / WOODPECKER_URL at it — full env in the module docstring
+# terminal 2: point BITBUCKET_URL at it — full env in the module docstring
 
 curl -X POST 127.0.0.1:9000/__control -d '{"validation":"failure"}'   # success|failure|hang
-curl 127.0.0.1:9000/__state                                           # branches, PRs, pipelines
+curl 127.0.0.1:9000/__state                                           # branches, PRs, builds
 ```
 
 Requires `tashtiot-apis-library >= 1.1.0`.

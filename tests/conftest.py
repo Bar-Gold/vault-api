@@ -16,12 +16,9 @@ HS256_SECRET = "test-secret-test-secret-test-secret"
 _BASE_ENV = {
     "BITBUCKET_URL": "https://bitbucket.test",
     "BITBUCKET_TOKEN": "bb-token",
-    "WOODPECKER_URL": "https://woodpecker.test",
-    "WOODPECKER_TOKEN": "wp-token",
     "VAULT_VALUES_REPO_PROJECT_KEY": "INFRA",
     "VAULT_VALUES_REPO_SLUG": "vault-values",
     "VAULT_VALUES_REPO_BASE_BRANCH": "master",
-    "WOODPECKER_REPO_ID": "42",
     # Keep the suite fast: no real waiting between polls.
     "CI_POLL_INTERVAL_SECONDS": "0",
     "CI_PIPELINE_START_TIMEOUT_SECONDS": "0",

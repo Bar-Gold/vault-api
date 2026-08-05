@@ -28,23 +28,19 @@ class VaultApiStaticSettings(BaseSettings):
     )
 
     BITBUCKET_TOKEN: str = Field(
-        description="HTTP access token for the Bitbucket REST API (branch, file and pull-request operations).",
+        description="HTTP access token for the Bitbucket REST API (branch, file, pull-request "
+        "and build-status operations).",
     )
 
-    # --- Woodpecker CI (the pipelines gating and applying the change) ---
-    WOODPECKER_URL: str = Field(
-        description="Base URL of the Woodpecker CI server.",
-    )
-
-    WOODPECKER_TOKEN: str = Field(
-        description="Personal/service token for the Woodpecker REST API.",
-    )
+    # There are deliberately no CI-server settings here. The CI gates read the build
+    # statuses the pipelines post *into Bitbucket* — the pull request's Builds tab — so
+    # Bitbucket is the only upstream this service talks to.
 
     # --- Outbound HTTP ---
     HTTP_TIMEOUT_SECONDS: float = Field(
         default=30.0,
-        description="Per-request timeout for the Bitbucket and Woodpecker clients. This bounds a "
-        "single call, not the overall flow — the CI_* settings bound the waiting.",
+        description="Per-request timeout for the Bitbucket client. This bounds a single call, "
+        "not the overall flow — the CI_* settings bound the waiting.",
     )
 
     VERIFY_SSL: bool = Field(

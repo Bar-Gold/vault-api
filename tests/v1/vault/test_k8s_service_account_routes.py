@@ -13,14 +13,14 @@ from app.helpers import (
     render_values_yaml,
 )
 from app.v1.vault.conf import config
-from tests.fakes import make_pipeline
+from tests.fakes import passing
 
 KV = "myapp"
 FILE = "payments"
 VALUES_PATH = "kv/payments.yaml"
 ROLES = {"read": ["app01.corp.example.com"]}
 
-STORE_URL = f"{config.API_PREFIX}/{FILE}/{KV}"
+STORE_URL = f"{config.API_PREFIX}/{KV}"
 SA_URL = f"{STORE_URL}/k8s-service-accounts"
 SA_PR_URL = f"{SA_URL}/pull-request"
 
@@ -28,18 +28,18 @@ BODY = {"service_account": "vault", "namespace": "payments", "cluster": "dev"}
 QUERY = {"service_account": "vault", "namespace": "payments", "cluster": "dev"}
 
 
-def _seed(bitbucket, *names, accounts=None):
+def _seed(bitbucket, *names, path=VALUES_PATH, accounts=None):
     document = build_kv_stores_document(
         [build_kv_store(n, "payments secrets", ROLES) for n in names]
     )
     if accounts is not None:
         for store in document["kvStores"]:
             store["roles"]["k8sServiceAccounts"] = list(accounts)
-    bitbucket.existing_files[VALUES_PATH] = render_values_yaml(document)
+    bitbucket.existing_files[path] = render_values_yaml(document)
 
 
-def _committed(bitbucket):
-    return yaml.safe_load(bitbucket.committed[VALUES_PATH])
+def _committed(bitbucket, path=VALUES_PATH):
+    return yaml.safe_load(bitbucket.committed[path])
 
 
 # --------------------------------------------------------------------------- #
@@ -169,14 +169,11 @@ def test_unbinding_something_not_bound_is_404(client, auth_headers, bitbucket):
     assert "is not bound to" in response.json()["error"]
 
 
-def test_a_repeat_unbind_is_404(client, auth_headers, bitbucket, woodpecker):
+def test_a_repeat_unbind_is_404(client, auth_headers, bitbucket):
     _seed(bitbucket, KV, accounts=[build_k8s_service_account("vault", "payments", "dev")])
     assert client.delete(SA_URL, params=QUERY, headers=auth_headers).status_code == 200
 
-    woodpecker.results = [
-        make_pipeline(number=4, status="success"),
-        make_pipeline(number=5, status="success", event="push", commit="merge-sha-1"),
-    ]
+    bitbucket.builds = [passing(), passing("ci/woodpecker/push/deploy")]
     bitbucket.existing_files[VALUES_PATH] = bitbucket.committed[VALUES_PATH]
 
     assert client.delete(SA_URL, params=QUERY, headers=auth_headers).status_code == 404
@@ -192,7 +189,7 @@ def test_pr_only_bind_returns_201_and_does_not_merge(client, auth_headers, bitbu
 
     assert response.status_code == 201
     assert response.json()["pull_request"]["state"] == "OPEN"
-    assert response.json()["validation_pipeline"] is None
+    assert response.json()["validation_builds"] is None
     assert "merge_pull_request" not in bitbucket.calls
 
 
@@ -249,21 +246,21 @@ def test_reads_need_auth(client, bitbucket):
 # routing — the fixed segment must beat the parameterised ones
 # --------------------------------------------------------------------------- #
 def test_a_store_named_k8s_service_accounts_stays_addressable(client, auth_headers, bitbucket):
-    """Three segments against two — `DELETE /{file}/{kv_name}` still wins for this name."""
-    _seed(bitbucket, "k8s-service-accounts")
+    """Two segments against one — `DELETE /{kv_name}` still wins for this name."""
+    _seed(bitbucket, "k8s-service-accounts", path="kv/k8s-service-accounts.yaml")
 
     response = client.delete(
-        f"{config.API_PREFIX}/{FILE}/k8s-service-accounts", headers=auth_headers
+        f"{config.API_PREFIX}/k8s-service-accounts", headers=auth_headers
     )
 
     assert response.status_code == 200
-    assert _committed(bitbucket) == {"kvStores": []}
+    assert _committed(bitbucket, path="kv/k8s-service-accounts.yaml") == {"kvStores": []}
 
 
 def test_the_binding_route_wins_over_the_delete_pull_request_route(
     client, auth_headers, bitbucket
 ):
-    """`/{kv}/k8s-service-accounts/pull-request` is four segments; the delete PR route is three."""
+    """`/{kv}/k8s-service-accounts/pull-request` is three segments; the delete PR route is two."""
     _seed(bitbucket, KV)
 
     response = client.post(SA_PR_URL, json=BODY, headers=auth_headers)
@@ -273,15 +270,19 @@ def test_the_binding_route_wins_over_the_delete_pull_request_route(
 
 
 def test_a_store_named_pull_request_can_still_be_unbound(client, auth_headers, bitbucket):
-    """`/{file}/pull-request/k8s-service-accounts` addresses a store, not an endpoint."""
+    """`/pull-request/k8s-service-accounts` addresses a store, not an endpoint.
+
+    Two segments either way, but the second is a different literal, so nothing collides.
+    """
     _seed(
         bitbucket,
         "pull-request",
+        path="kv/pull-request.yaml",
         accounts=[build_k8s_service_account("vault", "payments", "dev")],
     )
 
     response = client.delete(
-        f"{config.API_PREFIX}/{FILE}/pull-request/k8s-service-accounts",
+        f"{config.API_PREFIX}/pull-request/k8s-service-accounts",
         params=QUERY,
         headers=auth_headers,
     )
@@ -289,9 +290,19 @@ def test_a_store_named_pull_request_can_still_be_unbound(client, auth_headers, b
     assert response.status_code == 200
 
 
-def test_a_malformed_file_is_422_not_404(client, auth_headers):
+def test_a_malformed_kv_name_is_422_not_404(client, auth_headers):
     response = client.get(
-        f"{config.API_PREFIX}/Bad_File/{KV}/k8s-service-accounts", headers=auth_headers
+        f"{config.API_PREFIX}/Bad_Name/k8s-service-accounts", headers=auth_headers
     )
 
     assert response.status_code == 422
+
+
+def test_a_store_named_files_is_not_shadowed_by_the_file_read(client, auth_headers, bitbucket):
+    """`GET /files/{file}` is two segments; a store named `files` is one."""
+    _seed(bitbucket, "files", path="kv/files.yaml")
+
+    response = client.get(f"{config.API_PREFIX}/files", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.json()["name"] == "files"

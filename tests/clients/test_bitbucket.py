@@ -10,7 +10,7 @@ import pytest
 import respx
 from tashtiot_apis_library.connectors import ExternalServiceError
 
-from app.clients.bitbucket import BitbucketClient, PullRequest
+from app.clients.bitbucket import BitbucketClient, BuildTimeoutError, PullRequest
 
 BASE = "https://bitbucket.test"
 API = f"{BASE}/rest/api/1.0/projects/INFRA/repos/vault-values"
@@ -20,7 +20,15 @@ BRANCH_API = f"{BASE}/rest/branch-utils/1.0/projects/INFRA/repos/vault-values"
 @pytest.fixture
 def bitbucket():
     client = httpx.AsyncClient(base_url=BASE)
-    return BitbucketClient(client, project_key="INFRA", repo_slug="vault-values")
+    # Zero budgets: the polling loops must be exercised without the suite waiting.
+    return BitbucketClient(
+        client,
+        project_key="INFRA",
+        repo_slug="vault-values",
+        poll_interval=0,
+        start_timeout=0,
+        completion_timeout=0,
+    )
 
 
 def _pr_payload(pr_id=101, version=0, state="OPEN", merge_commit=None):
@@ -29,7 +37,7 @@ def _pr_payload(pr_id=101, version=0, state="OPEN", merge_commit=None):
         "version": version,
         "title": "Create Vault KV mount kingmagen/prod/myapp",
         "state": state,
-        "fromRef": {"displayId": "vault-kv/prod-myapp-abc"},
+        "fromRef": {"displayId": "vault-kv/prod-myapp-abc", "latestCommit": "source-sha"},
         "toRef": {"displayId": "master"},
         "links": {"self": [{"href": f"{BASE}/pull-requests/{pr_id}"}]},
     }
@@ -338,6 +346,14 @@ def test_pull_request_parsing_tolerates_missing_optional_fields():
     assert pull_request.url is None
     assert pull_request.merge_commit is None
     assert pull_request.state == "OPEN"
+    assert pull_request.from_commit == ""
+
+
+def test_pull_request_parsing_reads_the_source_branch_head():
+    """`fromRef.latestCommit` is the sha the validation gate watches."""
+    pull_request = PullRequest.from_api(_pr_payload())
+
+    assert pull_request.from_commit == "source-sha"
 
 
 # --------------------------------------------------------------------------- #
@@ -389,3 +405,216 @@ async def test_get_last_commit_maps_a_failure(bitbucket):
 
     assert error.value.status_code == 404
     assert "Repo not found" in error.value.detail
+
+
+# --------------------------------------------------------------------------- #
+# build statuses — the CI gates
+#
+# The shapes here are Bitbucket's own: `state` is one of SUCCESSFUL / FAILED /
+# CANCELLED / UNKNOWN / INPROGRESS, and the list is a normal paged response.
+# --------------------------------------------------------------------------- #
+def _builds_page(*builds, is_last=True, next_start=None):
+    body = {"values": list(builds), "size": len(builds), "isLastPage": is_last}
+    if next_start is not None:
+        body["nextPageStart"] = next_start
+    return body
+
+
+def _build(key="ci/woodpecker/pr/build", state="SUCCESSFUL", **extra):
+    return {
+        "key": key,
+        "state": state,
+        "name": "vault-values #12",
+        "url": "https://ci.test/repos/1/pipeline/12",
+        "buildNumber": "12",
+        **extra,
+    }
+
+
+@respx.mock
+async def test_get_build_statuses_hits_the_commit_builds_endpoint(bitbucket):
+    route = respx.get(f"{API}/commits/deadbeef/builds").mock(
+        return_value=httpx.Response(200, json=_builds_page(_build()))
+    )
+
+    builds = await bitbucket.get_build_statuses("deadbeef")
+
+    assert [(b.key, b.state, b.build_number) for b in builds] == [
+        ("ci/woodpecker/pr/build", "SUCCESSFUL", "12")
+    ]
+    assert builds[0].url == "https://ci.test/repos/1/pipeline/12"
+    assert route.calls[0].request.url.params["limit"] == "100"
+
+
+@respx.mock
+async def test_get_build_statuses_follows_pagination(bitbucket):
+    respx.get(f"{API}/commits/deadbeef/builds").mock(
+        side_effect=[
+            httpx.Response(
+                200, json=_builds_page(_build(key="a"), is_last=False, next_start=1)
+            ),
+            httpx.Response(200, json=_builds_page(_build(key="b"))),
+        ]
+    )
+
+    builds = await bitbucket.get_build_statuses("deadbeef")
+
+    assert [b.key for b in builds] == ["a", "b"]
+
+
+@respx.mock
+async def test_a_commit_with_no_builds_is_an_empty_list_not_an_error(bitbucket):
+    """The webhook is asynchronous, so 'nothing yet' is the normal first answer."""
+    respx.get(f"{API}/commits/deadbeef/builds").mock(
+        return_value=httpx.Response(200, json=_builds_page())
+    )
+
+    assert await bitbucket.get_build_statuses("deadbeef") == []
+
+
+@pytest.mark.parametrize(
+    "state,terminal,succeeded",
+    [
+        ("SUCCESSFUL", True, True),
+        ("FAILED", True, False),
+        ("CANCELLED", True, False),
+        ("UNKNOWN", True, False),
+        ("INPROGRESS", False, False),
+    ],
+)
+@respx.mock
+async def test_every_bitbucket_state_is_classified(bitbucket, state, terminal, succeeded):
+    """CANCELLED and UNKNOWN are the ones a 'not FAILED' gate would wave through."""
+    respx.get(f"{API}/commits/deadbeef/builds").mock(
+        return_value=httpx.Response(200, json=_builds_page(_build(state=state)))
+    )
+
+    build = (await bitbucket.get_build_statuses("deadbeef"))[0]
+
+    assert build.is_terminal is terminal
+    assert build.succeeded is succeeded
+
+
+@respx.mock
+async def test_await_builds_returns_once_everything_is_terminal(bitbucket):
+    respx.get(f"{API}/commits/deadbeef/builds").mock(
+        side_effect=[
+            httpx.Response(200, json=_builds_page(_build(state="INPROGRESS"))),
+            httpx.Response(200, json=_builds_page(_build(state="SUCCESSFUL"))),
+        ]
+    )
+
+    builds = await bitbucket.await_builds("deadbeef")
+
+    assert [b.state for b in builds] == ["SUCCESSFUL"]
+
+
+@respx.mock
+async def test_await_builds_waits_for_the_slowest_workflow(bitbucket):
+    """One result per key, so a green build alongside a running one is not a pass yet."""
+    respx.get(f"{API}/commits/deadbeef/builds").mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json=_builds_page(
+                    _build(key="lint", state="SUCCESSFUL"),
+                    _build(key="test", state="INPROGRESS"),
+                ),
+            ),
+            httpx.Response(
+                200,
+                json=_builds_page(
+                    _build(key="lint", state="SUCCESSFUL"),
+                    _build(key="test", state="FAILED"),
+                ),
+            ),
+        ]
+    )
+
+    builds = await bitbucket.await_builds("deadbeef")
+
+    assert sorted(b.state for b in builds) == ["FAILED", "SUCCESSFUL"]
+
+
+@respx.mock
+async def test_await_builds_times_out_when_nothing_is_ever_reported(bitbucket):
+    """An empty list can never mean 'finished' — that is the whole first phase."""
+    respx.get(f"{API}/commits/deadbeef/builds").mock(
+        return_value=httpx.Response(200, json=_builds_page())
+    )
+
+    with pytest.raises(BuildTimeoutError) as error:
+        await bitbucket.await_builds("deadbeef")
+
+    assert "No build was reported" in error.value.message
+    assert error.value.builds == []
+
+
+@respx.mock
+async def test_await_builds_times_out_and_reports_what_it_saw(bitbucket):
+    respx.get(f"{API}/commits/deadbeef/builds").mock(
+        return_value=httpx.Response(200, json=_builds_page(_build(state="INPROGRESS")))
+    )
+
+    with pytest.raises(BuildTimeoutError) as error:
+        await bitbucket.await_builds("deadbeef")
+
+    assert "still running" in error.value.message
+    assert [b.state for b in error.value.builds] == ["INPROGRESS"]
+
+
+@respx.mock
+async def test_excluded_keys_are_invisible_to_both_phases(bitbucket):
+    """The fast-forward case: gate 1's results sit on the very commit gate 2 asks about."""
+    respx.get(f"{API}/commits/deadbeef/builds").mock(
+        return_value=httpx.Response(
+            200, json=_builds_page(_build(key="ci/woodpecker/pr/build"))
+        )
+    )
+
+    with pytest.raises(BuildTimeoutError) as error:
+        await bitbucket.await_builds(
+            "deadbeef", exclude_keys=frozenset({"ci/woodpecker/pr/build"})
+        )
+
+    # It waited for a *new* result rather than re-reading the validation one.
+    assert "No build was reported" in error.value.message
+
+
+@respx.mock
+async def test_a_build_read_failure_is_mapped_not_swallowed(bitbucket):
+    """An unknown sha 404s, and that must surface rather than look like 'no builds yet'."""
+    respx.get(f"{API}/commits/nosuch/builds").mock(
+        return_value=httpx.Response(404, json={"errors": [{"message": "Commit not found"}]})
+    )
+
+    with pytest.raises(ExternalServiceError) as error:
+        await bitbucket.await_builds("nosuch")
+
+    assert error.value.status_code == 404
+    assert "Commit not found" in error.value.detail
+
+
+# --------------------------------------------------------------------------- #
+# branch head — the deploy gate's fallback when no merge commit is reported
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_get_branch_head_asks_for_the_newest_commit_on_the_branch(bitbucket):
+    route = respx.get(f"{API}/commits").mock(
+        return_value=httpx.Response(200, json={"values": [{"id": "head-sha"}]})
+    )
+
+    assert await bitbucket.get_branch_head("master") == "head-sha"
+
+    params = route.calls[0].request.url.params
+    assert params["until"] == "master"
+    assert params["limit"] == "1"
+    # Not scoped to a path: the merge commit need not have touched the values file.
+    assert "path" not in params
+
+
+@respx.mock
+async def test_get_branch_head_is_none_on_an_empty_branch(bitbucket):
+    respx.get(f"{API}/commits").mock(return_value=httpx.Response(200, json={"values": []}))
+
+    assert await bitbucket.get_branch_head("master") is None

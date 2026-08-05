@@ -15,9 +15,14 @@ The create flow is a GitOps chain with two CI gates:
 
     1. commit the values file to a short-lived branch
     2. open a pull request against the base branch
-    3. wait for the **validation** pipeline (Woodpecker, `pull_request` event) — it blocks the merge
+    3. wait for the **validation** build on the pull request's commit — it blocks the merge
     4. merge the pull request
-    5. wait for the **deploy** pipeline (Woodpecker, `push` event) — it applies the change to Vault
+    5. wait for the **deploy** build on the merge commit — it applies the change to Vault
+
+Both gates are read from **Bitbucket**, not from the CI server: the CI server posts its
+result against the commit it built, and Bitbucket keeps it — that store is what a pull
+request's Builds tab shows. So a gate is "ask Bitbucket about a sha we already hold", which
+is why there are no pipeline matchers and no pre-flight watermark here.
 
 The request blocks until step 5 finishes, then returns "Successful creation of <name>".
 Update and delete run the same chain over a different document — one entry edited, one
@@ -25,25 +30,23 @@ entry removed — so all three share its rollbacks rather than each hand-rolling
 
 There is no transaction, so each step rolls back what the earlier steps did:
 committing fails -> delete the branch; the PR fails to open -> delete the branch; the
-validation pipeline fails or times out -> decline the PR and delete the branch. **The merge
-is the point of no return**: once step 4 succeeds the change is on the base branch, so a
-failing deploy pipeline is reported as-is rather than rolled back — un-merging would need a
+validation build fails or times out -> decline the PR and delete the branch. **The merge is
+the point of no return**: once step 4 succeeds the change is on the base branch, so a
+failing deploy build is reported as-is rather than rolled back — un-merging would need a
 revert PR and a second human decision.
 """
 
 import uuid
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import yaml
 from loguru import logger
 from tashtiot_apis_library.connectors import ExternalServiceError
 
-from ...clients.bitbucket import PullRequest
-from ...clients.woodpecker import Pipeline, PipelineTimeoutError
+from ...clients.bitbucket import BuildStatus, BuildTimeoutError, PullRequest
 from ...helpers import (
     K8sServiceAccountIdentity,
     K8sServiceAccountNotFound,
-    KVStoreNotFound,
     add_k8s_service_account,
     add_kv_store,
     build_branch_name,
@@ -63,9 +66,9 @@ from ...helpers import (
 )
 from .conf import config
 from .schemas import (
+    BuildInfo,
     K8sServiceAccountCreate,
     OperationStatus,
-    PipelineInfo,
     PullRequestInfo,
     VaultKVCreate,
     VaultKVUpdate,
@@ -87,8 +90,8 @@ class VaultOperationError(Exception):
         file: str = "",
         status_code: int = 502,
         pull_request: Optional[PullRequest] = None,
-        validation_pipeline: Optional[Pipeline] = None,
-        deploy_pipeline: Optional[Pipeline] = None,
+        validation_builds: Optional[List[BuildStatus]] = None,
+        deploy_builds: Optional[List[BuildStatus]] = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -96,8 +99,8 @@ class VaultOperationError(Exception):
         self.file = file
         self.status_code = status_code
         self.pull_request = pull_request
-        self.validation_pipeline = validation_pipeline
-        self.deploy_pipeline = deploy_pipeline
+        self.validation_builds = validation_builds
+        self.deploy_builds = deploy_builds
 
     def to_response(self) -> "VaultOperationResponse":
         """The failed response body, so the route only has to pick the HTTP status.
@@ -112,8 +115,8 @@ class VaultOperationError(Exception):
             kv_name=self.kv_name,
             file=self.file,
             pull_request=_pull_request_info(self.pull_request),
-            validation_pipeline=_pipeline_info(self.validation_pipeline),
-            deploy_pipeline=_pipeline_info(self.deploy_pipeline),
+            validation_builds=_build_infos(self.validation_builds),
+            deploy_builds=_build_infos(self.deploy_builds),
             error=self.message,
         )
 
@@ -127,68 +130,23 @@ def _pull_request_info(pull_request: Optional[PullRequest]) -> Optional[PullRequ
     return PullRequestInfo(id=pull_request.id, url=pull_request.url, state=pull_request.state)
 
 
-def _pipeline_info(pipeline: Optional[Pipeline]) -> Optional[PipelineInfo]:
-    if pipeline is None:
+def _build_infos(builds: Optional[List[BuildStatus]]) -> Optional[List[BuildInfo]]:
+    if builds is None:
         return None
-    return PipelineInfo(number=pipeline.number, status=pipeline.status, link=pipeline.link)
+    return [
+        BuildInfo(key=build.key, state=build.state, name=build.name or None, url=build.url)
+        for build in builds
+    ]
 
 
-def _pipeline_failure(kind: str, pipeline: Pipeline) -> str:
-    link = f" ({pipeline.link})" if pipeline.link else ""
-    return f"{kind} pipeline #{pipeline.number} finished with status '{pipeline.status}'{link}"
+def _build_failure(kind: str, builds: List[BuildStatus]) -> str:
+    """Name every build that did not succeed, not just the first.
 
-
-# --------------------------------------------------------------------------- #
-# pipeline matchers
-# --------------------------------------------------------------------------- #
-def pull_request_pipeline_matcher(branch: str, min_number: int) -> Callable[[Pipeline], bool]:
-    """Match the validation pipeline for our PR.
-
-    Woodpecker records the source branch differently per forge and event (`branch`, `ref`
-    or `refspec`), so we look for our branch name in any of them. `min_number` rules out
-    pipelines that already existed before this request started.
+    Bitbucket stores one result per key per commit, so a commit can carry several — one per
+    workflow. Reporting only one of them would send a reader to the wrong build page.
     """
-
-    def _matches(pipeline: Pipeline) -> bool:
-        if pipeline.event != "pull_request" or pipeline.number <= min_number:
-            return False
-        return branch in " ".join([pipeline.branch, pipeline.ref, pipeline.refspec])
-
-    return _matches
-
-
-def deploy_pipeline_matcher(
-    base_branch: str, merge_commit: Optional[str], min_number: int
-) -> Callable[[Pipeline], bool]:
-    """Match the post-merge pipeline.
-
-    Prefer the merge commit sha, which is unambiguous. Bitbucket does not always return it
-    on the merge response, so fall back to "a push pipeline on the base branch newer than
-    anything that existed before we merged".
-    """
-
-    def _matches(pipeline: Pipeline) -> bool:
-        if pipeline.event != "push" or pipeline.number <= min_number:
-            return False
-        if merge_commit:
-            return pipeline.commit == merge_commit
-        return pipeline.branch == base_branch
-
-    return _matches
-
-
-async def _latest_pipeline_number(woodpecker: Any) -> int:
-    """Highest existing pipeline number, used as the `min_number` watermark.
-
-    A failure here only costs us the watermark, so it degrades to 0 rather than aborting
-    the whole operation.
-    """
-    try:
-        pipelines = await woodpecker.list_pipelines()
-    except Exception as exc:
-        logger.warning(f"Could not read the current Woodpecker pipeline list: {exc}")
-        return 0
-    return max((pipeline.number for pipeline in pipelines), default=0)
+    failed = [build for build in builds if not build.succeeded]
+    return f"{kind} did not pass: " + ", ".join(str(build) for build in failed)
 
 
 # --------------------------------------------------------------------------- #
@@ -249,17 +207,24 @@ async def _read_document(
     return parsed
 
 
-async def _walk_values_files(bitbucket: Any) -> AsyncIterator[Tuple[str, Any]]:
-    """Every parsed yaml under `VAULT_VALUES_DIR` on the base branch, path first.
+async def _walk_values_files(
+    bitbucket: Any, skipped: Optional[List[str]] = None
+) -> AsyncIterator[Tuple[str, str, Any]]:
+    """Every parsed yaml under `VAULT_VALUES_DIR` on the base branch: file, path, document.
 
-    One caller today — the create's store-name scan — because store names are the only
-    thing in this format with a values-dir-wide namespace. It stays a separate generator
-    so that "read and parse every file, skipping the ones that cannot be parsed" has one
-    implementation whenever a second dir-wide question appears. A file we did not write,
-    or a bad merge, is logged and skipped rather than blocking an unrelated operation.
+    Two callers, and both exist because a store name is the one thing in this format with a
+    values-dir-wide namespace: the create's duplicate scan, and `_resolve_store`, which is
+    how every other route finds a store without the caller naming a file. A file we did not
+    write, or a bad merge, is logged and skipped rather than blocking an unrelated
+    operation.
 
     It costs a directory listing plus a read per file, which is why a caller does it once,
     up front, and takes everything it needs out of the same pass.
+
+    `file` is the relative path with its extension stripped — the value that round-trips
+    through `values_file_path` for the flat layout this service writes. It is *reported*,
+    never taken as input, so a hand-made file in a sub-directory yields a name that is not
+    addressable and that costs nothing.
     """
     base_branch = config.VAULT_VALUES_REPO_BASE_BRANCH
     values_dir = config.VAULT_VALUES_DIR
@@ -278,21 +243,24 @@ async def _walk_values_files(bitbucket: Any) -> AsyncIterator[Tuple[str, Any]]:
             raise
         except yaml.YAMLError:
             logger.warning(f"Skipping unparseable values file: {path}")
+            if skipped is not None:
+                skipped.append(path)
             continue
 
-        yield path, parsed
+        yield relative_path.lstrip("/").rsplit(".", 1)[0], path, parsed
 
 
 async def _assert_name_is_free(bitbucket: Any, kv_name: str, file: str) -> None:
     """Reject a create whose store name is already used **anywhere** in the values dir.
 
-    Store names are global to Vault, so uniqueness cannot be scoped to one file.
+    Store names are global to Vault, so uniqueness cannot be scoped to one file — and that
+    same global uniqueness is what lets every other route address a store by name alone.
 
     This is a check, not a lock: two creates in flight both pass it, and the second pull
     request then conflicts at merge. That is the same race the whole GitOps flow already
     has, and a human resolves it.
     """
-    async for path, parsed in _walk_values_files(bitbucket):
+    async for _, path, parsed in _walk_values_files(bitbucket):
         if kv_name in kv_store_names(parsed):
             raise VaultOperationError(
                 f"{kv_name} already exists (defined in {path} on "
@@ -301,6 +269,59 @@ async def _assert_name_is_free(bitbucket: Any, kv_name: str, file: str) -> None:
                 file=file,
                 status_code=409,
             )
+
+
+async def _resolve_store(
+    bitbucket: Any, kv_name: str
+) -> Tuple[str, str, Dict[str, Any], Dict[str, Any]]:
+    """Find the store named `kv_name`: its file, path, whole document and own entry.
+
+    **This is why no route but the create mentions a file.** A store name is unique across
+    the entire values directory — the create enforces exactly that — so the name alone
+    addresses a store, and a caller never has to remember which file it was grouped into.
+
+    Two steps, because the common case should not pay for the general one:
+
+    1. try `<values dir>/<kv_name>.yaml`, the file a create with no `file` writes. One read,
+       and it answers for every store created the normal way. It still has to *find* the
+       store inside: a file may be named after one store while holding another.
+    2. otherwise walk the directory, which is what finds a store grouped into a file under
+       somebody else's name.
+
+    A store that is in no file at all is the 404 — the same answer `GET`/`PATCH`/`DELETE`
+    have always given for a store that is not there.
+    """
+    values_dir = config.VAULT_VALUES_DIR
+    conventional_path = values_file_path(values_dir, kv_name)
+
+    document = await _read_document(bitbucket, conventional_path, kv_name, kv_name)
+    if document is not None:
+        store = find_kv_store(document, kv_name)
+        if store is not None:
+            return kv_name, conventional_path, document, store
+
+    skipped: List[str] = []
+    async for file, path, parsed in _walk_values_files(bitbucket, skipped=skipped):
+        if path == conventional_path or not isinstance(parsed, dict):
+            continue
+        store = find_kv_store(parsed, kv_name)
+        if store is not None:
+            return file, path, parsed, store
+
+    # A file the walk could not parse might be the very one holding the store, and "not
+    # defined anywhere" would send an operator looking for the wrong problem. The
+    # conventional path does not need this — `_read_document` reports its own YAML error.
+    unreadable = (
+        f" ({len(skipped)} unparseable file(s) skipped: {', '.join(skipped)})"
+        if skipped
+        else ""
+    )
+    raise VaultOperationError(
+        f"{kv_name} is not defined in any file under {values_dir} on "
+        f"{config.VAULT_VALUES_REPO_BASE_BRANCH}{unreadable}",
+        kv_name=kv_name,
+        status_code=404,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -360,7 +381,6 @@ async def _open_pull_request(
 
 async def _commit_via_pull_request(
     bitbucket: Any,
-    woodpecker: Any,
     *,
     path: str,
     content: str,
@@ -369,7 +389,7 @@ async def _commit_via_pull_request(
     description: str,
     kv_name: str = "",
     source_commit_id: Optional[str] = None,
-) -> Tuple[PullRequest, Pipeline, Pipeline]:
+) -> Tuple[PullRequest, List[BuildStatus], List[BuildStatus]]:
     """branch -> commit -> PR -> gate 1 -> merge -> gate 2, with every rollback.
 
     Shared by every mutating flow — stores and bindings alike: the only thing that differs
@@ -377,14 +397,15 @@ async def _commit_via_pull_request(
     Keeping one implementation means the rollback asymmetry cannot drift between
     operations. `kv_name` is carried only so a failure names its subject.
 
-    Returns the merged pull request and both pipelines. Raises `VaultOperationError` for
-    every business failure, having already rolled back whatever is still safe to roll back.
+    Both gates ask Bitbucket which builds it holds for a commit. There is no watermark to
+    take before the branch is created: each gate names a commit that did not exist until
+    this request made it, so nothing older can be mistaken for ours.
+
+    Returns the merged pull request and both gates' builds. Raises `VaultOperationError`
+    for every business failure, having already rolled back whatever is still safe to roll
+    back.
     """
     base_branch = config.VAULT_VALUES_REPO_BASE_BRANCH
-
-    # Watermark before anything can trigger CI, so we never match a pre-existing pipeline.
-    # This has to precede the branch creation, hence not folding it into _open_pull_request.
-    baseline = await _latest_pipeline_number(woodpecker)
 
     # ---- 1-2. branch + commit + pull request ------------------------------- #
     pull_request = await _open_pull_request(
@@ -398,32 +419,40 @@ async def _commit_via_pull_request(
         source_commit_id=source_commit_id,
     )
 
-    # ---- 3. validation pipeline (blocks the merge) ------------------------- #
-    try:
-        validation = await woodpecker.await_pipeline(
-            pull_request_pipeline_matcher(branch, baseline)
-        )
-    except PipelineTimeoutError as timeout_error:
+    # ---- 3. validation build (blocks the merge) ---------------------------- #
+    if not pull_request.from_commit:
+        # Without the source commit there is no sha to ask about, and merging unvalidated
+        # is not an option — roll all the way back rather than degrade the gate.
         await _decline_and_cleanup(bitbucket, pull_request, branch)
         raise VaultOperationError(
-            f"Validation pipeline did not complete: {timeout_error.message}",
+            f"Bitbucket did not report a source commit for pull request "
+            f"{pull_request.id}, so its builds cannot be watched",
+            kv_name=kv_name,
+            pull_request=pull_request,
+        )
+
+    try:
+        validation = await bitbucket.await_builds(pull_request.from_commit)
+    except BuildTimeoutError as timeout_error:
+        await _decline_and_cleanup(bitbucket, pull_request, branch)
+        raise VaultOperationError(
+            f"Validation build did not complete: {timeout_error.message}",
             kv_name=kv_name,
             status_code=504,
             pull_request=pull_request,
-            validation_pipeline=timeout_error.pipeline,
+            validation_builds=timeout_error.builds,
         ) from timeout_error
 
-    if not validation.succeeded:
+    if not all(build.succeeded for build in validation):
         await _decline_and_cleanup(bitbucket, pull_request, branch)
         raise VaultOperationError(
-            _pipeline_failure("Validation", validation),
+            _build_failure("Validation", validation),
             kv_name=kv_name,
             pull_request=pull_request,
-            validation_pipeline=validation,
+            validation_builds=validation,
         )
 
     # ---- 4. merge (point of no return) ------------------------------------- #
-    merge_baseline = await _latest_pipeline_number(woodpecker)
     try:
         current = await bitbucket.get_pull_request(pull_request.id)
         merged = await bitbucket.merge_pull_request(current.id, current.version)
@@ -435,35 +464,52 @@ async def _commit_via_pull_request(
             f"{merge_error.detail}",
             kv_name=kv_name,
             pull_request=pull_request,
-            validation_pipeline=validation,
+            validation_builds=validation,
         ) from merge_error
 
     logger.info(f"Merged pull request {merged.id} for {kv_name}")
 
-    # ---- 5. deploy pipeline ------------------------------------------------ #
-    try:
-        deploy = await woodpecker.await_pipeline(
-            deploy_pipeline_matcher(base_branch, merged.merge_commit, merge_baseline)
-        )
-    except PipelineTimeoutError as timeout_error:
+    # ---- 5. deploy build --------------------------------------------------- #
+    deploy_commit = merged.merge_commit or await bitbucket.get_branch_head(base_branch)
+    if not deploy_commit:
         raise VaultOperationError(
-            f"Deploy pipeline did not complete: {timeout_error.message}. "
+            f"Pull request {merged.id} merged, but Bitbucket reported no commit on "
+            f"{base_branch} to watch the deploy build on",
+            kv_name=kv_name,
+            pull_request=merged,
+            validation_builds=validation,
+        )
+
+    # A fast-forward merge leaves the base branch on the very commit the pull request
+    # built, so its validation results are already sitting there. Skipping the keys gate 1
+    # saw is what makes this wait for the deploy build instead of re-reading gate 1.
+    already_seen: frozenset = (
+        frozenset(build.key for build in validation)
+        if deploy_commit == pull_request.from_commit
+        else frozenset()
+    )
+
+    try:
+        deploy = await bitbucket.await_builds(deploy_commit, exclude_keys=already_seen)
+    except BuildTimeoutError as timeout_error:
+        raise VaultOperationError(
+            f"Deploy build did not complete: {timeout_error.message}. "
             f"The change is already merged to {base_branch}.",
             kv_name=kv_name,
             status_code=504,
             pull_request=merged,
-            validation_pipeline=validation,
-            deploy_pipeline=timeout_error.pipeline,
+            validation_builds=validation,
+            deploy_builds=timeout_error.builds,
         ) from timeout_error
 
-    if not deploy.succeeded:
+    if not all(build.succeeded for build in deploy):
         raise VaultOperationError(
-            f"{_pipeline_failure('Deploy', deploy)}. "
+            f"{_build_failure('Deploy', deploy)}. "
             f"The change is already merged to {base_branch} and needs a revert.",
             kv_name=kv_name,
             pull_request=merged,
-            validation_pipeline=validation,
-            deploy_pipeline=deploy,
+            validation_builds=validation,
+            deploy_builds=deploy,
         )
 
     return merged, validation, deploy
@@ -519,7 +565,6 @@ async def _prepare_create(
 
 async def create_kv_mount_operation(
     bitbucket: Any,
-    woodpecker: Any,
     payload: VaultKVCreate,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
@@ -528,7 +573,6 @@ async def create_kv_mount_operation(
 
     merged, validation, deploy = await _commit_via_pull_request(
         bitbucket,
-        woodpecker,
         path=path,
         content=content,
         branch=_branch_for(payload.file, payload.kv_name, branch_suffix),
@@ -544,8 +588,8 @@ async def create_kv_mount_operation(
         kv_name=payload.kv_name,
         file=payload.file,
         pull_request=_pull_request_info(merged),
-        validation_pipeline=_pipeline_info(validation),
-        deploy_pipeline=_pipeline_info(deploy),
+        validation_builds=_build_infos(validation),
+        deploy_builds=_build_infos(deploy),
     )
 
 
@@ -609,35 +653,27 @@ async def _require_document(
 
 async def update_kv_mount_operation(
     bitbucket: Any,
-    woodpecker: Any,
-    file: str,
     kv_name: str,
     payload: VaultKVUpdate,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
     """Edit one store's description and/or roles. Its name and siblings are untouched.
 
+    The store is found by name — `_resolve_store` supplies the file, so the caller does
+    not name one and an unknown store is the 404 before any edit is attempted.
+
     An edit that changes nothing returns success without opening a pull request — the
     reason `yaml_data_equals` exists. That keeps repeat requests from filling the values
     repo with empty pull requests.
     """
-    path = values_file_path(config.VAULT_VALUES_DIR, file)
-    current = await _require_document(bitbucket, path, kv_name, file)
+    file, path, current, _ = await _resolve_store(bitbucket, kv_name)
 
-    try:
-        updated = update_kv_store(
-            current,
-            kv_name,
-            description=payload.kv_description,
-            roles=payload.roles,
-        )
-    except KVStoreNotFound as missing:
-        raise VaultOperationError(
-            f"{kv_name} is not defined in {path}",
-            kv_name=kv_name,
-            file=file,
-            status_code=404,
-        ) from missing
+    updated = update_kv_store(
+        current,
+        kv_name,
+        description=payload.kv_description,
+        roles=payload.roles,
+    )
 
     if yaml_data_equals(current, updated):
         logger.info(f"No change required for {kv_name}; skipping the pull request")
@@ -666,7 +702,6 @@ async def update_kv_mount_operation(
 
     merged, validation, deploy = await _commit_via_pull_request(
         bitbucket,
-        woodpecker,
         path=path,
         content=render_values_yaml(updated),
         branch=_branch_for(file, kv_name, branch_suffix),
@@ -687,8 +722,8 @@ async def update_kv_mount_operation(
         kv_name=kv_name,
         file=file,
         pull_request=_pull_request_info(merged),
-        validation_pipeline=_pipeline_info(validation),
-        deploy_pipeline=_pipeline_info(deploy),
+        validation_builds=_build_infos(validation),
+        deploy_builds=_build_infos(deploy),
     )
 
 
@@ -696,32 +731,22 @@ async def update_kv_mount_operation(
 # removing a store
 # --------------------------------------------------------------------------- #
 async def _prepare_delete(
-    bitbucket: Any, file: str, kv_name: str
-) -> Tuple[str, str, Optional[str]]:
-    """Everything a delete needs before it touches a branch.
+    bitbucket: Any, kv_name: str
+) -> Tuple[str, str, str, Optional[str]]:
+    """Everything a delete needs before it touches a branch, the file included.
 
     The counterpart of `_prepare_create`, and shared by both delete paths for the same
-    reason: they cannot then disagree about what is a 404.
+    reason: they cannot then disagree about what is a 404. `_resolve_store` is that 404 —
+    a store in no file cannot be deleted, and the caller never named a file to be wrong
+    about.
 
-    Unlike a create it runs **no scan at all**. Uniqueness is a create-only concern, and
-    there is nothing referential to check: a store's Kubernetes service accounts are nested
-    inside it, so removing the store removes its bindings in the same diff and no reference
-    is left dangling anywhere in the values directory. There is no `yaml_data_equals` short
-    circuit either — if `remove_kv_store` did not raise, the document changed. A removal is
-    never a no-op.
+    It still runs **no referential scan**: a store's Kubernetes service accounts are
+    nested inside it, so removing the store removes its bindings in the same diff and no
+    reference is left dangling. There is no `yaml_data_equals` short circuit either — if
+    `remove_kv_store` did not raise, the document changed. A removal is never a no-op.
     """
-    path = values_file_path(config.VAULT_VALUES_DIR, file)
-    current = await _require_document(bitbucket, path, kv_name, file)
-
-    try:
-        updated = remove_kv_store(current, kv_name)
-    except KVStoreNotFound as missing:
-        raise VaultOperationError(
-            f"{kv_name} is not defined in {path}",
-            kv_name=kv_name,
-            file=file,
-            status_code=404,
-        ) from missing
+    file, path, current, _ = await _resolve_store(bitbucket, kv_name)
+    updated = remove_kv_store(current, kv_name)
 
     # The file exists by definition here, so the write is an edit and Bitbucket wants the
     # optimistic-lock token for that path.
@@ -729,7 +754,7 @@ async def _prepare_delete(
         path, at=config.VAULT_VALUES_REPO_BASE_BRANCH
     )
 
-    return path, render_values_yaml(updated), source_commit_id
+    return file, path, render_values_yaml(updated), source_commit_id
 
 
 def _delete_description(path: str, kv_name: str) -> str:
@@ -743,8 +768,6 @@ def _delete_description(path: str, kv_name: str) -> str:
 
 async def delete_kv_store_operation(
     bitbucket: Any,
-    woodpecker: Any,
-    file: str,
     kv_name: str,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
@@ -758,11 +781,10 @@ async def delete_kv_store_operation(
     merge is the point of no return here too — a deploy pipeline that fails after a delete
     is reported, and the message says the removal already needs a revert.
     """
-    path, content, source_commit_id = await _prepare_delete(bitbucket, file, kv_name)
+    file, path, content, source_commit_id = await _prepare_delete(bitbucket, kv_name)
 
     merged, validation, deploy = await _commit_via_pull_request(
         bitbucket,
-        woodpecker,
         path=path,
         content=content,
         branch=_branch_for(file, kv_name, branch_suffix),
@@ -778,14 +800,13 @@ async def delete_kv_store_operation(
         kv_name=kv_name,
         file=file,
         pull_request=_pull_request_info(merged),
-        validation_pipeline=_pipeline_info(validation),
-        deploy_pipeline=_pipeline_info(deploy),
+        validation_builds=_build_infos(validation),
+        deploy_builds=_build_infos(deploy),
     )
 
 
 async def delete_kv_store_pull_request_operation(
     bitbucket: Any,
-    file: str,
     kv_name: str,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
@@ -799,7 +820,7 @@ async def delete_kv_store_pull_request_operation(
     call opens a second pull request for the same removal, for the same reason a repeat
     PR-only create does.
     """
-    path, content, source_commit_id = await _prepare_delete(bitbucket, file, kv_name)
+    file, path, content, source_commit_id = await _prepare_delete(bitbucket, kv_name)
 
     pull_request = await _open_pull_request(
         bitbucket,
@@ -833,21 +854,9 @@ async def get_kv_file_operation(bitbucket: Any, file: str) -> Dict[str, Any]:
     return await _require_document(bitbucket, path, kv_name="", file=file)
 
 
-async def get_kv_store_operation(
-    bitbucket: Any, file: str, kv_name: str
-) -> Dict[str, Any]:
-    """One store out of a values file."""
-    path = values_file_path(config.VAULT_VALUES_DIR, file)
-    document = await _require_document(bitbucket, path, kv_name, file)
-
-    store = find_kv_store(document, kv_name)
-    if store is None:
-        raise VaultOperationError(
-            f"{kv_name} is not defined in {path}",
-            kv_name=kv_name,
-            file=file,
-            status_code=404,
-        )
+async def get_kv_store_operation(bitbucket: Any, kv_name: str) -> Dict[str, Any]:
+    """One store, found by name wherever it lives."""
+    _, _, _, store = await _resolve_store(bitbucket, kv_name)
     return store
 
 
@@ -900,37 +909,16 @@ def _k8s_sa_description(
     )
 
 
-async def _require_store(
-    bitbucket: Any, path: str, file: str, kv_name: str
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """The parsed document and the one store inside it, or a 404 for whichever is missing.
-
-    Both binding operations start here, which is why "unknown file" and "unknown store"
-    cannot answer differently between adding and removing one.
-    """
-    document = await _require_document(bitbucket, path, kv_name, file)
-
-    store = find_kv_store(document, kv_name)
-    if store is None:
-        raise VaultOperationError(
-            f"{kv_name} is not defined in {path}",
-            kv_name=kv_name,
-            file=file,
-            status_code=404,
-        )
-    return document, store
-
-
 async def _prepare_k8s_sa_add(
-    bitbucket: Any, file: str, kv_name: str, payload: K8sServiceAccountCreate
-) -> Tuple[str, str, Optional[str], K8sServiceAccountIdentity]:
-    """Everything adding a binding needs before it touches a branch.
+    bitbucket: Any, kv_name: str, payload: K8sServiceAccountCreate
+) -> Tuple[str, str, str, Optional[str], K8sServiceAccountIdentity]:
+    """Everything adding a binding needs before it touches a branch, the file included.
 
     Shared by the blocking path and its PR-only twin, the same way `_prepare_create` is, so
-    the two cannot disagree about what is a 404 and what is a 409.
+    the two cannot disagree about what is a 404 and what is a 409. A binding is addressed
+    through its store, so it inherits the store's "found by name" rule for free.
     """
-    path = values_file_path(config.VAULT_VALUES_DIR, file)
-    document, store = await _require_store(bitbucket, path, file, kv_name)
+    file, path, document, store = await _resolve_store(bitbucket, kv_name)
 
     account = build_k8s_service_account(
         payload.service_account, payload.namespace, payload.cluster
@@ -955,19 +943,18 @@ async def _prepare_k8s_sa_add(
         path, at=config.VAULT_VALUES_REPO_BASE_BRANCH
     )
 
-    return path, render_values_yaml(updated), source_commit_id, identity
+    return file, path, render_values_yaml(updated), source_commit_id, identity
 
 
 async def _prepare_k8s_sa_remove(
-    bitbucket: Any, file: str, kv_name: str, identity: K8sServiceAccountIdentity
-) -> Tuple[str, str, Optional[str]]:
-    """Everything removing a binding needs before it touches a branch.
+    bitbucket: Any, kv_name: str, identity: K8sServiceAccountIdentity
+) -> Tuple[str, str, str, Optional[str]]:
+    """Everything removing a binding needs before it touches a branch, the file included.
 
     No `yaml_data_equals` short circuit, for the same reason a store delete has none: if
     `remove_k8s_service_account` did not raise, the document changed.
     """
-    path = values_file_path(config.VAULT_VALUES_DIR, file)
-    document, _ = await _require_store(bitbucket, path, file, kv_name)
+    file, path, document, _ = await _resolve_store(bitbucket, kv_name)
 
     try:
         updated = remove_k8s_service_account(document, kv_name, identity)
@@ -983,25 +970,22 @@ async def _prepare_k8s_sa_remove(
         path, at=config.VAULT_VALUES_REPO_BASE_BRANCH
     )
 
-    return path, render_values_yaml(updated), source_commit_id
+    return file, path, render_values_yaml(updated), source_commit_id
 
 
 async def add_k8s_service_account_operation(
     bitbucket: Any,
-    woodpecker: Any,
-    file: str,
     kv_name: str,
     payload: K8sServiceAccountCreate,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
     """Bind a service account to a store, then block until both pipelines have finished."""
-    path, content, source_commit_id, identity = await _prepare_k8s_sa_add(
-        bitbucket, file, kv_name, payload
+    file, path, content, source_commit_id, identity = await _prepare_k8s_sa_add(
+        bitbucket, kv_name, payload
     )
 
     merged, validation, deploy = await _commit_via_pull_request(
         bitbucket,
-        woodpecker,
         path=path,
         content=content,
         branch=_k8s_sa_branch_for(file, kv_name, branch_suffix),
@@ -1019,14 +1003,13 @@ async def add_k8s_service_account_operation(
         kv_name=kv_name,
         file=file,
         pull_request=_pull_request_info(merged),
-        validation_pipeline=_pipeline_info(validation),
-        deploy_pipeline=_pipeline_info(deploy),
+        validation_builds=_build_infos(validation),
+        deploy_builds=_build_infos(deploy),
     )
 
 
 async def add_k8s_service_account_pull_request_operation(
     bitbucket: Any,
-    file: str,
     kv_name: str,
     payload: K8sServiceAccountCreate,
     branch_suffix: Optional[str] = None,
@@ -1038,8 +1021,8 @@ async def add_k8s_service_account_pull_request_operation(
     waited on), and a repeat call opens a second pull request because the first is not on
     the base branch for the duplicate check to see.
     """
-    path, content, source_commit_id, identity = await _prepare_k8s_sa_add(
-        bitbucket, file, kv_name, payload
+    file, path, content, source_commit_id, identity = await _prepare_k8s_sa_add(
+        bitbucket, kv_name, payload
     )
 
     pull_request = await _open_pull_request(
@@ -1070,8 +1053,6 @@ async def add_k8s_service_account_pull_request_operation(
 
 async def remove_k8s_service_account_operation(
     bitbucket: Any,
-    woodpecker: Any,
-    file: str,
     kv_name: str,
     identity: K8sServiceAccountIdentity,
     branch_suffix: Optional[str] = None,
@@ -1081,14 +1062,13 @@ async def remove_k8s_service_account_operation(
     Removing the store's last binding drops the `k8sServiceAccounts` key entirely, leaving
     the store exactly as a fresh create would have written it.
     """
-    path, content, source_commit_id = await _prepare_k8s_sa_remove(
-        bitbucket, file, kv_name, identity
+    file, path, content, source_commit_id = await _prepare_k8s_sa_remove(
+        bitbucket, kv_name, identity
     )
 
     service_account, _, _ = identity
     merged, validation, deploy = await _commit_via_pull_request(
         bitbucket,
-        woodpecker,
         path=path,
         content=content,
         branch=_k8s_sa_branch_for(file, kv_name, branch_suffix),
@@ -1106,21 +1086,20 @@ async def remove_k8s_service_account_operation(
         kv_name=kv_name,
         file=file,
         pull_request=_pull_request_info(merged),
-        validation_pipeline=_pipeline_info(validation),
-        deploy_pipeline=_pipeline_info(deploy),
+        validation_builds=_build_infos(validation),
+        deploy_builds=_build_infos(deploy),
     )
 
 
 async def remove_k8s_service_account_pull_request_operation(
     bitbucket: Any,
-    file: str,
     kv_name: str,
     identity: K8sServiceAccountIdentity,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
     """Open the pull request that removes the binding, and stop — no CI gates, no merge."""
-    path, content, source_commit_id = await _prepare_k8s_sa_remove(
-        bitbucket, file, kv_name, identity
+    file, path, content, source_commit_id = await _prepare_k8s_sa_remove(
+        bitbucket, kv_name, identity
     )
 
     service_account, _, _ = identity
@@ -1151,13 +1130,12 @@ async def remove_k8s_service_account_pull_request_operation(
 
 
 async def get_k8s_service_accounts_operation(
-    bitbucket: Any, file: str, kv_name: str
+    bitbucket: Any, kv_name: str
 ) -> List[Dict[str, Any]]:
     """Every binding on one store.
 
     A store that binds nothing answers 200 with an empty list — it simply has no
-    `k8sServiceAccounts` key. Only a missing file or a missing store is a 404.
+    `k8sServiceAccounts` key. Only a store that is in no file at all is a 404.
     """
-    path = values_file_path(config.VAULT_VALUES_DIR, file)
-    _, store = await _require_store(bitbucket, path, file, kv_name)
+    _, _, _, store = await _resolve_store(bitbucket, kv_name)
     return k8s_service_accounts(store)

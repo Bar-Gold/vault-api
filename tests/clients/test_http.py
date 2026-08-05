@@ -10,7 +10,6 @@ from tashtiot_apis_library.connectors import ExternalServiceError
 
 from app.clients import http
 from app.clients.bitbucket import BitbucketClient
-from app.clients.woodpecker import WoodpeckerClient
 
 BASE = "https://service.test"
 
@@ -78,7 +77,7 @@ async def test_default_detail_extraction_for_json_and_text(client):
 
 
 # --------------------------------------------------------------------------- #
-# both real clients inherit the mapping
+# the real client inherits the mapping — on reads and on the CI gates alike
 # --------------------------------------------------------------------------- #
 @respx.mock
 async def test_bitbucket_unreachable_is_a_bad_gateway_not_a_crash():
@@ -99,16 +98,22 @@ async def test_bitbucket_unreachable_is_a_bad_gateway_not_a_crash():
 
 
 @respx.mock
-async def test_woodpecker_unreachable_is_a_bad_gateway_not_a_crash():
-    respx.get("https://woodpecker.test/api/repos/42/pipelines").mock(
-        side_effect=httpx.ConnectError("getaddrinfo failed")
-    )
-    woodpecker = WoodpeckerClient(
-        httpx.AsyncClient(base_url="https://woodpecker.test"), repo_id="42", poll_interval=0
+async def test_an_unreachable_build_status_read_is_a_bad_gateway_too():
+    """The gates go through the same funnel, so a dead Bitbucket is a 502 mid-chain."""
+    respx.get(
+        "https://bitbucket.test/rest/api/1.0/projects/INFRA/repos/vault-values"
+        "/commits/deadbeef/builds"
+    ).mock(side_effect=httpx.ReadTimeout("read timed out"))
+    bitbucket = BitbucketClient(
+        httpx.AsyncClient(base_url="https://bitbucket.test"),
+        project_key="INFRA",
+        repo_slug="vault-values",
+        poll_interval=0,
     )
 
     with pytest.raises(ExternalServiceError) as exc_info:
-        await woodpecker.list_pipelines()
+        await bitbucket.get_build_statuses("deadbeef")
 
-    assert exc_info.value.status_code == 502
-    assert exc_info.value.service_name == "woodpecker"
+    # 504 rather than 502: routes.py keys off exactly this to answer 504.
+    assert exc_info.value.status_code == 504
+    assert exc_info.value.service_name == "bitbucket"

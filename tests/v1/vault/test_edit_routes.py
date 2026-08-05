@@ -1,20 +1,21 @@
 """The update and read endpoints end-to-end: auth, routing, status codes.
 
-Also where the two-segment `{file}/{kv_name}` routing is exercised over HTTP, since a
-single-segment read (`/{file}`) and a two-segment one must not shadow each other.
+Also where the routing is exercised over HTTP: a store is one segment (`/{kv_name}`)
+and the whole-file read is two (`/files/{file}`), and neither may shadow the other.
 """
 import yaml
 
 from app.helpers import build_kv_store, build_kv_stores_document, render_values_yaml
 from app.v1.vault.conf import config
+from tests.fakes import failing
 
 KV = "myapp"
 FILE = "payments"
 VALUES_PATH = "kv/payments.yaml"
 ROLES = {"read": ["app01.corp.example.com"]}
 
-FILE_URL = f"{config.API_PREFIX}/{FILE}"
-STORE_URL = f"{config.API_PREFIX}/{FILE}/{KV}"
+FILE_URL = f"{config.API_PREFIX}/files/{FILE}"
+STORE_URL = f"{config.API_PREFIX}/{KV}"
 
 
 def _seed(bitbucket, *names, path=VALUES_PATH, description="payments secrets"):
@@ -76,13 +77,13 @@ def test_update_can_replace_roles(client, auth_headers, bitbucket):
     }
 
 
-def test_update_of_a_missing_file_returns_404(client, auth_headers):
+def test_update_of_a_store_in_no_file_returns_404(client, auth_headers):
     response = client.patch(
         STORE_URL, json={"kv_description": "x"}, headers=auth_headers
     )
 
     assert response.status_code == 404
-    assert "does not exist" in response.json()["error"]
+    assert "is not defined in any file" in response.json()["error"]
 
 
 def test_update_of_a_missing_store_returns_404(client, auth_headers, bitbucket):
@@ -124,18 +125,16 @@ def test_update_no_op_returns_200_without_a_pull_request(client, auth_headers, b
     assert response.json()["pull_request"] is None
 
 
-def test_update_failed_validation_returns_502(client, auth_headers, bitbucket, woodpecker):
-    from tests.fakes import make_pipeline
-
+def test_update_failed_validation_returns_502(client, auth_headers, bitbucket):
     _seed(bitbucket, KV)
-    woodpecker.results = [make_pipeline(number=2, status="failure", event="pull_request")]
+    bitbucket.builds = [failing()]
 
     response = client.patch(
         STORE_URL, json={"kv_description": "new"}, headers=auth_headers
     )
 
     assert response.status_code == 502
-    assert "Validation pipeline #2" in response.json()["error"]
+    assert "Validation did not pass" in response.json()["error"]
     assert "decline_pull_request" in bitbucket.calls
 
 
@@ -163,7 +162,7 @@ def test_reading_a_store_returns_just_that_entry(client, auth_headers, bitbucket
     assert "kvStores" not in body
 
 
-def test_reading_a_missing_file_returns_404(client, auth_headers):
+def test_reading_a_store_in_no_file_returns_404(client, auth_headers):
     assert client.get(f"{config.API_PREFIX}/nope", headers=auth_headers).status_code == 404
 
 
@@ -174,7 +173,7 @@ def test_reading_a_missing_store_returns_404(client, auth_headers, bitbucket):
 
 
 def test_the_two_route_shapes_do_not_shadow_each_other(client, auth_headers, bitbucket):
-    """`/{file}` and `/{file}/{kv_name}` must both resolve to their own handler."""
+    """`/files/{file}` and `/{kv_name}` must both resolve to their own handler."""
     _seed(bitbucket, KV)
 
     whole_file = client.get(FILE_URL, headers=auth_headers).json()

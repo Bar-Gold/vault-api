@@ -63,25 +63,23 @@ class VaultV1StaticSettings(BaseSettings):
         description="Bitbucket usernames added as reviewers on every opened pull request.",
     )
 
-    # --- Woodpecker CI ---
-    WOODPECKER_REPO_ID: str = Field(
-        ...,
-        description="Woodpecker's numeric repo id (or owner/name) for the Vault values repo.",
-    )
-
+    # --- CI gates ---
+    # Read from Bitbucket's build-status store (the pull request's Builds tab), not from
+    # the CI server, so there is no CI repo id or token to configure. The names still say
+    # PIPELINE because that is what is being waited on; only the place we ask has changed.
     CI_POLL_INTERVAL_SECONDS: float = Field(
         default=5.0,
-        description="How often to poll Woodpecker for pipeline state.",
+        description="How often to re-read a commit's build statuses from Bitbucket.",
     )
 
     CI_PIPELINE_START_TIMEOUT_SECONDS: float = Field(
         default=120.0,
-        description="How long to wait for a pipeline to appear after opening/merging the PR.",
+        description="How long to wait for the first build to be reported against a commit.",
     )
 
     CI_PIPELINE_TIMEOUT_SECONDS: float = Field(
         default=900.0,
-        description="How long to wait for a running pipeline to reach a terminal status.",
+        description="How long to wait for a commit's builds to leave INPROGRESS.",
     )
 
 

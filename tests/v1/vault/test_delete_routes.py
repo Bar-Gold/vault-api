@@ -1,7 +1,7 @@
 """The delete endpoints end-to-end, plus the path-parameter validation they share.
 
-Two shapes live on the same prefix here — `/{file}/{kv_name}` and
-`/{file}/{kv_name}/pull-request` — so the routing tests matter as much as the status codes.
+Two shapes live on the same prefix here — `/{kv_name}` and `/{kv_name}/pull-request` — so
+the routing tests matter as much as the status codes.
 """
 import yaml
 
@@ -12,15 +12,15 @@ from app.helpers import (
     render_values_yaml,
 )
 from app.v1.vault.conf import config
-from tests.fakes import make_pipeline
+from tests.fakes import failing
 
 KV = "myapp"
 FILE = "payments"
 VALUES_PATH = "kv/payments.yaml"
 ROLES = {"read": ["app01.corp.example.com"]}
 
-FILE_URL = f"{config.API_PREFIX}/{FILE}"
-STORE_URL = f"{config.API_PREFIX}/{FILE}/{KV}"
+FILE_URL = f"{config.API_PREFIX}/files/{FILE}"
+STORE_URL = f"{config.API_PREFIX}/{KV}"
 DELETE_PR_URL = f"{STORE_URL}/pull-request"
 
 
@@ -74,11 +74,11 @@ def test_deleting_the_last_store_leaves_the_file_with_an_empty_list(
     assert _committed(bitbucket) == {"kvStores": []}
 
 
-def test_delete_of_a_missing_file_returns_404(client, auth_headers):
+def test_delete_of_a_store_in_no_file_returns_404(client, auth_headers):
     response = client.delete(STORE_URL, headers=auth_headers)
 
     assert response.status_code == 404
-    assert "does not exist" in response.json()["error"]
+    assert "is not defined in any file" in response.json()["error"]
 
 
 def test_delete_of_a_missing_store_returns_404(client, auth_headers, bitbucket):
@@ -104,14 +104,14 @@ def test_deleting_a_bound_store_succeeds(client, auth_headers, bitbucket):
     assert _committed(bitbucket) == {"kvStores": []}
 
 
-def test_delete_failed_validation_returns_502(client, auth_headers, bitbucket, woodpecker):
+def test_delete_failed_validation_returns_502(client, auth_headers, bitbucket):
     _seed(bitbucket, KV)
-    woodpecker.results = [make_pipeline(number=2, status="failure", event="pull_request")]
+    bitbucket.builds = [failing()]
 
     response = client.delete(STORE_URL, headers=auth_headers)
 
     assert response.status_code == 502
-    assert "Validation pipeline #2" in response.json()["error"]
+    assert "Validation did not pass" in response.json()["error"]
     assert "decline_pull_request" in bitbucket.calls
 
 
@@ -131,7 +131,7 @@ def test_delete_upstream_timeout_returns_504(client, auth_headers, bitbucket):
 # delete /pull-request
 # --------------------------------------------------------------------------- #
 def test_delete_pull_request_only_returns_201_and_leaves_the_pr_open(
-    client, auth_headers, bitbucket, woodpecker
+    client, auth_headers, bitbucket
 ):
     _seed(bitbucket, KV)
 
@@ -141,10 +141,10 @@ def test_delete_pull_request_only_returns_201_and_leaves_the_pr_open(
     body = response.json()
     assert body["status"] == "Succeeded"
     assert body["pull_request"]["state"] == "OPEN"
-    assert body["validation_pipeline"] is None
-    assert body["deploy_pipeline"] is None
-    # The fake raises if a pipeline is awaited unscripted; assert Woodpecker was never used.
-    assert woodpecker.calls == []
+    assert body["validation_builds"] is None
+    assert body["deploy_builds"] is None
+    # Not "the gate passed" — the gate was never opened at all.
+    assert "await_builds" not in bitbucket.calls
 
 
 def test_delete_pull_request_only_of_a_missing_store_returns_404(
@@ -156,7 +156,7 @@ def test_delete_pull_request_only_of_a_missing_store_returns_404(
 
 
 def test_the_two_delete_shapes_do_not_shadow_each_other(client, auth_headers, bitbucket):
-    """Three segments must reach the PR-only route, two the blocking one."""
+    """Two segments must reach the PR-only route, one the blocking one."""
     _seed(bitbucket, KV, "pull-request")
 
     pr_only = client.delete(DELETE_PR_URL, headers=auth_headers)
@@ -167,10 +167,14 @@ def test_the_two_delete_shapes_do_not_shadow_each_other(client, auth_headers, bi
 
 
 def test_a_store_named_pull_request_is_still_addressable(client, auth_headers, bitbucket):
-    """`pull-request` is a legal store name; only the third segment is fixed."""
+    """`pull-request` is a legal store name, and one segment beats two.
+
+    `DELETE /pull-request` is the store; `DELETE /pull-request/pull-request` would be the
+    PR-only removal of it.
+    """
     _seed(bitbucket, "pull-request")
 
-    response = client.delete(f"{FILE_URL}/pull-request", headers=auth_headers)
+    response = client.delete(f"{config.API_PREFIX}/pull-request", headers=auth_headers)
 
     assert response.status_code == 200
     assert response.json()["kv_name"] == "pull-request"
@@ -179,31 +183,32 @@ def test_a_store_named_pull_request_is_still_addressable(client, auth_headers, b
 # --------------------------------------------------------------------------- #
 # path parameters
 #
-# `file` and `kv_name` are pattern-checked in the URI exactly as they are in a create body.
-# Nothing here is currently exploitable — Starlette's path convertor already refuses a
-# slash — but an unchecked `file` surfaces as an opaque Bitbucket 404 instead of a 422.
+# `kv_name` is pattern-checked in the URI exactly as it is in a create body, and so is
+# `file` on the one route that still takes one. Nothing here is currently exploitable —
+# Starlette's path convertor already refuses a slash — but an unchecked `file` surfaces
+# as an opaque Bitbucket 404 instead of a 422.
 # --------------------------------------------------------------------------- #
 def test_a_malformed_file_is_422_not_404(client, auth_headers, bitbucket):
-    response = client.delete(f"{config.API_PREFIX}/Not_A_File/{KV}", headers=auth_headers)
+    response = client.get(f"{config.API_PREFIX}/files/Not_A_File", headers=auth_headers)
 
     assert response.status_code == 422
     assert bitbucket.calls == []
 
 
 def test_a_malformed_kv_name_is_422(client, auth_headers, bitbucket):
-    response = client.delete(f"{FILE_URL}/Not_A_Name", headers=auth_headers)
+    response = client.delete(f"{config.API_PREFIX}/Not_A_Name", headers=auth_headers)
 
     assert response.status_code == 422
     assert bitbucket.calls == []
 
 
 def test_a_traversing_file_never_reaches_bitbucket(client, auth_headers, bitbucket):
-    """`file` is the only path parameter that reaches a filesystem path.
+    """`file` is still the path parameter that reaches a filesystem path.
 
     Percent-encoded because an HTTP client collapses a literal `..` out of the URL before
     it is ever sent — this is the form that actually arrives at the route.
     """
-    response = client.get(f"{config.API_PREFIX}/%2e%2e", headers=auth_headers)
+    response = client.get(f"{config.API_PREFIX}/files/%2e%2e", headers=auth_headers)
 
     assert response.status_code == 422
     assert bitbucket.calls == []
@@ -211,13 +216,18 @@ def test_a_traversing_file_never_reaches_bitbucket(client, auth_headers, bitbuck
 
 def test_the_read_routes_are_validated_too(client, auth_headers, bitbucket):
     assert client.get(f"{config.API_PREFIX}/UPPER", headers=auth_headers).status_code == 422
-    assert client.get(f"{FILE_URL}/UPPER", headers=auth_headers).status_code == 422
+    assert (
+        client.get(f"{config.API_PREFIX}/files/UPPER", headers=auth_headers).status_code
+        == 422
+    )
     assert bitbucket.calls == []
 
 
 def test_the_update_route_is_validated_too(client, auth_headers, bitbucket):
     response = client.patch(
-        f"{FILE_URL}/Not_A_Name", json={"kv_description": "x"}, headers=auth_headers
+        f"{config.API_PREFIX}/Not_A_Name",
+        json={"kv_description": "x"},
+        headers=auth_headers,
     )
 
     assert response.status_code == 422

@@ -8,7 +8,6 @@ from tashtiot_apis_library.fastapi_template._internal.utils import settings as l
 from tashtiot_apis_library.fastapi_template.utils import BaseAPI
 
 from .clients.bitbucket import BitbucketClient
-from .clients.woodpecker import WoodpeckerClient
 from .global_conf import global_config
 from .v1.vault.conf import config as vault_config
 from .v1.vault.routes import get_v1_vault_router
@@ -65,6 +64,8 @@ def create_app() -> FastAPI:
     _replace_docs_route(app)
 
     # Configure external services objects. Connectors are built once here, never per-request.
+    # Bitbucket is the only upstream: it holds the values repo *and* the build statuses the
+    # CI gates read, so there is no second client and no CI-server credentials to carry.
     bitbucket_http = BaseAPI(
         global_config.BITBUCKET_URL,
         headers={"Authorization": f"Bearer {global_config.BITBUCKET_TOKEN}"},
@@ -75,17 +76,6 @@ def create_app() -> FastAPI:
         bitbucket_http,
         project_key=vault_config.VAULT_VALUES_REPO_PROJECT_KEY,
         repo_slug=vault_config.VAULT_VALUES_REPO_SLUG,
-    )
-
-    woodpecker_http = BaseAPI(
-        global_config.WOODPECKER_URL,
-        headers={"Authorization": f"Bearer {global_config.WOODPECKER_TOKEN}"},
-        timeout=global_config.HTTP_TIMEOUT_SECONDS,
-        verify=global_config.VERIFY_SSL,
-    ).client
-    woodpecker = WoodpeckerClient(
-        woodpecker_http,
-        repo_id=vault_config.WOODPECKER_REPO_ID,
         poll_interval=vault_config.CI_POLL_INTERVAL_SECONDS,
         start_timeout=vault_config.CI_PIPELINE_START_TIMEOUT_SECONDS,
         completion_timeout=vault_config.CI_PIPELINE_TIMEOUT_SECONDS,
@@ -93,7 +83,7 @@ def create_app() -> FastAPI:
 
     # Add routes to app. One router: Kubernetes service accounts are a sub-resource of a KV
     # store, not a resource kind of their own, so they hang off these same paths.
-    app.include_router(get_v1_vault_router(bitbucket, woodpecker))
+    app.include_router(get_v1_vault_router(bitbucket))
 
     return app
 

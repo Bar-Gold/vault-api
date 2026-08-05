@@ -8,13 +8,14 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 _SEGMENT = r"[a-z0-9]+(?:-[a-z0-9]+)*"
 
 # The values file a store lives in: `kv/{file}.yaml`. This is the **path-traversal guard**,
-# not just a style rule — it is the only request field that reaches the filesystem path. No
-# slash, so no directory can be escaped or created, and `..` cannot match.
+# not just a style rule — it is the only value that reaches the filesystem path, on the one
+# optional create field and the one read route that still names a file. No slash, so no
+# directory can be escaped or created, and `..` cannot match.
 FILE_PATTERN = rf"^{_SEGMENT}$"
 
-# A store's name. Single-segment because the routes address a store as `{file}/{kv_name}`,
-# and a slash here would make that split ambiguous. Unlike `file`, this never reaches a
-# path — it is a value inside the document.
+# A store's name. Single-segment because it *is* the address every route but the whole-file
+# read uses (`/{kv_name}`), and a slash would turn one store into two path segments. Unlike
+# `file`, this never reaches a filesystem path — it is a value inside the document.
 KV_NAME_PATTERN = rf"^{_SEGMENT}$"
 
 # The role keys the committed document may carry.
@@ -120,21 +121,36 @@ class OperationStatus(str, Enum):
     FAILED = "Failed"
 
 
+# Every request model below sets `extra: "forbid"`. Pydantic's default is to ignore an
+# unrecognised field, which reads as success: a caller who sent `environment` or mistyped
+# `file` would get a 201 and a store built from something other than what they asked for.
+# `file` being optional is what makes that sharp — a typo no longer fails on a missing
+# required field, it silently falls back to naming the file after the store.
 class VaultKVCreate(BaseModel):
-    """A create request: which file, the store's name, what it is for, and who reaches it.
+    """A create request: the store's name, what it is for, who reaches it — and optionally
+    which file to group it into.
 
     This service appends an entry to a values file and reports what the pipelines did with
     it. What the KV *means* — mounts, engine version, policies — is the deploy pipeline's
     business, so none of it is modelled here.
+
+    **`file` is the only optional field, and omitting it is the normal case.** A caller
+    should not have to remember which file their store lives in, so leaving it out names
+    the file after the store (`kv/<kv_name>.yaml`). It is still accepted for grouping
+    several stores into one file, which the format is built for. Either way this is the
+    *only* request that mentions a file at all: every other route addresses a store by name
+    alone, because store names are unique across the whole values directory.
     """
 
     # Without an explicit example, Swagger UI synthesises one from `pattern` and renders an
     # unreadable regex-derived string in the "Example Value" box. These give it something a
-    # human can edit.
+    # human can edit. `file` is left out of the example on purpose — it shows the normal,
+    # three-field request.
     model_config = {
+        # A field this model does not know is a 422, never a silent drop.
+        "extra": "forbid",
         "json_schema_extra": {
             "example": {
-                "file": "athena",
                 "kv_name": "athena-passwords",
                 "kv_description": "Passwords for athena",
                 "roles": {
@@ -144,15 +160,16 @@ class VaultKVCreate(BaseModel):
         }
     }
 
-    file: str = Field(
-        ...,
+    file: Optional[str] = Field(
+        default=None,
         max_length=128,
         pattern=FILE_PATTERN,
-        examples=["payments"],
+        examples=["athena"],
         description=(
-            "Values file the store is added to, committed as '<values dir>/<file>.yaml'. "
-            "The file may already hold other stores; this one is appended to its kvStores "
-            "list. Created if it does not exist yet."
+            "Optional. Values file the store is added to, committed as "
+            "'<values dir>/<file>.yaml'. Defaults to the store's own name. The file may "
+            "already hold other stores; this one is appended to its kvStores list, and "
+            "nothing already in the file is touched. Created if it does not exist yet."
         ),
     )
 
@@ -197,14 +214,28 @@ class VaultKVCreate(BaseModel):
     def valid_roles(cls, v: Dict[str, List[str]]) -> Dict[str, List[str]]:
         return _validate_roles(v)
 
+    @model_validator(mode="after")
+    def default_file_to_the_store_name(self) -> "VaultKVCreate":
+        """Fill `file` in here, so nothing downstream has to know it was optional.
+
+        `kv_name` and `file` carry the same shape — a single lowercase segment — so the
+        store's name is always a valid file name, and the substitution needs no validation
+        of its own.
+        """
+        if self.file is None:
+            self.file = self.kv_name
+        return self
+
 
 class VaultKVUpdate(BaseModel):
     """Editable fields. The name is not one of them — renaming is a Vault migration.
 
-    `file` and `kv_name` come from the URL path; the body carries only the change.
+    `kv_name` comes from the URL path; the body carries only the change.
     """
 
     model_config = {
+        # A field this model does not know is a 422, never a silent drop.
+        "extra": "forbid",
         "json_schema_extra": {
             "example": {
                 "kv_description": "Passwords for athena, rotated quarterly",
@@ -275,6 +306,8 @@ class K8sServiceAccountCreate(BaseModel):
     """
 
     model_config = {
+        # A field this model does not know is a 422, never a silent drop.
+        "extra": "forbid",
         "json_schema_extra": {
             "example": {
                 "service_account": "vault",
@@ -342,10 +375,20 @@ class PullRequestInfo(BaseModel):
     state: str = Field(..., description="Pull-request state as reported by Bitbucket.")
 
 
-class PipelineInfo(BaseModel):
-    number: int = Field(..., description="Woodpecker pipeline number.")
-    status: str = Field(..., description="Terminal Woodpecker status, e.g. success/failure.")
-    link: Optional[str] = Field(default=None, description="Browser link to the pipeline.")
+class BuildInfo(BaseModel):
+    """One row of the pull request's Builds tab, as Bitbucket reports it.
+
+    `key` is what identifies a build to Bitbucket — it stores one result per key per
+    commit — so it is the field that tells two workflows apart, not a number.
+    """
+
+    key: str = Field(..., description="Bitbucket build-status key, e.g. ci/woodpecker/pr/build.")
+    state: str = Field(
+        ...,
+        description="Bitbucket build state: SUCCESSFUL, FAILED, CANCELLED, UNKNOWN or INPROGRESS.",
+    )
+    name: Optional[str] = Field(default=None, description="Display name reported by the CI server.")
+    url: Optional[str] = Field(default=None, description="Browser link to the build.")
 
 
 class VaultOperationResponse(BaseModel):
@@ -381,12 +424,17 @@ class VaultOperationResponse(BaseModel):
         default=None, description="The pull request opened for this change."
     )
 
-    validation_pipeline: Optional[PipelineInfo] = Field(
-        default=None, description="The pull-request pipeline that gates the merge."
+    validation_builds: Optional[List[BuildInfo]] = Field(
+        default=None,
+        description=(
+            "Builds Bitbucket reported against the pull request's commit — the gate on the "
+            "merge. A list because a CI server may report one build per workflow."
+        ),
     )
 
-    deploy_pipeline: Optional[PipelineInfo] = Field(
-        default=None, description="The post-merge pipeline that applies the change."
+    deploy_builds: Optional[List[BuildInfo]] = Field(
+        default=None,
+        description="Builds reported against the merge commit — the ones that apply the change.",
     )
 
     error: Optional[str] = Field(

@@ -58,7 +58,10 @@ def test_openapi_is_reachable_and_lists_the_routes(client):
     assert response.status_code == 200
     paths = response.json()["paths"]
     assert any(p.endswith("/kv/pull-request") for p in paths)
-    assert any(p.endswith("{file}/{kv_name}") for p in paths)
+    # A store is addressed by name alone; only the whole-file read still names a file.
+    assert any(p.endswith("/kv/{kv_name}") for p in paths)
+    assert any(p.endswith("/kv/files/{file}") for p in paths)
+    assert not any("{file}/{kv_name}" in p for p in paths)
 
 
 def test_create_schema_carries_a_readable_example(client):
@@ -67,8 +70,9 @@ def test_create_schema_carries_a_readable_example(client):
     schemas = client.get("/openapi.json").json()["components"]["schemas"]
     create = schemas["VaultKVCreate"]
 
+    # No `file`: the example shows the normal three-field request, since a caller should
+    # not have to know which file their store lands in.
     assert create["example"] == {
-        "file": "athena",
         "kv_name": "athena-passwords",
         "kv_description": "Passwords for athena",
         "roles": {
@@ -76,7 +80,7 @@ def test_create_schema_carries_a_readable_example(client):
         },
     }
     assert create["properties"]["kv_name"]["examples"] == ["myapp"]
-    assert create["properties"]["file"]["examples"] == ["payments"]
+    assert "file" not in create["required"]
 
 
 def test_the_role_example_is_a_distinguished_name(client):
@@ -119,3 +123,12 @@ def test_docs_needs_no_auth(client):
     """The auth middleware excludes the docs; a login wall would also look like a hang."""
     assert client.get(DOCS).status_code == 200
     assert client.get("/openapi.json").status_code == 200
+
+
+def test_the_create_example_omitting_file_still_lands_somewhere(client):
+    """`file` defaults to the store's own name, so the three-field example is complete."""
+    from app.v1.vault.schemas import VaultKVCreate
+
+    example = client.get("/openapi.json").json()["components"]["schemas"]["VaultKVCreate"]["example"]
+
+    assert VaultKVCreate(**example).file == "athena-passwords"

@@ -1,31 +1,52 @@
-"""Duck-typed stand-ins for the Bitbucket and Woodpecker clients.
+"""Duck-typed stand-in for the Bitbucket client.
 
-The clients themselves are covered end-to-end against their real REST shapes in
-`tests/clients/` (respx). These fakes exist so the operation tests can assert on
-*sequencing and rollback* — which calls happen, in what order, and what gets undone when a
-step fails — without any HTTP in the way.
+The client itself is covered end-to-end against the real REST shapes in `tests/clients/`
+(respx). This fake exists so the operation tests can assert on *sequencing and rollback* —
+which calls happen, in what order, and what gets undone when a step fails — without any
+HTTP in the way.
+
+There is only one fake now: Bitbucket is the only upstream, because the CI gates read the
+build statuses the pipelines post into Bitbucket rather than asking a CI server.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional
 
 from tashtiot_apis_library.connectors import ExternalServiceError
 
-from app.clients.bitbucket import PullRequest
-from app.clients.woodpecker import Pipeline
+from app.clients.bitbucket import BuildStatus, PullRequest
 
 
-def make_pipeline(number: int = 1, status: str = "success", event: str = "pull_request", **kwargs) -> Pipeline:
-    return Pipeline(number=number, status=status, event=event, **kwargs)
+def make_build(
+    key: str = "ci/woodpecker/pr/build", state: str = "SUCCESSFUL", **kwargs
+) -> BuildStatus:
+    return BuildStatus(key=key, state=state, **kwargs)
+
+
+def passing(key: str = "ci/woodpecker/pr/build") -> List[BuildStatus]:
+    """The usual scripted gate result: one green build."""
+    return [make_build(key=key, state="SUCCESSFUL")]
+
+
+def failing(key: str = "ci/woodpecker/pr/build") -> List[BuildStatus]:
+    return [make_build(key=key, state="FAILED", url="https://ci.test/1")]
 
 
 class FakeBitbucket:
-    """Records every call; `fail_on` injects a failure into a chosen method."""
+    """Records every call; `fail_on` injects a failure into a chosen method.
+
+    `builds` is a **queue** popped once per `await_builds`, exactly as the pipeline results
+    used to be: element 0 is the validation gate and element 1 the deploy gate. An
+    `Exception` in the list is raised instead of returned, which is how a timeout or a red
+    build is staged. Running dry is an `AssertionError`, so an unexpected extra gate fails
+    loudly rather than silently passing.
+    """
 
     def __init__(
         self,
         existing_files: Optional[Dict[str, str]] = None,
         fail_on: Optional[Dict[str, Exception]] = None,
         merge_commit: Optional[str] = "merge-sha-1",
+        builds: Optional[List[Any]] = None,
     ) -> None:
         self.calls: List[str] = []
         self.existing_files = dict(existing_files or {})
@@ -38,6 +59,15 @@ class FakeBitbucket:
         # handling can be asserted on.
         self.source_commit_ids: List[Optional[str]] = []
         self.last_commit_id: Optional[str] = "file-commit-sha"
+        self.branch_head: Optional[str] = "base-head-sha"
+        # Both gates default to green, so a test only scripts `builds` when it cares.
+        self.builds: List[Any] = list(
+            builds if builds is not None else [passing(), passing("ci/woodpecker/push/deploy")]
+        )
+        # The (commit, exclude_keys) each gate was opened on — this is what pins that the
+        # validation gate watches the PR's commit and the deploy gate the merge commit.
+        self.awaited_commits: List[str] = []
+        self.excluded_keys: List[FrozenSet[str]] = []
         self._next_id = 101
 
     def _record(self, name: str) -> None:
@@ -80,6 +110,10 @@ class FakeBitbucket:
         self._record("get_last_commit")
         return self.last_commit_id
 
+    async def get_branch_head(self, branch: str) -> Optional[str]:
+        self._record("get_branch_head")
+        return self.branch_head
+
     async def put_file(
         self,
         path: str,
@@ -107,6 +141,9 @@ class FakeBitbucket:
             to_branch=to_branch,
             state="OPEN",
             url=f"https://bitbucket.test/pr/{self._next_id}",
+            # The head of the branch put_file just committed to — what the validation
+            # gate watches, and what the PR's Builds tab shows.
+            from_commit=f"sha-{from_branch}",
         )
         self.pull_requests[pull_request.id] = pull_request
         self._next_id += 1
@@ -133,30 +170,15 @@ class FakeBitbucket:
         stored.state = "DECLINED"
         return stored
 
-
-class FakeWoodpecker:
-    """Serves a scripted list of pipelines and a scripted queue of `await_pipeline` results."""
-
-    def __init__(
-        self,
-        existing: Optional[List[Pipeline]] = None,
-        results: Optional[List[Any]] = None,
-    ) -> None:
-        self.existing = list(existing or [])
-        self.results = list(results or [])
-        self.matchers: List[Any] = []
-        self.calls: List[str] = []
-
-    async def list_pipelines(self, per_page: int = 50) -> List[Pipeline]:
-        self.calls.append("list_pipelines")
-        return self.existing
-
-    async def await_pipeline(self, matches, **kwargs) -> Pipeline:
-        self.calls.append("await_pipeline")
-        self.matchers.append(matches)
-        if not self.results:
-            raise AssertionError("FakeWoodpecker.await_pipeline called with no scripted result")
-        result = self.results.pop(0)
+    async def await_builds(
+        self, commit_id: str, exclude_keys: FrozenSet[str] = frozenset(), **kwargs
+    ) -> List[BuildStatus]:
+        self._record("await_builds")
+        self.awaited_commits.append(commit_id)
+        self.excluded_keys.append(exclude_keys)
+        if not self.builds:
+            raise AssertionError("FakeBitbucket.await_builds called with no scripted result")
+        result = self.builds.pop(0)
         if isinstance(result, Exception):
             raise result
         return result

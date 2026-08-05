@@ -57,12 +57,12 @@ async def test_returns_the_open_pull_request(payload, bitbucket):
     assert "not merged" in result.message
 
 
-async def test_reports_no_pipelines(payload, bitbucket):
-    """Nothing ran, so neither pipeline field may be populated."""
+async def test_reports_no_builds(payload, bitbucket):
+    """Nothing was *observed*, so neither build field may be populated."""
     result = await _open(bitbucket, payload)
 
-    assert result.validation_pipeline is None
-    assert result.deploy_pipeline is None
+    assert result.validation_builds is None
+    assert result.deploy_builds is None
 
 
 async def test_call_order_stops_at_the_pull_request(payload, bitbucket):
@@ -217,7 +217,7 @@ def test_route_requires_a_token(client):
     assert client.post(PR_URL, json=CREATE_BODY).status_code == 401
 
 
-def test_route_returns_201_and_leaves_the_pr_open(client, auth_headers, bitbucket, woodpecker):
+def test_route_returns_201_and_leaves_the_pr_open(client, auth_headers, bitbucket):
     response = client.post(PR_URL, json=CREATE_BODY, headers=auth_headers)
 
     assert response.status_code == 201
@@ -225,11 +225,11 @@ def test_route_returns_201_and_leaves_the_pr_open(client, auth_headers, bitbucke
     assert body["status"] == "Succeeded"
     assert body["file"] == FILE
     assert body["pull_request"]["state"] == "OPEN"
-    assert body["validation_pipeline"] is None
-    assert body["deploy_pipeline"] is None
-    # The fake would raise if a pipeline were awaited without a scripted result; assert
-    # directly that Woodpecker was never consulted at all.
-    assert woodpecker.calls == []
+    assert body["validation_builds"] is None
+    assert body["deploy_builds"] is None
+    # The fake would raise if a gate were opened without a scripted result; assert
+    # directly that no gate was opened at all.
+    assert "await_builds" not in bitbucket.calls
 
 
 def test_route_rejects_a_bad_name(client, auth_headers, bitbucket):

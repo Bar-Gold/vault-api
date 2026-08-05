@@ -2,7 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.v1.vault.schemas import K8sServiceAccountCreate, VaultKVCreate
-from tests.fakes import FakeBitbucket, FakeWoodpecker, make_pipeline
+from tests.fakes import FakeBitbucket
 
 
 @pytest.fixture
@@ -38,29 +38,18 @@ def account_identity(account_payload):
 
 @pytest.fixture
 def bitbucket():
+    """The only upstream — repo *and* CI gates, both green by default."""
     return FakeBitbucket()
 
 
 @pytest.fixture
-def woodpecker():
-    """Both gates green: validation #2 then deploy #3."""
-    return FakeWoodpecker(
-        results=[
-            make_pipeline(number=2, status="success", event="pull_request"),
-            make_pipeline(number=3, status="success", event="push", commit="merge-sha-1"),
-        ]
-    )
+def client(monkeypatch, bitbucket):
+    """TestClient over the real app, with the connector swapped for the fake.
 
-
-@pytest.fixture
-def client(monkeypatch, bitbucket, woodpecker):
-    """TestClient over the real app, with both connectors swapped for the fakes.
-
-    `create_app()` is the only place the connectors are constructed, so patching the
-    classes it imports is enough to take the network out of the picture.
+    `create_app()` is the only place the connector is constructed, so patching the class
+    it imports is enough to take the network out of the picture.
     """
     monkeypatch.setattr("app.main.BitbucketClient", lambda *args, **kwargs: bitbucket)
-    monkeypatch.setattr("app.main.WoodpeckerClient", lambda *args, **kwargs: woodpecker)
 
     from app.main import create_app
 
