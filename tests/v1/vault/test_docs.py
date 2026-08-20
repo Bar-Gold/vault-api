@@ -10,6 +10,8 @@ library upgrade that re-introduces one is caught here rather than in a browser.
 """
 import re
 
+import pytest
+
 DOCS = "/docs"
 
 
@@ -123,3 +125,60 @@ def test_docs_needs_no_auth(client):
     """The auth middleware excludes the docs; a login wall would also look like a hang."""
     assert client.get(DOCS).status_code == 200
     assert client.get("/openapi.json").status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# the route documentation is part of the contract
+#
+# Swagger renders `summary` and `description` verbatim, so a stale one is a lie told to
+# every caller who reads the docs page. Nothing pinned them before, and they went stale the
+# moment the chain stopped merging: the create still advertised "wait for both pipelines"
+# long after the second pipeline was gone.
+# --------------------------------------------------------------------------- #
+RETIRED_CLAIMS = (
+    "both pipelines",
+    "deploy build",
+    "merges, then",
+    "runs the full chain",
+    "point of no return",
+)
+
+
+def _documented_text(client):
+    """Every summary and description the OpenAPI document exposes, per operation."""
+    spec = client.get("/openapi.json").json()
+    for path, operations in spec["paths"].items():
+        if "vault" not in path:
+            continue
+        for method, operation in operations.items():
+            yield (
+                f"{method.upper()} {path}",
+                f"{operation.get('summary', '')} {operation.get('description', '')}",
+            )
+
+
+@pytest.mark.parametrize("claim", RETIRED_CLAIMS)
+def test_no_route_advertises_a_retired_behaviour(client, claim):
+    offenders = [name for name, text in _documented_text(client) if claim in text.lower()]
+
+    assert not offenders, f"{offenders} still document {claim!r}"
+
+
+def test_every_mutating_route_says_a_pull_request_is_opened(client):
+    """The one thing a caller must not miss: nothing is applied when the call returns."""
+    mutating = [
+        (name, text)
+        for name, text in _documented_text(client)
+        if not name.startswith("GET")
+    ]
+
+    assert mutating, "no mutating routes found — the shape changed"
+    for name, text in mutating:
+        assert "pull request" in text.lower(), f"{name} does not mention the pull request"
+
+
+def test_the_blocking_routes_say_they_wait_and_the_others_say_they_do_not(client):
+    """The only difference between a route and its /pull-request twin is the wait."""
+    for name, text in _documented_text(client):
+        if name.endswith("/pull-request"):
+            assert "without waiting" in text.lower(), f"{name} should say it does not wait"

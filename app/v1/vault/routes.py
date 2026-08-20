@@ -277,12 +277,15 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         "/",
         response_model=VaultOperationResponse,
         status_code=201,
-        summary="Create a KV store and wait for both pipelines",
+        summary="Open a validated pull request that creates a KV store",
         description=(
             "Writes '<values dir>/<team>/<kv_name>/' with an oidc-access.yaml and, if the "
-            "request carries any k8s grants, a k8s-access.yaml. Opens a pull request, waits "
-            "for the validation build, merges, then waits for the deploy build. Blocks for "
-            "the whole chain."
+            "request carries any k8s grants, a k8s-access.yaml. Opens a pull request and "
+            "blocks until the validation build finishes. "
+            "**The store is not created when this returns** - the pull request is, and it "
+            "is open, green and waiting for a human to merge. This service never merges. "
+            "A red or timed-out build declines the pull request and deletes the branch, so "
+            "nothing is left behind."
         ),
     )
     async def create_kv(payload: VaultKVCreate):
@@ -294,17 +297,19 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         "/pull-request",
         response_model=VaultOperationResponse,
         status_code=201,
-        summary="Open the create pull request and stop",
+        summary="Open the create pull request without waiting for CI",
         description=(
-            "Steps 1-3 only: branch, commit, pull request. No CI wait and no merge. The "
-            "forge still runs the validation pipeline; this endpoint just does not wait "
-            "for it, so the build fields are null. A repeat call opens a second pull "
-            "request, because the duplicate scan reads the base branch."
+            "The same branch, commit and pull request as the create above, minus the "
+            "wait. The forge still runs the validation pipeline; this endpoint just does "
+            "not watch it, so validation_builds is null - nothing was observed, not "
+            "nothing ran. A repeat call opens a second pull request, because the "
+            "duplicate scan reads the base branch and an unmerged pull request is not "
+            "there."
         ),
     )
     async def create_kv_pull_request_only(payload: VaultKVCreate):
         logger.info(
-            f"Opening a pull request for KV store {payload.kv_name} (no CI, no merge)"
+            f"Opening a pull request for KV store {payload.kv_name} (no CI wait)"
         )
         return await _execute(create_kv_pull_request_operation(bitbucket, payload))
 
@@ -318,11 +323,13 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         "/tashtiot/{team}",
         response_model=VaultOperationResponse,
         status_code=201,
-        summary="Create or replace one team's shared-services grants",
+        summary="Open a validated pull request setting a team's shared-services grants",
         description=(
-            "Writes '<values dir>/<Tashtiot dir>/<team>.yaml'. An upsert: create and "
-            "replace are the same call because the file's identity is the team. An "
-            "upsert that changes nothing returns 200 with a null pull request."
+            "Writes '<values dir>/<Tashtiot dir>/<team>.yaml' - one flat file mixing both "
+            "auth types in a single access list. An upsert: create and replace are the "
+            "same call because the file's identity is the team. "
+            "Answers 201 with the pull request open for review, or 200 with a null "
+            "pull_request when the file already said exactly this."
         ),
     )
     async def upsert_tashtiot(team: TeamParam, payload: TashtiotAccessUpsert):
@@ -343,8 +350,11 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         "/tashtiot/{team}",
         response_model=VaultOperationResponse,
         status_code=201,
-        summary="Remove one team's shared-services grants",
-        description="Deletes the team's file and runs the full chain.",
+        summary="Open a validated pull request removing a team's shared-services grants",
+        description=(
+            "The file is still there when this returns; the pull request that removes it "
+            "is open for review."
+        ),
     )
     async def delete_tashtiot(team: TeamParam):
         logger.info(f"Deleting {config.TASHTIOT_DIR} access for {team}")
@@ -373,10 +383,11 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         "/{kv_name}/access",
         response_model=VaultOperationResponse,
         status_code=201,
-        summary="Grant one principal access to a store",
+        summary="Open a validated pull request granting one principal access",
         description=(
-            "Appends one entry to whichever access file its auth_type selects, and runs "
-            "the full chain. A grant already present is a 409."
+            "Appends one entry to whichever access file its auth_type selects, opens a "
+            "pull request and waits for the validation build. A grant already present is "
+            "a 409. The grant is not in effect when this returns - a human merges."
         ),
     )
     async def add_access(kv_name: KVNameParam, payload: AccessEntry):
@@ -387,7 +398,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         "/{kv_name}/access/pull-request",
         response_model=VaultOperationResponse,
         status_code=201,
-        summary="Open the grant pull request and stop",
+        summary="Open the grant pull request without waiting for CI",
     )
     async def add_access_pull_request_only(
         kv_name: KVNameParam, payload: AccessEntry
@@ -411,11 +422,14 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         "/{kv_name}/access",
         response_model=VaultOperationResponse,
         status_code=201,
-        summary="Revoke one grant",
+        summary="Open a validated pull request revoking one grant",
         description=(
             "The grant's identity travels as query parameters, since DELETE bodies are "
             "widely dropped. oidc needs path and dn; k8s needs path, name, namespace and "
-            "cluster. A mismatched set is a 422, not a wrong-grant revoke."
+            "cluster. A mismatched set is a 422, not a wrong-grant revoke. Capabilities "
+            "are not taken - they are not part of a grant's identity. "
+            "The grant is still in effect when this returns; the pull request that "
+            "revokes it is open for review."
         ),
     )
     async def delete_access(
@@ -438,7 +452,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         "/{kv_name}/access/pull-request",
         response_model=VaultOperationResponse,
         status_code=201,
-        summary="Open the revoke pull request and stop",
+        summary="Open the revoke pull request without waiting for CI",
     )
     async def delete_access_pull_request_only(
         kv_name: KVNameParam,
@@ -466,14 +480,15 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         "/{kv_name}/pull-request",
         response_model=VaultOperationResponse,
         status_code=201,
-        summary="Open the delete pull request and stop",
+        summary="Open the delete pull request without waiting for CI",
         description=(
-            "Steps 1-3 only for a removal. The escape hatch that matters most: delete is "
-            "the destructive operation, and this hands the merge to a reviewer."
+            "The same removal as the delete below, minus the wait for the validation "
+            "build. A repeat call opens a second removal pull request, because nothing "
+            "was merged and the store is still on the base branch."
         ),
     )
     async def delete_kv_pull_request_only(kv_name: KVNameParam):
-        logger.info(f"Opening a pull request to delete {kv_name} (no CI, no merge)")
+        logger.info(f"Opening a pull request to delete {kv_name} (no CI wait)")
         return await _execute(
             delete_kv_store_pull_request_operation(bitbucket, kv_name)
         )
@@ -493,10 +508,13 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         "/{kv_name}",
         response_model=VaultOperationResponse,
         status_code=201,
-        summary="Replace a store's grants",
+        summary="Open a validated pull request replacing a store's grants",
         description=(
-            "The access list is replaced wholesale. An edit that changes nothing returns "
-            "200 with a null pull request rather than opening an empty one."
+            "The access list is replaced wholesale: send the list you want, not a patch "
+            "of it. "
+            "Answers 201 with the pull request open for review, or 200 with a null "
+            "pull_request when the store already said exactly this - that short circuit "
+            "is what keeps repeat requests from filling the values repo with empty diffs."
         ),
     )
     async def update_kv(kv_name: KVNameParam, payload: VaultKVUpdate):
@@ -507,10 +525,13 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         "/{kv_name}",
         response_model=VaultOperationResponse,
         status_code=201,
-        summary="Open a pull request that deletes a KV store",
+        summary="Open a validated pull request that deletes a KV store",
         description=(
-            "Removes the store's whole directory, both access files with it, and runs the "
-            "full chain. A repeat delete is a 404."
+            "Removes the store's whole directory, both access files with it, then waits "
+            "for the validation build. "
+            "**The store is not deleted when this returns** - the pull request that "
+            "deletes it is open for review. A repeat call is a 404 only once that pull "
+            "request has been merged."
         ),
     )
     async def delete_kv(kv_name: KVNameParam):
