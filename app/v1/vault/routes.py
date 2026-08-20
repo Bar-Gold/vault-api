@@ -5,9 +5,11 @@ its own, so it hangs off `/{kv_name}/access` rather than getting a prefix of its
 Tashtiot per-team file *is* a different resource, but it shares the chain and the response
 model, so it lives on the same router behind a fixed `/tashtiot` segment.
 
-**Fixed segments are registered before `/{kv_name}`.** `/pull-request`, `/tashtiot` and
-`/stores` would otherwise be shadowed by a store literally named one of those. Registration
-order is the whole guard, and tests pin each one.
+**Fixed segments are registered before `/{kv_name}`.** `/tashtiot` and `/stores` would
+otherwise be shadowed by a store literally named one of those. Registration order is the
+whole guard, and tests pin each one. `/pull-request` used to be a third: the routes that
+opened a pull request *without* waiting for CI are gone, so nothing occupies that segment
+and a store may be called `pull-request` with nothing to collide with.
 
 **Path parameters are pattern-validated**, not just body fields. Starlette's path convertor
 is `[^/]+`, so nothing is exploitable without them, but a malformed name would otherwise
@@ -26,18 +28,14 @@ from .conf import config
 from .operations import (
     VaultOperationError,
     add_access_entry_operation,
-    add_access_entry_pull_request_operation,
     create_kv_mount_operation,
-    create_kv_pull_request_operation,
     delete_kv_store_operation,
-    delete_kv_store_pull_request_operation,
     delete_tashtiot_access_operation,
     get_kv_access_operation,
     get_kv_store_operation,
     get_tashtiot_access_operation,
     list_kv_stores_operation,
     remove_access_entry_operation,
-    remove_access_entry_pull_request_operation,
     update_kv_mount_operation,
     upsert_tashtiot_access_operation,
 )
@@ -293,25 +291,6 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         return await _execute(create_kv_mount_operation(bitbucket, payload))
 
     # Registered before `/{kv_name}` so a store named `pull-request` cannot shadow it.
-    @router.post(
-        "/pull-request",
-        response_model=VaultOperationResponse,
-        status_code=201,
-        summary="Open the create pull request without waiting for CI",
-        description=(
-            "The same branch, commit and pull request as the create above, minus the "
-            "wait. The forge still runs the validation pipeline; this endpoint just does "
-            "not watch it, so validation_builds is null - nothing was observed, not "
-            "nothing ran. A repeat call opens a second pull request, because the "
-            "duplicate scan reads the base branch and an unmerged pull request is not "
-            "there."
-        ),
-    )
-    async def create_kv_pull_request_only(payload: VaultKVCreate):
-        logger.info(
-            f"Opening a pull request for KV store {payload.kv_name} (no CI wait)"
-        )
-        return await _execute(create_kv_pull_request_operation(bitbucket, payload))
 
     # ---------------------------------------------------------------- #
     # the Tashtiot per-team file
@@ -394,18 +373,6 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         logger.info(f"Granting access on {kv_name}")
         return await _execute(add_access_entry_operation(bitbucket, kv_name, payload))
 
-    @router.post(
-        "/{kv_name}/access/pull-request",
-        response_model=VaultOperationResponse,
-        status_code=201,
-        summary="Open the grant pull request without waiting for CI",
-    )
-    async def add_access_pull_request_only(
-        kv_name: KVNameParam, payload: AccessEntry
-    ):
-        return await _execute(
-            add_access_entry_pull_request_operation(bitbucket, kv_name, payload)
-        )
 
     @router.get(
         "/{kv_name}/access",
@@ -448,50 +415,12 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         logger.info(f"Revoking access on {kv_name}")
         return await _execute(remove_access_entry_operation(bitbucket, kv_name, entry))
 
-    @router.delete(
-        "/{kv_name}/access/pull-request",
-        response_model=VaultOperationResponse,
-        status_code=201,
-        summary="Open the revoke pull request without waiting for CI",
-    )
-    async def delete_access_pull_request_only(
-        kv_name: KVNameParam,
-        auth_type: AuthTypeQuery,
-        path: PathQuery,
-        dn: DnQuery = None,
-        name: ServiceAccountQuery = None,
-        namespace: NamespaceQuery = None,
-        cluster: ClusterQuery = None,
-    ):
-        try:
-            entry = _revoked_entry(auth_type, path, dn, name, namespace, cluster)
-        except VaultOperationError as invalid:
-            return _json(invalid.to_response(), invalid.status_code)
-        return await _execute(
-            remove_access_entry_pull_request_operation(bitbucket, kv_name, entry)
-        )
 
     # ---------------------------------------------------------------- #
     # the store itself
     #
     # Single-segment, registered last so every fixed segment above wins.
     # ---------------------------------------------------------------- #
-    @router.delete(
-        "/{kv_name}/pull-request",
-        response_model=VaultOperationResponse,
-        status_code=201,
-        summary="Open the delete pull request without waiting for CI",
-        description=(
-            "The same removal as the delete below, minus the wait for the validation "
-            "build. A repeat call opens a second removal pull request, because nothing "
-            "was merged and the store is still on the base branch."
-        ),
-    )
-    async def delete_kv_pull_request_only(kv_name: KVNameParam):
-        logger.info(f"Opening a pull request to delete {kv_name} (no CI wait)")
-        return await _execute(
-            delete_kv_store_pull_request_operation(bitbucket, kv_name)
-        )
 
     @router.get(
         "/{kv_name}",

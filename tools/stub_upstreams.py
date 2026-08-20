@@ -42,8 +42,8 @@ in-memory dicts below, so a `DELETE` fails here with a git error surfaced as a 5
 expected; point `BITBUCKET_URL` at a real Bitbucket to exercise it. The same applies to the
 one edit that removes a file — an update that empties a store's Kubernetes grants.
 
-Everything else — create, update, both PR-only variants, adding a grant and the Tashtiot
-routes — runs against this stub unchanged.
+Everything else — create, a non-emptying update, adding a grant and the Tashtiot routes —
+runs against this stub unchanged.
 
 Deliberately faithful in three places, because they are the easy things to break:
   * a pull request's `version` is bumped every time a build status changes, so merging

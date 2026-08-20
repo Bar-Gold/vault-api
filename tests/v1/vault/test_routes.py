@@ -24,7 +24,6 @@ from tests.v1.vault.conftest import (
 )
 
 CREATE_URL = f"{config.API_PREFIX}/"
-PR_URL = f"{config.API_PREFIX}/pull-request"
 STORE_URL = f"{config.API_PREFIX}/{KV}"
 ACCESS_URL = f"{STORE_URL}/access"
 STORES_URL = f"{config.API_PREFIX}/stores"
@@ -134,17 +133,6 @@ def test_a_malformed_body_is_422_before_any_call(
 
     assert response.status_code == 422
     assert bitbucket.calls == []
-
-
-def test_the_pull_request_only_route_returns_201_and_leaves_it_open(
-    client, auth_headers, bitbucket
-):
-    response = client.post(PR_URL, json=BODY, headers=auth_headers)
-
-    assert response.status_code == 201
-    body = response.json()
-    assert body["pull_request"]["state"] == "OPEN"
-    assert body["validation_builds"] is None
 
 
 # --------------------------------------------------------------------------- #
@@ -339,15 +327,6 @@ def test_delete_of_an_unknown_store_is_404(client, auth_headers):
     assert client.delete(STORE_URL, headers=auth_headers).status_code == 404
 
 
-def test_the_delete_pull_request_route_returns_201(client, auth_headers, bitbucket):
-    seed_store(bitbucket, oidc=[oidc_entry()])
-
-    response = client.delete(f"{STORE_URL}/pull-request", headers=auth_headers)
-
-    assert response.status_code == 201
-    assert response.json()["pull_request"]["state"] == "OPEN"
-
-
 # --------------------------------------------------------------------------- #
 # the Tashtiot layout
 #
@@ -454,14 +433,12 @@ def test_the_tashtiot_file_is_not_a_store(client, auth_headers, bitbucket):
 # Every fixed segment is registered before `/{kv_name}`. Without that a store named after
 # one of them would shadow the endpoint.
 # --------------------------------------------------------------------------- #
-def test_the_create_pull_request_segment_is_not_swallowed(client, auth_headers, bitbucket):
-    response = client.post(PR_URL, json=BODY, headers=auth_headers)
-
-    assert response.status_code == 201
 
 
-def test_a_store_named_pull_request_is_still_readable(client, auth_headers, bitbucket):
-    """`GET /pull-request` is a normal store read — the two coexist."""
+def test_a_store_named_pull_request_has_nothing_to_collide_with(
+    client, auth_headers, bitbucket
+):
+    """The routes that owned that segment are gone, so the name is now unremarkable."""
     seed_store(bitbucket, kv_name="pull-request", oidc=[oidc_entry()])
 
     response = client.get(f"{config.API_PREFIX}/pull-request", headers=auth_headers)
@@ -504,4 +481,36 @@ def test_a_malformed_store_name_in_the_path_is_422(client, auth_headers, bitbuck
     response = client.get(f"{config.API_PREFIX}/Bad_Name", headers=auth_headers)
 
     assert response.status_code == 422
+    assert bitbucket.calls == []
+
+
+# --------------------------------------------------------------------------- #
+# the routes that skipped CI are gone
+#
+# They opened a pull request and returned without watching the build. Without that wait a
+# caller could not know the change was green, which is the one guarantee this service still
+# offers now that it does not merge. Pinned at the HTTP level so re-adding one is a
+# deliberate act rather than an accident.
+# --------------------------------------------------------------------------- #
+def test_the_create_pull_request_route_is_gone(client, auth_headers, bitbucket):
+    """`/pull-request` now falls through to `/{kv_name}`, which has no POST."""
+    response = client.post(
+        f"{config.API_PREFIX}/pull-request", json=BODY, headers=auth_headers
+    )
+
+    assert response.status_code == 405
+    assert bitbucket.calls == []
+
+
+@pytest.mark.parametrize("path", [
+    "/{kv}/pull-request",
+    "/{kv}/access/pull-request",
+])
+def test_the_sub_resource_pull_request_routes_are_gone(
+    client, auth_headers, bitbucket, path
+):
+    url = f"{config.API_PREFIX}{path.format(kv=KV)}"
+
+    assert client.post(url, json={}, headers=auth_headers).status_code == 404
+    assert client.delete(url, headers=auth_headers).status_code == 404
     assert bitbucket.calls == []

@@ -103,8 +103,8 @@ POST /api/vault/v1/kv/
 ```
 
 **The request blocks until CI answers.** That is deliberate — the endpoint's contract is "the
-change is proposed *and* green", not a job handle. See `POST /pull-request` below if even that
-is too long to wait. Two consequences:
+change is proposed *and* green", not a job handle — and there is no variant that returns
+sooner. Two consequences:
 
 - any proxy/ingress in front needs a read timeout larger than
   `CI_PIPELINE_START_TIMEOUT_SECONDS + CI_PIPELINE_TIMEOUT_SECONDS` — one gate's worth;
@@ -245,6 +245,10 @@ something returns `201`.
 | `DELETE /{kv_name}/access?auth_type=…&path=…` | revoke one grant |
 | `GET`/`DELETE /tashtiot/{team}` | read or remove one team's shared-services file |
 
+**There is no `/pull-request` variant of anything.** Routes that opened a pull request
+without waiting for CI were removed: without the wait a caller could not know the change
+was green, which is the one guarantee left once the service stopped merging.
+
 **A store is addressed by name alone.** Names are unique across every team — the create
 enforces it — so a caller never has to remember who owns theirs. `team` appears on the create
 and nowhere else.
@@ -257,19 +261,6 @@ resolve to *some* entry.
 **Capabilities are not part of a grant's identity.** Granting `read` and later `read`+`write`
 to the same principal on the same path is an edit of one entry, so a duplicate is a `409` and
 a revoke does not need to know what the grant currently permits.
-
-### `POST /pull-request` — the non-blocking half
-
-Every mutating route has a `/pull-request` twin that runs steps 1-3 and stops: branch, commit,
-pull request. **The difference is only the wait** — the main routes also open a pull request
-and leave it for a human; these just do not block on CI first. Use them when a round-trip
-matters more than knowing the build is green. Two consequences, both deliberate:
-
-- **The forge still runs CI.** The endpoint does not suppress the validation pipeline; it just
-  does not wait. `validation_builds` is `null` because nothing was *observed*, not because
-  nothing ran.
-- **A repeat call opens a second pull request.** Every scan reads the base branch, and an
-  unmerged PR is not there. Reviewers close the loser.
 
 ### `DELETE` — removes the directory
 
@@ -290,8 +281,6 @@ Same chain, same rollbacks, same point of no return. What is worth knowing:
   branch, pull request, the gate, rollback — is unchanged.
 - **A repeat delete is `404`**, the same answer `GET` and `PATCH` give for a store that is not
   there. The *state* is idempotent; the status code tells you which call did the work.
-- **`DELETE .../pull-request` is the escape hatch**, answering `201` and leaving the removal
-  for a reviewer. It matters more here than for a create: this is the destructive one.
 
 ### Uniqueness
 

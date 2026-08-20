@@ -13,9 +13,7 @@ from app.v1.vault.operations import (
     VaultOperationError,
     add_access_entry_operation,
     create_kv_mount_operation,
-    create_kv_pull_request_operation,
     delete_kv_store_operation,
-    delete_kv_store_pull_request_operation,
     get_kv_access_operation,
     get_kv_store_operation,
     list_kv_stores_operation,
@@ -209,35 +207,6 @@ async def test_a_build_timeout_declines_and_deletes(bitbucket, payload):
     assert bitbucket.calls[-2:] == ["decline_pull_request", "delete_branch"]
 
 
-# --------------------------------------------------------------------------- #
-# the PR-only variant
-# --------------------------------------------------------------------------- #
-async def test_pull_request_only_stops_before_the_gates(bitbucket, payload):
-    result = await create_kv_pull_request_operation(
-        bitbucket, payload, branch_suffix="abc123"
-    )
-
-    assert result.pull_request.state == "OPEN"
-    assert result.validation_builds is None
-    assert "await_builds" not in bitbucket.calls
-    assert "merge_pull_request" not in bitbucket.calls
-
-
-async def test_pull_request_only_commits_the_same_files(bitbucket, payload):
-    """The branch content must not depend on which endpoint asked for it."""
-    await create_kv_pull_request_operation(bitbucket, payload, branch_suffix="abc123")
-
-    assert sorted(bitbucket.committed) == [K8S_PATH, OIDC_PATH]
-
-
-async def test_a_second_pull_request_only_call_opens_a_second_pull_request(
-    bitbucket, payload
-):
-    """Nothing was merged, so the scan cannot see the first one."""
-    first = await create_kv_pull_request_operation(bitbucket, payload, branch_suffix="a")
-    second = await create_kv_pull_request_operation(bitbucket, payload, branch_suffix="b")
-
-    assert first.pull_request.id != second.pull_request.id
 
 
 # --------------------------------------------------------------------------- #
@@ -522,15 +491,3 @@ async def test_a_repeat_delete_is_404(bitbucket):
         await delete_kv_store_operation(bitbucket, KV, branch_suffix="def456")
 
     assert error.value.status_code == 404
-
-
-async def test_delete_pull_request_only_stops_at_the_pull_request(bitbucket):
-    seed_store(bitbucket, oidc=[oidc_entry()])
-
-    result = await delete_kv_store_pull_request_operation(
-        bitbucket, KV, branch_suffix="abc123"
-    )
-
-    assert result.pull_request.state == "OPEN"
-    assert "await_builds" not in bitbucket.calls
-    assert bitbucket.deleted == [STORE_DIR]

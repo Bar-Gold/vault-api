@@ -59,14 +59,15 @@ def test_openapi_is_reachable_and_lists_the_routes(client):
 
     assert response.status_code == 200
     paths = response.json()["paths"]
-    assert any(p.endswith("/kv/pull-request") for p in paths)
     # A store is addressed by name alone; the team appears only on a create.
     assert any(p.endswith("/kv/{kv_name}") for p in paths)
     assert any(p.endswith("/kv/{kv_name}/access") for p in paths)
     assert any(p.endswith("/kv/tashtiot/{team}") for p in paths)
-    # The retired shapes: a file was never an address, and bindings are not their own kind.
+    # The retired shapes: a file was never an address, bindings are not their own kind,
+    # and the routes that skipped CI are gone.
     assert not any("{file}" in p for p in paths)
     assert not any("k8s-service-accounts" in p for p in paths)
+    assert not any(p.endswith("/pull-request") for p in paths)
 
 
 def test_create_schema_carries_a_readable_example(client):
@@ -177,8 +178,13 @@ def test_every_mutating_route_says_a_pull_request_is_opened(client):
         assert "pull request" in text.lower(), f"{name} does not mention the pull request"
 
 
-def test_the_blocking_routes_say_they_wait_and_the_others_say_they_do_not(client):
-    """The only difference between a route and its /pull-request twin is the wait."""
+def test_every_route_waits_for_ci(client):
+    """There is no longer a variant that skips the build, so none may claim to.
+
+    The `/pull-request` twins were removed: without the wait a caller could not know the
+    change was green, which is the one guarantee this service still offers.
+    """
     for name, text in _documented_text(client):
-        if name.endswith("/pull-request"):
-            assert "without waiting" in text.lower(), f"{name} should say it does not wait"
+        assert "without waiting" not in text.lower(), f"{name} claims to skip CI"
+
+

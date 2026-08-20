@@ -403,9 +403,12 @@ async def _open_pull_request(
     Both rollbacks live here: a failed commit or a failed PR deletes the branch, so a
     failure leaves the repo exactly as it was found. Touches no CI and never merges.
 
-    Shared by `_open_and_validate` (which goes on to wait for the validation build) and
-    every PR-only operation (which stops here). One implementation means they cannot drift
-    apart in what they roll back.
+    **One caller**, `_open_and_validate`. It stays a separate function because the two
+    rollback stages are genuinely different — this one deletes the branch, its caller
+    declines the pull request as well — and folding them together would put both stories in
+    one place. The four PR-only operations that used to stop here are gone: without the
+    wait, a caller could not know the change was green, which is the one guarantee this
+    service still offers.
 
     **A change may touch several paths.** A store is two files, so a create commits twice on
     the same branch and the pull request carries both — Bitbucket's browse resource writes
@@ -644,41 +647,6 @@ async def create_kv_mount_operation(
     )
 
 
-async def create_kv_pull_request_operation(
-    bitbucket: Any,
-    payload: VaultKVCreate,
-    branch_suffix: Optional[str] = None,
-) -> VaultOperationResponse:
-    """Open the pull request and stop — no CI gates, no merge.
-
-    The same duplicate guard, branch, commits and pull request as a create, minus everything
-    that waits or merges. Two consequences, both deliberate: the forge still runs the
-    validation pipeline (it is simply not waited on), and a repeat call opens a second pull
-    request, because the name scan reads the base branch and an unmerged PR is not there.
-    """
-    directory, change, entries = await _prepare_create(bitbucket, payload)
-
-    pull_request = await _open_pull_request(
-        bitbucket,
-        change=change,
-        branch=_branch_for(payload.team, payload.kv_name, branch_suffix),
-        summary=f"Create KV store {payload.kv_name} for {payload.team}",
-        description=_describe(payload.kv_name, directory, entries, "store created"),
-        kv_name=payload.kv_name,
-    )
-
-    return VaultOperationResponse(
-        status=OperationStatus.SUCCEEDED,
-        message=(
-            f"Opened pull request {pull_request.id} for {payload.kv_name}. "
-            f"It is not merged — review, CI and merge are up to you."
-        ),
-        kv_name=payload.kv_name,
-        file=directory,
-        pull_request=_pull_request_info(pull_request),
-    )
-
-
 # --------------------------------------------------------------------------- #
 # editing a store
 # --------------------------------------------------------------------------- #
@@ -888,37 +856,6 @@ async def add_access_entry_operation(
     )
 
 
-async def add_access_entry_pull_request_operation(
-    bitbucket: Any,
-    kv_name: str,
-    payload: Any,
-    branch_suffix: Optional[str] = None,
-) -> VaultOperationResponse:
-    """Open the pull request that adds the grant, and stop — no CI gates, no merge."""
-    entry = to_document_entry(payload)
-    store, change, _ = await _prepare_access_change(bitbucket, kv_name, entry, removing=False)
-
-    pull_request = await _open_pull_request(
-        bitbucket,
-        change=change,
-        branch=_branch_for(store.team, kv_name, branch_suffix),
-        summary=f"Grant {_entry_text(entry)} on {kv_name}",
-        description=_describe(kv_name, store.directory, [entry], "grant added"),
-        kv_name=kv_name,
-    )
-
-    return VaultOperationResponse(
-        status=OperationStatus.SUCCEEDED,
-        message=(
-            f"Opened pull request {pull_request.id} to grant {_entry_text(entry)} on "
-            f"{kv_name}. It is not merged — review, CI and merge are up to you."
-        ),
-        kv_name=kv_name,
-        file=store.directory,
-        pull_request=_pull_request_info(pull_request),
-    )
-
-
 async def remove_access_entry_operation(
     bitbucket: Any,
     kv_name: str,
@@ -948,36 +885,6 @@ async def remove_access_entry_operation(
         file=store.directory,
         pull_request=_pull_request_info(pull_request),
         validation_builds=_build_infos(validation),
-    )
-
-
-async def remove_access_entry_pull_request_operation(
-    bitbucket: Any,
-    kv_name: str,
-    entry: Dict[str, Any],
-    branch_suffix: Optional[str] = None,
-) -> VaultOperationResponse:
-    """Open the pull request that revokes the grant, and stop — no CI gates, no merge."""
-    store, change, _ = await _prepare_access_change(bitbucket, kv_name, entry, removing=True)
-
-    pull_request = await _open_pull_request(
-        bitbucket,
-        change=change,
-        branch=_branch_for(store.team, kv_name, branch_suffix),
-        summary=f"Revoke {_entry_text(entry)} on {kv_name}",
-        description=_describe(kv_name, store.directory, [entry], "grant removed"),
-        kv_name=kv_name,
-    )
-
-    return VaultOperationResponse(
-        status=OperationStatus.SUCCEEDED,
-        message=(
-            f"Opened pull request {pull_request.id} to revoke {_entry_text(entry)} on "
-            f"{kv_name}. It is not merged — review, CI and merge are up to you."
-        ),
-        kv_name=kv_name,
-        file=store.directory,
-        pull_request=_pull_request_info(pull_request),
     )
 
 
@@ -1030,40 +937,6 @@ async def delete_kv_store_operation(
         file=store.directory,
         pull_request=_pull_request_info(pull_request),
         validation_builds=_build_infos(validation),
-    )
-
-
-async def delete_kv_store_pull_request_operation(
-    bitbucket: Any,
-    kv_name: str,
-    branch_suffix: Optional[str] = None,
-) -> VaultOperationResponse:
-    """Open the pull request that deletes the store, and stop — no CI gates, no merge.
-
-    The escape hatch matters more for a delete than for a create: it is the most destructive
-    operation here, and this hands the decision to a reviewer. Nothing reaches the base
-    branch, so a repeat call opens a second removal pull request.
-    """
-    store = await _prepare_delete(bitbucket, kv_name)
-
-    pull_request = await _open_pull_request(
-        bitbucket,
-        change=Change(writes=[], removes=[store.directory]),
-        branch=_branch_for(store.team, kv_name, branch_suffix),
-        summary=f"Delete KV store {kv_name} from {store.team}",
-        description=_describe(kv_name, store.directory, store.access, "store deleted"),
-        kv_name=kv_name,
-    )
-
-    return VaultOperationResponse(
-        status=OperationStatus.SUCCEEDED,
-        message=(
-            f"Opened pull request {pull_request.id} to delete {kv_name}. "
-            f"It is not merged — review, CI and merge are up to you."
-        ),
-        kv_name=kv_name,
-        file=store.directory,
-        pull_request=_pull_request_info(pull_request),
     )
 
 

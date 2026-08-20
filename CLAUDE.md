@@ -143,17 +143,13 @@ segments in the builds endpoint. Keep all three if you extend it.
 | Route | Body | Notes |
 |-------|------|-------|
 | `POST /api/vault/v1/kv/` | `{team, kv_name, access}` | the chain below; blocks until the validation build ends; 201 |
-| `POST /api/vault/v1/kv/pull-request` | same body | steps 1-3 only: opens the PR and returns **without waiting for CI**; 201 |
 | `GET /api/vault/v1/kv/stores` | — | every store: `{team, kv_name, directory}`. Lists directories, reads no file |
 | `GET /api/vault/v1/kv/{kv_name}` | — | one store: its team, directory and every grant, both kinds, oidc first |
 | `PATCH /api/vault/v1/kv/{kv_name}` | `{access}` | replaces the grant list wholesale; 201 (200 if unchanged) |
 | `DELETE /api/vault/v1/kv/{kv_name}` | — | **removes the store's directory**, both files with it; 201 |
-| `DELETE /api/vault/v1/kv/{kv_name}/pull-request` | — | steps 1-3 only for a removal; 201 |
 | `POST /api/vault/v1/kv/{kv_name}/access` | one entry | appends one grant to whichever file its `auth_type` selects; 201 |
-| `POST /api/vault/v1/kv/{kv_name}/access/pull-request` | same body | steps 1-3 only; 201 |
 | `GET /api/vault/v1/kv/{kv_name}/access` | — | that store's grants (empty list, not 404, when it grants none) |
 | `DELETE /api/vault/v1/kv/{kv_name}/access` | `?auth_type=&path=&…` | revokes one grant; 201 |
-| `DELETE /api/vault/v1/kv/{kv_name}/access/pull-request` | same query | steps 1-3 only; 201 |
 | `PUT /api/vault/v1/kv/tashtiot/{team}` | `{access}` | create-or-replace one team's shared-services grants; 201 (200 if unchanged) |
 | `GET /api/vault/v1/kv/tashtiot/{team}` | — | that team's file, parsed and returned as-is |
 | `DELETE /api/vault/v1/kv/tashtiot/{team}` | — | removes the team's file; 201 |
@@ -189,12 +185,18 @@ mismatched set is a **422**, not a wrong-grant revoke. `_revoked_entry` in `rout
 single place that rule lives. Capabilities are not taken: they are not part of identity, and
 asking for them would suggest a partial revoke is possible.
 
-**Fixed segments are registered before `/{kv_name}`.** `/pull-request`, `/stores` and
-`/tashtiot` would otherwise be shadowed by a store literally named one of those. Registration
-order is the whole guard, and tests pin each case: a store named `pull-request` or `access`
-stays readable at `GET /{name}` (one segment against two), and `/tashtiot/{team}` cannot
-collide with a store read for the same reason. The one genuine casualty is a store named
-`stores` — `GET /stores` is the listing and wins; a test pins that too.
+**Fixed segments are registered before `/{kv_name}`.** `/stores` and `/tashtiot` would
+otherwise be shadowed by a store literally named one of those. Registration order is the
+whole guard, and tests pin each case: a store named `access` stays readable at
+`GET /{name}` (one segment against two), and `/tashtiot/{team}` cannot collide with a
+store read for the same reason. The one genuine casualty is a store named `stores` —
+`GET /stores` is the listing and wins; a test pins that too.
+
+**`/pull-request` is no longer a segment anywhere.** The four routes that opened a pull
+request *without* waiting for CI are gone — without the wait a caller could not know the
+change was green, which is the one guarantee this service still offers now that it does
+not merge. A store may be called `pull-request` with nothing to collide with, and tests
+pin that the old paths answer 404/405.
 
 **Path parameters are pattern-validated**, not just body fields: `kv_name` carries
 `KV_NAME_PATTERN` and `team` carries `TEAM_PATTERN`, via `Annotated[str, Path(...)]` aliases
@@ -430,8 +432,10 @@ alias and would not round-trip.
 **Two shared helpers, nested.** `_open_pull_request` owns branch -> commit(s) -> PR and both
 of their rollbacks (either failure deletes the branch). `_open_and_validate` calls it and
 then waits for the validation build. **Every mutating operation goes through them** — the
-blocking ones via `_open_and_validate`, the PR-only variants stopping at
-`_open_pull_request`. One implementation each means the rollback shape cannot drift.
+blocking ones via `_open_and_validate`, which is now `_open_pull_request`'s **only**
+caller. It stays a separate function because the two rollback stages differ — the inner
+one deletes the branch, the outer also declines the pull request — and folding them
+together would put both stories in one place.
 
 **Nothing merges.** The old chain went on to merge the pull request and wait for a deploy
 build on the merge commit; it does not any more. What went with that decision:
@@ -515,9 +519,10 @@ upsert is create-or-replace in one call because the file's identity *is* the tea
 would have nothing to describe; it short-circuits on no change like an update does.
 
 **Ordering consequence worth knowing** (documented, not worked around): a caller who creates a
-store via `POST /pull-request` and then immediately adds a grant to it gets a 404 — the store
-is on an unmerged branch and every scan reads the base branch. Same base-branch-only
-visibility that makes a repeat `/pull-request` open a second PR.
+store and then immediately adds a grant to it gets a 404 — the store is on an unmerged
+branch and every scan reads the base branch. **This is the normal case now**, not an edge
+one: since nothing merges, a store is only visible to the next request once a human has
+merged its pull request. It is also why a repeat create opens a second pull request.
 
 ## Auth & config provider
 
@@ -566,8 +571,10 @@ visibility that makes a repeat `/pull-request` open a second PR.
 
 - The mutating endpoints **block** until the validation build finishes. Any proxy in front
   needs a read timeout above `CI_PIPELINE_START_TIMEOUT_SECONDS + CI_PIPELINE_TIMEOUT_SECONDS`
-  — one gate's worth, not two. `/pull-request` is the escape hatch when even that is
-  unacceptable: it answers in one round-trip without waiting for CI at all.
+  — one gate's worth, not two. **There is no escape hatch**: the routes that returned
+  without waiting for CI were removed, so every caller waits. If that budget is not
+  workable for some client, the answer is a shorter `CI_PIPELINE_TIMEOUT_SECONDS`, not a
+  route that reports success without knowing the build passed.
 - Status codes, and the rule is now one line: **201 when a pull request was opened, 200 when
   none was.** Every mutating route declares 201; the only 200s are the no-op short circuits
   (an update or upsert whose document already matched) and the reads. `_execute` owns that
@@ -638,8 +645,8 @@ visibility that makes a repeat `/pull-request` open a second PR.
   so is an edit that empties one kind of grant (removing that access file). Both need git's
   smart HTTP protocol and a real repository rather than the stub's in-memory dicts, so they
   fail there with a git error surfaced as a 502. That is expected; everything else — create,
-  a non-emptying update, both PR-only variants, adding a grant and the Tashtiot routes — runs
-  against it unchanged.
+  a non-emptying update, adding a grant and the Tashtiot routes — runs against it
+  unchanged.
 - Commits are expected to be **Conventional Commits** (`feat:`, `fix:`, `test:`, `feat!:` for
   a breaking change) — follow the existing `git log`. There is no changelog tooling. The
   version is a literal in `pyproject.toml` plus the `APP_VERSION` build arg.
