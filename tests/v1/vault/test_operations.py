@@ -1,306 +1,172 @@
-"""The create chain: sequencing, the two CI gates, and what gets rolled back when.
+"""The chain and its rollbacks, against the duck-typed fake.
 
-The connector is a duck-typed fake (`tests/fakes.py`) so these tests assert on the order
-of calls and on the rollback, not on HTTP. There is only one of them: the CI gates read
-Bitbucket's build statuses — the pull request's Builds tab — so Bitbucket is the whole of
-the outside world here.
+What these pin is *sequencing*: which upstream calls happen, in what order, and what gets
+undone when a step fails. The committed bytes are `tests/test_helpers.py`'s job and the
+HTTP surface is `test_routes.py`'s; here the question is always "what did the service do".
 """
+
 import pytest
 import yaml
 from tashtiot_apis_library.connectors import ExternalServiceError
 
-from app.clients.bitbucket import BuildStatus, BuildTimeoutError
-from app.helpers import build_kv_store, build_kv_stores_document, render_values_yaml
 from app.v1.vault.operations import (
     VaultOperationError,
+    add_access_entry_operation,
     create_kv_mount_operation,
-    get_kv_file_operation,
+    create_kv_pull_request_operation,
+    delete_kv_store_operation,
+    delete_kv_store_pull_request_operation,
+    get_kv_access_operation,
     get_kv_store_operation,
+    list_kv_stores_operation,
+    remove_access_entry_operation,
+    update_kv_mount_operation,
 )
-from app.v1.vault.schemas import OperationStatus
-from tests.fakes import FakeBitbucket, failing, passing
-
-KV = "myapp"
-FILE = KV  # a store names its own file now
-VALUES_PATH = f"kv/{KV}.yaml"
-BRANCH = f"vault-kv/{KV}-abc123"
-ROLES = {"read": ["app01.corp.example.com"]}
-# What FakeBitbucket reports as the head of the branch put_file committed to.
-PR_COMMIT = f"sha-{BRANCH}"
-
-
-def _file_with(*names, description="payments secrets"):
-    """A rendered values file already holding these stores."""
-    return render_values_yaml(
-        build_kv_stores_document([build_kv_store(n, description, ROLES) for n in names])
-    )
+from app.v1.vault.schemas import K8sAccessEntry, OidcAccessEntry, VaultKVUpdate
+from tests.fakes import failing, passing
+from tests.v1.vault.conftest import (
+    DN,
+    K8S_PATH,
+    KV,
+    OIDC_PATH,
+    OTHER_DN,
+    STORE_DIR,
+    TEAM,
+    k8s_entry,
+    oidc_entry,
+    seed_store,
+)
 
 
 async def _create(bitbucket, payload):
-    return await create_kv_mount_operation(
-        bitbucket, payload, branch_suffix="abc123"
-    )
+    return await create_kv_mount_operation(bitbucket, payload, branch_suffix="abc123")
+
+
+def _committed(bitbucket, path):
+    return yaml.safe_load(bitbucket.committed[path])
 
 
 # --------------------------------------------------------------------------- #
-# happy path
+# creating a store
 # --------------------------------------------------------------------------- #
-async def test_happy_path_returns_the_success_message(payload, bitbucket):
-    response = await _create(bitbucket, payload)
+async def test_create_writes_both_access_files(bitbucket, payload):
+    """A store is a directory of two files, so one create commits twice."""
+    await _create(bitbucket, payload)
 
-    assert response.status == OperationStatus.SUCCEEDED
-    assert response.message == f"Successful creation of {KV}"
-    assert response.kv_name == KV
-    assert response.error is None
-
-
-async def test_happy_path_reports_pull_request_and_both_gates(payload, bitbucket):
-    response = await _create(bitbucket, payload)
-
-    assert response.pull_request.id == 101
-    assert response.pull_request.state == "MERGED"
-    assert [b.key for b in response.validation_builds] == ["ci/woodpecker/pr/build"]
-    assert [b.state for b in response.deploy_builds] == ["SUCCESSFUL"]
+    assert sorted(bitbucket.committed) == [K8S_PATH, OIDC_PATH]
+    assert _committed(bitbucket, OIDC_PATH)["access"][0]["dn"] == DN
+    assert _committed(bitbucket, K8S_PATH)["access"][0]["authType"] == "k8s"
 
 
-async def test_happy_path_call_order(payload, bitbucket):
+async def test_a_store_with_no_k8s_grants_writes_no_k8s_file(bitbucket, oidc_only_payload):
+    """Not an empty list — no file. That is the shape the format specifies."""
+    await _create(bitbucket, oidc_only_payload)
+
+    assert list(bitbucket.committed) == [OIDC_PATH]
+
+
+async def test_create_returns_the_success_message(bitbucket, payload):
+    result = await _create(bitbucket, payload)
+
+    assert result.status.value == "Succeeded"
+    assert result.message == f"Successful creation of {KV}"
+    assert result.kv_name == KV
+    assert result.file == STORE_DIR
+
+
+async def test_create_reports_the_merge_and_both_pipelines(bitbucket, payload):
+    result = await _create(bitbucket, payload)
+
+    assert result.pull_request.state == "MERGED"
+    assert [b.state for b in result.validation_builds] == ["SUCCESSFUL"]
+    assert [b.state for b in result.deploy_builds] == ["SUCCESSFUL"]
+
+
+async def test_create_call_order(bitbucket, payload):
     await _create(bitbucket, payload)
 
     assert bitbucket.calls == [
-        "list_files",  # scan every file for the name
-        "get_file_content",  # read the target file (404 -> new file)
+        "list_files",  # the duplicate-name scan, dir-wide
         "create_branch",
-        "put_file",
+        "put_file",  # oidc-access.yaml
+        "put_file",  # k8s-access.yaml, same branch
         "create_pull_request",
         "await_builds",  # gate 1, on the pull request's commit
         "get_pull_request",  # re-read for the current version
         "merge_pull_request",
         "await_builds",  # gate 2, on the merge commit
     ]
-    # Nothing was rolled back.
-    assert "decline_pull_request" not in bitbucket.calls
-    assert "delete_branch" not in bitbucket.calls
 
 
-async def test_each_gate_watches_its_own_commit(payload, bitbucket):
-    """The whole point of reading builds from Bitbucket: a gate names a sha, not a pipeline.
-
-    Gate 1 asks about the head of the branch the change was committed to — the commit the
-    pull request shows in its Builds tab. Gate 2 asks about the merge commit.
-    """
+async def test_create_sends_no_optimistic_lock_token(bitbucket, payload):
+    """Both files are new, and the browse resource rejects a create that carries one."""
     await _create(bitbucket, payload)
 
-    assert bitbucket.awaited_commits == [PR_COMMIT, "merge-sha-1"]
+    assert bitbucket.source_commit_ids == [None, None]
 
 
-async def test_a_distinct_merge_commit_excludes_nothing(payload, bitbucket):
-    """The exclusion only exists for fast-forwards; a real merge commit carries no history."""
-    await _create(bitbucket, payload)
+async def test_the_branch_names_team_and_store(bitbucket, payload):
+    result = await _create(bitbucket, payload)
 
-    assert bitbucket.excluded_keys == [frozenset(), frozenset()]
-
-
-async def test_a_fast_forward_merge_skips_the_keys_gate_one_already_saw(payload, bitbucket):
-    """A fast-forward leaves the base branch on the commit the PR built.
-
-    Its validation results are already sitting on that sha, so without excluding them the
-    deploy gate would open on gate 1's own answer and call the deploy a success before it
-    started.
-    """
-    bitbucket.merge_commit = PR_COMMIT
-
-    await _create(bitbucket, payload)
-
-    assert bitbucket.awaited_commits == [PR_COMMIT, PR_COMMIT]
-    assert bitbucket.excluded_keys[1] == frozenset({"ci/woodpecker/pr/build"})
+    stored = bitbucket.pull_requests[result.pull_request.id]
+    assert stored.from_branch == f"vault-kv/{TEAM}-{KV}-abc123"
 
 
-async def test_the_deploy_gate_falls_back_to_the_base_branch_head(payload, bitbucket):
-    """Not every merge strategy reports a merge commit; the head of the base branch does."""
-    bitbucket.merge_commit = None
+async def test_both_gates_watch_the_right_commits(bitbucket, payload):
+    result = await _create(bitbucket, payload)
 
-    await _create(bitbucket, payload)
-
-    assert "get_branch_head" in bitbucket.calls
-    assert bitbucket.awaited_commits == [PR_COMMIT, "base-head-sha"]
-
-
-async def test_a_pull_request_without_a_source_commit_is_rolled_back(payload, bitbucket):
-    """No sha means no gate, and merging unvalidated is not the fallback."""
-    original = bitbucket.create_pull_request
-
-    async def without_source_commit(*args, **kwargs):
-        pull_request = await original(*args, **kwargs)
-        pull_request.from_commit = ""
-        return pull_request
-
-    bitbucket.create_pull_request = without_source_commit
-
-    with pytest.raises(VaultOperationError) as exc_info:
-        await _create(bitbucket, payload)
-
-    assert "did not report a source commit" in exc_info.value.message
-    assert "decline_pull_request" in bitbucket.calls
-    assert "delete_branch" in bitbucket.calls
-    assert "merge_pull_request" not in bitbucket.calls
-
-
-async def test_committed_file_is_a_kvstores_list(payload, bitbucket):
-    await _create(bitbucket, payload)
-
-    committed = yaml.safe_load(bitbucket.committed[VALUES_PATH])
-    assert committed == {
-        "kvStores": [
-            {
-                "name": KV,
-                "description": payload.kv_description,
-                "roles": {"read": ["app01.corp.example.com"]},
-            }
-        ]
-    }
-
-
-async def test_a_new_file_is_written_without_an_optimistic_lock_token(
-    payload, bitbucket
-):
-    """sourceCommitId on a path that does not exist makes Bitbucket reject the write."""
-    await _create(bitbucket, payload)
-
-    assert bitbucket.source_commit_ids == [None]
-    assert "get_last_commit" not in bitbucket.calls
-
-
-async def test_appending_to_an_existing_file_keeps_the_existing_stores(
-    payload
-):
-    """The whole point of the format: one file, several stores."""
-    bitbucket = FakeBitbucket(existing_files={VALUES_PATH: _file_with("already-here")})
-
-    await _create(bitbucket, payload)
-
-    committed = yaml.safe_load(bitbucket.committed[VALUES_PATH])
-    assert [s["name"] for s in committed["kvStores"]] == ["already-here", KV]
-
-
-async def test_appending_to_an_existing_file_sends_the_lock_token(payload):
-    """Editing a path that already exists needs Bitbucket's optimistic-lock token."""
-    bitbucket = FakeBitbucket(existing_files={VALUES_PATH: _file_with("already-here")})
-
-    await _create(bitbucket, payload)
-
-    assert bitbucket.source_commit_ids == ["file-commit-sha"]
-    assert bitbucket.calls.index("get_last_commit") < bitbucket.calls.index("put_file")
-
-
-async def test_merge_uses_the_freshly_read_version(payload, bitbucket):
-    """The fake bumps `version` on every read; merging with a stale one would 409 for real."""
-    await _create(bitbucket, payload)
-
-    assert bitbucket.pull_requests[101].version == 1
+    stored = bitbucket.pull_requests[result.pull_request.id]
+    assert bitbucket.awaited_commits == [stored.from_commit, bitbucket.merge_commit]
 
 
 # --------------------------------------------------------------------------- #
-# duplicate guard — names are global to Vault, so it scans every file
+# uniqueness
 # --------------------------------------------------------------------------- #
-async def test_a_name_already_in_the_target_file_is_rejected(payload):
-    bitbucket = FakeBitbucket(existing_files={VALUES_PATH: _file_with(KV)})
+async def test_a_duplicate_name_is_409_and_touches_nothing(bitbucket, payload):
+    seed_store(bitbucket, oidc=[oidc_entry()])
 
-    with pytest.raises(VaultOperationError) as exc_info:
+    with pytest.raises(VaultOperationError) as error:
         await _create(bitbucket, payload)
 
-    assert exc_info.value.status_code == 409
-    assert KV in exc_info.value.message
+    assert error.value.status_code == 409
     assert "create_branch" not in bitbucket.calls
 
 
-async def test_a_name_used_in_a_different_file_is_also_rejected(payload):
-    """Store names are global to Vault, so uniqueness cannot be scoped to one file."""
-    bitbucket = FakeBitbucket(existing_files={"kv/other-team.yaml": _file_with(KV)})
+async def test_a_name_used_by_another_team_is_also_409(bitbucket, payload):
+    """A store name is global to Vault, which is what makes the name a sufficient address."""
+    seed_store(bitbucket, team="platform", kv_name=KV, oidc=[oidc_entry()])
 
-    with pytest.raises(VaultOperationError) as exc_info:
+    with pytest.raises(VaultOperationError) as error:
         await _create(bitbucket, payload)
 
-    assert exc_info.value.status_code == 409
-    assert "kv/other-team.yaml" in exc_info.value.message
-    assert "create_branch" not in bitbucket.calls
+    assert error.value.status_code == 409
+    assert "platform" in error.value.message
 
 
-async def test_a_different_name_in_the_same_file_is_fine(payload, bitbucket):
-    bitbucket.existing_files[VALUES_PATH] = _file_with("something-else")
+async def test_a_different_name_under_another_team_does_not_collide(bitbucket, payload):
+    seed_store(bitbucket, team="platform", kv_name="other", oidc=[oidc_entry()])
 
-    response = await _create(bitbucket, payload)
-
-    assert response.status == OperationStatus.SUCCEEDED
+    assert (await _create(bitbucket, payload)).status.value == "Succeeded"
 
 
-async def test_an_unparseable_file_does_not_block_an_unrelated_create(
-    payload, bitbucket
-):
-    """A hand-edited file elsewhere must not make every create fail."""
-    bitbucket.existing_files["kv/broken.yaml"] = "kvStores: [unclosed\n  ::: bad"
-
-    response = await _create(bitbucket, payload)
-
-    assert response.status == OperationStatus.SUCCEEDED
-
-
-async def test_non_yaml_files_in_the_values_dir_are_skipped(
-    payload, bitbucket
-):
-    bitbucket.existing_files["kv/README.md"] = "# not a values file\n"
-
-    response = await _create(bitbucket, payload)
-
-    assert response.status == OperationStatus.SUCCEEDED
-
-
-async def test_non_404_on_the_duplicate_check_propagates(payload):
-    bitbucket = FakeBitbucket(
-        existing_files={"kv/other.yaml": _file_with("someone-else")},
-        fail_on={
-            "get_file_content": ExternalServiceError(
-                service_name="bitbucket", detail="server on fire", status_code=500
-            )
-        },
+# --------------------------------------------------------------------------- #
+# rollbacks
+# --------------------------------------------------------------------------- #
+async def test_a_failed_commit_deletes_the_branch(bitbucket, payload):
+    bitbucket.fail_on["put_file"] = ExternalServiceError(
+        service_name="bitbucket", detail="commit rejected", status_code=400
     )
 
     with pytest.raises(ExternalServiceError):
         await _create(bitbucket, payload)
 
-    assert "create_branch" not in bitbucket.calls
+    assert bitbucket.calls[-1] == "delete_branch"
+    assert "create_pull_request" not in bitbucket.calls
 
 
-# --------------------------------------------------------------------------- #
-# rollback before the pull request exists
-# --------------------------------------------------------------------------- #
-async def test_failed_commit_deletes_the_branch(payload):
-    bitbucket = FakeBitbucket(
-        fail_on={
-            "put_file": ExternalServiceError(
-                service_name="bitbucket", detail="commit rejected", status_code=400
-            )
-        }
-    )
-
-    with pytest.raises(ExternalServiceError):
-        await _create(bitbucket, payload)
-
-    assert bitbucket.calls == [
-        "list_files",
-        "get_file_content",
-        "create_branch",
-        "put_file",
-        "delete_branch",
-    ]
-
-
-async def test_failed_pull_request_deletes_the_branch(payload):
-    bitbucket = FakeBitbucket(
-        fail_on={
-            "create_pull_request": ExternalServiceError(
-                service_name="bitbucket", detail="no reviewers", status_code=400
-            )
-        }
+async def test_a_failed_pull_request_deletes_the_branch(bitbucket, payload):
+    bitbucket.fail_on["create_pull_request"] = ExternalServiceError(
+        service_name="bitbucket", detail="no reviewers", status_code=400
     )
 
     with pytest.raises(ExternalServiceError):
@@ -309,253 +175,362 @@ async def test_failed_pull_request_deletes_the_branch(payload):
     assert bitbucket.calls[-1] == "delete_branch"
 
 
-async def test_branch_cleanup_failure_does_not_mask_the_original_error(payload):
-    """A failing rollback is logged, never raised over the error that caused it."""
-    bitbucket = FakeBitbucket(
-        fail_on={
-            "put_file": ExternalServiceError(
-                service_name="bitbucket", detail="commit rejected", status_code=400
-            ),
-            "delete_branch": RuntimeError("branch already gone"),
-        }
-    )
-
-    with pytest.raises(ExternalServiceError) as exc_info:
-        await _create(bitbucket, payload)
-
-    assert exc_info.value.detail == "commit rejected"
-
-
-# --------------------------------------------------------------------------- #
-# gate 1 — the validation build
-# --------------------------------------------------------------------------- #
-async def test_failed_validation_declines_the_pull_request(payload, bitbucket):
+async def test_a_red_validation_build_declines_and_deletes(bitbucket, payload):
     bitbucket.builds = [failing()]
 
-    with pytest.raises(VaultOperationError) as exc_info:
+    with pytest.raises(VaultOperationError) as error:
         await _create(bitbucket, payload)
 
-    error = exc_info.value
-    assert error.status_code == 502
-    assert "Validation did not pass" in error.message
-    assert "ci/woodpecker/pr/build [FAILED]" in error.message
-    assert [b.state for b in error.validation_builds] == ["FAILED"]
-    assert error.deploy_builds is None
-    assert "decline_pull_request" in bitbucket.calls
-    assert "delete_branch" in bitbucket.calls
-    assert "merge_pull_request" not in bitbucket.calls
+    assert "Validation did not pass" in error.value.message
+    assert bitbucket.calls[-2:] == ["decline_pull_request", "delete_branch"]
 
 
-@pytest.mark.parametrize("state", ["FAILED", "CANCELLED", "UNKNOWN"])
-async def test_only_successful_passes_the_gate(payload, bitbucket, state):
-    """CANCELLED and UNKNOWN are terminal but not success — a gate keyed off "not FAILED"
-    would merge both."""
-    bitbucket.builds = [[BuildStatus(key="ci/woodpecker/pr/build", state=state)]]
-
-    with pytest.raises(VaultOperationError):
-        await _create(bitbucket, payload)
-
-    assert "merge_pull_request" not in bitbucket.calls
-
-
-async def test_one_red_build_among_several_fails_the_gate(payload, bitbucket):
-    """Bitbucket keeps one result per key, so a commit can carry one per workflow."""
-    bitbucket.builds = [
-        [
-            BuildStatus(key="ci/woodpecker/pr/lint", state="SUCCESSFUL"),
-            BuildStatus(key="ci/woodpecker/pr/test", state="FAILED"),
-        ]
-    ]
-
-    with pytest.raises(VaultOperationError) as exc_info:
-        await _create(bitbucket, payload)
-
-    # Only the failing one is named, but the whole set is reported.
-    assert "ci/woodpecker/pr/test" in exc_info.value.message
-    assert "ci/woodpecker/pr/lint" not in exc_info.value.message
-    assert len(exc_info.value.validation_builds) == 2
-
-
-async def test_validation_timeout_declines_and_reports_504(payload, bitbucket):
-    bitbucket.builds = [
-        BuildTimeoutError(
-            "Builds on sha-x were still running after 900s",
-            builds=[BuildStatus(key="ci/woodpecker/pr/build", state="INPROGRESS")],
-        )
-    ]
-
-    with pytest.raises(VaultOperationError) as exc_info:
-        await _create(bitbucket, payload)
-
-    error = exc_info.value
-    assert error.status_code == 504
-    assert "Validation build did not complete" in error.message
-    assert [b.state for b in error.validation_builds] == ["INPROGRESS"]
-    assert "decline_pull_request" in bitbucket.calls
-
-
-async def test_decline_failure_does_not_stop_the_branch_cleanup(payload):
-    """A failing decline is logged; the branch is still removed and the real error surfaces."""
-    bitbucket = FakeBitbucket(
-        fail_on={"decline_pull_request": RuntimeError("pull request already closed")},
-        builds=[failing()],
+async def test_a_failed_merge_leaves_the_pull_request_open(bitbucket, payload):
+    """Step 5 is the point of no return, so nothing before it is undone here."""
+    bitbucket.fail_on["merge_pull_request"] = ExternalServiceError(
+        service_name="bitbucket", detail="conflict", status_code=409
     )
 
-    with pytest.raises(VaultOperationError) as exc_info:
+    with pytest.raises(VaultOperationError) as error:
         await _create(bitbucket, payload)
 
-    assert "Validation did not pass" in exc_info.value.message
-    assert "delete_branch" in bitbucket.calls
-
-
-async def test_a_build_that_never_appears_still_cleans_up(payload, bitbucket):
-    """Nothing was observed, so there is nothing to report — but the rollback still runs."""
-    bitbucket.builds = [BuildTimeoutError("No build was reported against sha-x within 120s")]
-
-    with pytest.raises(VaultOperationError) as exc_info:
-        await _create(bitbucket, payload)
-
-    assert exc_info.value.validation_builds == []
-    assert "decline_pull_request" in bitbucket.calls
-    assert "delete_branch" in bitbucket.calls
-
-
-# --------------------------------------------------------------------------- #
-# the merge
-# --------------------------------------------------------------------------- #
-async def test_unmergeable_pull_request_is_left_open(payload):
-    """A validated-but-unmergeable PR is a human's problem — do not decline it."""
-    bitbucket = FakeBitbucket(
-        fail_on={
-            "merge_pull_request": ExternalServiceError(
-                service_name="bitbucket", detail="The pull request has conflicts", status_code=409
-            )
-        }
-    )
-
-    with pytest.raises(VaultOperationError) as exc_info:
-        await _create(bitbucket, payload)
-
-    error = exc_info.value
-    assert "could not be merged" in error.message
-    assert "conflicts" in error.message
-    assert error.pull_request.state == "OPEN"
+    assert "could not be merged" in error.value.message
     assert "decline_pull_request" not in bitbucket.calls
     assert "delete_branch" not in bitbucket.calls
 
 
-# --------------------------------------------------------------------------- #
-# gate 2 — the deploy build (past the point of no return)
-# --------------------------------------------------------------------------- #
-async def test_failed_deploy_reports_the_change_as_merged(payload, bitbucket):
+async def test_a_red_deploy_build_is_reported_not_rolled_back(bitbucket, payload):
     bitbucket.builds = [passing(), failing("ci/woodpecker/push/deploy")]
 
-    with pytest.raises(VaultOperationError) as exc_info:
+    with pytest.raises(VaultOperationError) as error:
         await _create(bitbucket, payload)
 
-    error = exc_info.value
-    assert error.status_code == 502
-    assert "Deploy did not pass" in error.message
-    assert "already merged" in error.message
-    assert [b.key for b in error.deploy_builds] == ["ci/woodpecker/push/deploy"]
-    assert error.pull_request.state == "MERGED"
-    # Nothing is rolled back after a merge.
-    assert "decline_pull_request" not in bitbucket.calls
-    assert "delete_branch" not in bitbucket.calls
-
-
-async def test_deploy_timeout_reports_504_and_the_merge(payload, bitbucket):
-    bitbucket.builds = [
-        passing(),
-        BuildTimeoutError("Builds on merge-sha-1 were still running after 900s"),
-    ]
-
-    with pytest.raises(VaultOperationError) as exc_info:
-        await _create(bitbucket, payload)
-
-    assert exc_info.value.status_code == 504
-    assert "already merged" in exc_info.value.message
-
-
-async def test_no_commit_to_watch_after_the_merge_is_reported_as_merged(payload, bitbucket):
-    """Past the point of no return, so this reports rather than rolls back."""
-    bitbucket.merge_commit = None
-    bitbucket.branch_head = None
-
-    with pytest.raises(VaultOperationError) as exc_info:
-        await _create(bitbucket, payload)
-
-    assert "reported no commit" in exc_info.value.message
-    assert exc_info.value.pull_request.state == "MERGED"
+    assert "needs a revert" in error.value.message
     assert "decline_pull_request" not in bitbucket.calls
 
 
 # --------------------------------------------------------------------------- #
-# error -> response mapping
+# the PR-only variant
 # --------------------------------------------------------------------------- #
-async def test_operation_error_renders_a_failed_response(payload, bitbucket):
-    bitbucket.builds = [failing()]
+async def test_pull_request_only_stops_before_the_gates(bitbucket, payload):
+    result = await create_kv_pull_request_operation(
+        bitbucket, payload, branch_suffix="abc123"
+    )
 
-    with pytest.raises(VaultOperationError) as exc_info:
-        await _create(bitbucket, payload)
+    assert result.pull_request.state == "OPEN"
+    assert result.validation_builds is None
+    assert "await_builds" not in bitbucket.calls
+    assert "merge_pull_request" not in bitbucket.calls
 
-    response = exc_info.value.to_response()
-    assert response.status == OperationStatus.FAILED
-    assert response.kv_name == KV
-    assert response.error == response.message
-    assert response.validation_builds[0].key == "ci/woodpecker/pr/build"
-    assert response.deploy_builds is None
+
+async def test_pull_request_only_commits_the_same_files(bitbucket, payload):
+    """The branch content must not depend on which endpoint asked for it."""
+    await create_kv_pull_request_operation(bitbucket, payload, branch_suffix="abc123")
+
+    assert sorted(bitbucket.committed) == [K8S_PATH, OIDC_PATH]
+
+
+async def test_a_second_pull_request_only_call_opens_a_second_pull_request(
+    bitbucket, payload
+):
+    """Nothing was merged, so the scan cannot see the first one."""
+    first = await create_kv_pull_request_operation(bitbucket, payload, branch_suffix="a")
+    second = await create_kv_pull_request_operation(bitbucket, payload, branch_suffix="b")
+
+    assert first.pull_request.id != second.pull_request.id
 
 
 # --------------------------------------------------------------------------- #
-# reads
+# resolution
 # --------------------------------------------------------------------------- #
-async def test_get_file_returns_every_store():
-    bitbucket = FakeBitbucket(existing_files={VALUES_PATH: _file_with("one", "two")})
+async def test_a_store_is_found_by_name_alone(bitbucket):
+    seed_store(bitbucket, team="platform", kv_name="secrets", oidc=[oidc_entry()])
 
-    data = await get_kv_file_operation(bitbucket, FILE)
+    store = await get_kv_store_operation(bitbucket, "secrets")
 
-    assert [s["name"] for s in data["kvStores"]] == ["one", "two"]
-
-
-async def test_get_file_reports_a_corrupt_values_file():
-    """A hand-edited/badly-merged file must not surface as a bare 500."""
-    bitbucket = FakeBitbucket(existing_files={VALUES_PATH: "kvStores: [unclosed\n  ::: bad"})
-
-    with pytest.raises(VaultOperationError) as exc_info:
-        await get_kv_file_operation(bitbucket, FILE)
-
-    assert "not valid YAML" in exc_info.value.message
+    assert store["team"] == "platform"
+    assert store["directory"] == "KVs/platform/secrets"
 
 
-async def test_get_file_of_a_missing_file_is_404():
-    with pytest.raises(VaultOperationError) as exc_info:
-        await get_kv_file_operation(FakeBitbucket(), "nope")
+async def test_a_read_returns_both_kinds_oidc_first(bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry()], k8s=[k8s_entry()])
 
-    assert exc_info.value.status_code == 404
+    entries = await get_kv_access_operation(bitbucket, KV)
 
-
-async def test_get_store_returns_only_that_entry():
-    bitbucket = FakeBitbucket(existing_files={VALUES_PATH: _file_with("one", "two")})
-
-    store = await get_kv_store_operation(bitbucket, "two")
-
-    assert store["name"] == "two"
-    assert store["roles"] == ROLES
+    assert [entry["authType"] for entry in entries] == ["oidc", "k8s"]
 
 
-async def test_get_store_of_an_absent_name_is_404():
-    bitbucket = FakeBitbucket(existing_files={VALUES_PATH: _file_with("one")})
+async def test_a_store_with_no_k8s_file_reads_as_oidc_only(bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry()])
 
-    with pytest.raises(VaultOperationError) as exc_info:
+    assert [e["authType"] for e in await get_kv_access_operation(bitbucket, KV)] == ["oidc"]
+
+
+async def test_an_unknown_store_is_404(bitbucket):
+    with pytest.raises(VaultOperationError) as error:
         await get_kv_store_operation(bitbucket, "nope")
 
-    assert exc_info.value.status_code == 404
-    assert "not defined in" in exc_info.value.message
+    assert error.value.status_code == 404
 
 
-async def test_get_store_of_a_missing_file_is_404():
-    with pytest.raises(VaultOperationError) as exc_info:
-        await get_kv_store_operation(FakeBitbucket(), KV)
+async def test_the_404_names_files_the_walk_could_not_classify(bitbucket):
+    """Otherwise a values dir in an unexpected shape reads as a deleted store."""
+    bitbucket.existing_files["KVs/stray.yaml"] = "access: []\n"
 
-    assert exc_info.value.status_code == 404
+    with pytest.raises(VaultOperationError) as error:
+        await get_kv_store_operation(bitbucket, "nope")
+
+    assert "KVs/stray.yaml" in error.value.message
+
+
+async def test_the_tashtiot_layout_is_not_walked_as_a_store(bitbucket):
+    """`Tashtiot/cloudops.yaml` is two segments; a store is three."""
+    bitbucket.existing_files["KVs/Tashtiot/cloudops.yaml"] = "access: []\n"
+    seed_store(bitbucket, oidc=[oidc_entry()])
+
+    stores = await list_kv_stores_operation(bitbucket)
+
+    assert [s["kv_name"] for s in stores] == [KV]
+
+
+async def test_listing_reports_team_name_and_directory(bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry()])
+    seed_store(bitbucket, team="platform", kv_name="secrets", oidc=[oidc_entry()])
+
+    stores = await list_kv_stores_operation(bitbucket)
+
+    assert {s["kv_name"] for s in stores} == {KV, "secrets"}
+    assert {s["team"] for s in stores} == {TEAM, "platform"}
+
+
+# --------------------------------------------------------------------------- #
+# updating a store
+# --------------------------------------------------------------------------- #
+async def _update(bitbucket, access, kv_name=KV):
+    return await update_kv_mount_operation(
+        bitbucket, kv_name, VaultKVUpdate(access=access), branch_suffix="abc123"
+    )
+
+
+async def test_update_replaces_the_grant_list(bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry()])
+
+    await _update(bitbucket, [
+        {"path": "*", "auth_type": "oidc", "dn": OTHER_DN, "capabilities": ["read"]}
+    ])
+
+    assert _committed(bitbucket, OIDC_PATH)["access"][0]["dn"] == OTHER_DN
+
+
+async def test_update_sends_the_optimistic_lock_token_for_an_existing_file(bitbucket):
+    """Without it the browse resource rejects an edit as an attempted create."""
+    seed_store(bitbucket, oidc=[oidc_entry()])
+
+    await _update(bitbucket, [
+        {"path": "*", "auth_type": "oidc", "dn": OTHER_DN, "capabilities": ["read"]}
+    ])
+
+    assert bitbucket.source_commit_ids == ["file-commit-sha"]
+
+
+async def test_adding_the_first_k8s_grant_creates_that_file_without_a_token(bitbucket):
+    """The k8s file does not exist yet, so that write is a create, not an edit."""
+    seed_store(bitbucket, oidc=[oidc_entry()])
+
+    await _update(bitbucket, [
+        {"path": "*", "auth_type": "oidc", "dn": DN, "capabilities": ["read", "write"]},
+        {"path": "*", "auth_type": "k8s", "name": "sa", "namespace": "ns",
+         "cluster": "dev", "capabilities": ["read"]},
+    ])
+
+    assert K8S_PATH in bitbucket.committed
+    assert bitbucket.source_commit_ids == ["file-commit-sha", None]
+
+
+async def test_emptying_the_k8s_grants_removes_that_file(bitbucket):
+    """An `access: []` file is a shape no create writes, so it is removed instead."""
+    seed_store(bitbucket, oidc=[oidc_entry()], k8s=[k8s_entry()])
+
+    await _update(bitbucket, [
+        {"path": "*", "auth_type": "oidc", "dn": DN, "capabilities": ["read", "write"]}
+    ])
+
+    assert bitbucket.deleted == [K8S_PATH]
+    assert list(bitbucket.committed) == [OIDC_PATH]
+
+
+async def test_a_no_op_update_opens_no_pull_request(bitbucket):
+    """What keeps repeat requests from filling the values repo with empty diffs."""
+    seed_store(bitbucket, oidc=[oidc_entry()])
+
+    result = await _update(bitbucket, [
+        {"path": "*", "auth_type": "oidc", "dn": DN, "capabilities": ["read", "write"]}
+    ])
+
+    assert result.status.value == "Succeeded"
+    assert result.pull_request is None
+    assert "create_branch" not in bitbucket.calls
+
+
+async def test_a_reordered_update_is_still_a_no_op(bitbucket):
+    """`yaml_data_equals` compares parsed documents, so order is not a change."""
+    seed_store(bitbucket, oidc=[oidc_entry(), oidc_entry(dn=OTHER_DN)])
+
+    result = await _update(bitbucket, [
+        {"path": "*", "auth_type": "oidc", "dn": OTHER_DN, "capabilities": ["read", "write"]},
+        {"path": "*", "auth_type": "oidc", "dn": DN, "capabilities": ["read", "write"]},
+    ])
+
+    assert result.pull_request is None
+
+
+async def test_update_of_an_unknown_store_is_404(bitbucket):
+    with pytest.raises(VaultOperationError) as error:
+        await _update(bitbucket, [
+            {"path": "*", "auth_type": "oidc", "dn": DN, "capabilities": ["read"]}
+        ], kv_name="nope")
+
+    assert error.value.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# one grant at a time
+# --------------------------------------------------------------------------- #
+async def test_adding_a_grant_appends_to_the_matching_file(bitbucket, grant_payload):
+    seed_store(bitbucket, oidc=[oidc_entry()], k8s=[k8s_entry()])
+
+    await add_access_entry_operation(bitbucket, KV, grant_payload, branch_suffix="abc123")
+
+    assert [e["dn"] for e in _committed(bitbucket, OIDC_PATH)["access"]] == [DN, OTHER_DN]
+    # The other file is not rewritten: a k8s grant never shows up in an oidc diff.
+    assert K8S_PATH not in bitbucket.committed
+
+
+async def test_a_k8s_grant_lands_in_the_k8s_file(bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry()])
+    payload = K8sAccessEntry(
+        path="*", auth_type="k8s", name="sa", namespace="ns",
+        cluster="dev", capabilities=["read"],
+    )
+
+    await add_access_entry_operation(bitbucket, KV, payload, branch_suffix="abc123")
+
+    assert list(bitbucket.committed) == [K8S_PATH]
+
+
+async def test_adding_a_duplicate_grant_is_409(bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry()])
+    payload = OidcAccessEntry(
+        path="*", auth_type="oidc", dn=DN, capabilities=["read"]
+    )
+
+    with pytest.raises(VaultOperationError) as error:
+        await add_access_entry_operation(bitbucket, KV, payload, branch_suffix="abc123")
+
+    assert error.value.status_code == 409
+    assert "create_branch" not in bitbucket.calls
+
+
+async def test_removing_a_grant_drops_it(bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry(), oidc_entry(dn=OTHER_DN)])
+
+    await remove_access_entry_operation(
+        bitbucket, KV, oidc_entry(dn=OTHER_DN), branch_suffix="abc123"
+    )
+
+    assert [e["dn"] for e in _committed(bitbucket, OIDC_PATH)["access"]] == [DN]
+
+
+async def test_removing_the_last_grant_of_a_kind_removes_its_file(bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry()], k8s=[k8s_entry()])
+
+    await remove_access_entry_operation(bitbucket, KV, k8s_entry(), branch_suffix="abc123")
+
+    assert bitbucket.deleted == [K8S_PATH]
+
+
+async def test_removing_a_grant_that_is_not_there_is_404(bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry()])
+
+    with pytest.raises(VaultOperationError) as error:
+        await remove_access_entry_operation(
+            bitbucket, KV, oidc_entry(dn=OTHER_DN), branch_suffix="abc123"
+        )
+
+    assert error.value.status_code == 404
+
+
+async def test_capabilities_do_not_affect_which_grant_is_revoked(bitbucket):
+    """A caller revoking a grant need not know what it currently permits."""
+    seed_store(bitbucket, oidc=[oidc_entry(capabilities=["read", "write"])])
+
+    await remove_access_entry_operation(
+        bitbucket, KV, oidc_entry(capabilities=[]), branch_suffix="abc123"
+    )
+
+    assert bitbucket.deleted == [OIDC_PATH]
+
+
+# --------------------------------------------------------------------------- #
+# deleting a store
+# --------------------------------------------------------------------------- #
+async def test_delete_removes_the_whole_directory(bitbucket):
+    """Both files go with it — a store is a directory, and git rm -r takes it whole."""
+    seed_store(bitbucket, oidc=[oidc_entry()], k8s=[k8s_entry()])
+
+    result = await delete_kv_store_operation(bitbucket, KV, branch_suffix="abc123")
+
+    assert bitbucket.deleted == [STORE_DIR]
+    assert bitbucket.committed == {}
+    assert result.message == f"Successful deletion of {KV}"
+
+
+async def test_delete_needs_no_optimistic_lock_token(bitbucket):
+    """Git resolves the path from the branch it fetched; the token is Bitbucket's."""
+    seed_store(bitbucket, oidc=[oidc_entry()])
+
+    await delete_kv_store_operation(bitbucket, KV, branch_suffix="abc123")
+
+    assert "get_last_commit" not in bitbucket.calls
+
+
+async def test_delete_leaves_another_store_alone(bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry()])
+    seed_store(bitbucket, team="platform", kv_name="secrets", oidc=[oidc_entry()])
+
+    await delete_kv_store_operation(bitbucket, KV, branch_suffix="abc123")
+
+    assert bitbucket.deleted == [STORE_DIR]
+
+
+async def test_delete_of_an_unknown_store_is_404(bitbucket):
+    with pytest.raises(VaultOperationError) as error:
+        await delete_kv_store_operation(bitbucket, "nope", branch_suffix="abc123")
+
+    assert error.value.status_code == 404
+    assert "create_branch" not in bitbucket.calls
+
+
+async def test_a_repeat_delete_is_404(bitbucket):
+    """The state is idempotent; the status code says which call did the work."""
+    seed_store(bitbucket, oidc=[oidc_entry()])
+    await delete_kv_store_operation(bitbucket, KV, branch_suffix="abc123")
+    # Simulate the merge landing the removal on the base branch.
+    del bitbucket.existing_files[OIDC_PATH]
+
+    with pytest.raises(VaultOperationError) as error:
+        await delete_kv_store_operation(bitbucket, KV, branch_suffix="def456")
+
+    assert error.value.status_code == 404
+
+
+async def test_delete_pull_request_only_stops_at_the_pull_request(bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry()])
+
+    result = await delete_kv_store_pull_request_operation(
+        bitbucket, KV, branch_suffix="abc123"
+    )
+
+    assert result.pull_request.state == "OPEN"
+    assert "await_builds" not in bitbucket.calls
+    assert bitbucket.deleted == [STORE_DIR]

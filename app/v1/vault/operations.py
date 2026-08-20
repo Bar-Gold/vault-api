@@ -1,19 +1,22 @@
-"""Business logic for Vault KV stores and the service accounts bound to them.
+"""Business logic for Vault KV stores and the grants that reach them.
 
-A values file holds one **list** of named stores under `kvStores`, so a create appends to
-`kv/<file>.yaml` rather than owning a file of its own; the file is created if this is its
-first store.
+A **KV store is a directory**, `KVs/<team>/<kv>/`, holding up to two files split by
+`authType` — `oidc-access.yaml` and `k8s-access.yaml`. Each file carries one `access` list
+of grants of its own kind. A store with no Kubernetes grants has no `k8s-access.yaml` at
+all rather than an empty one.
 
-A Kubernetes service account binding is **nested inside a store**, under
-`k8sServiceAccounts`, not stored beside it. That single fact removes a whole category of
-work: nothing points at a binding from elsewhere, so there is no referential rule, no
-cross-file uniqueness scan and no orphan to refuse — deleting a store takes its bindings
-with it. What a binding *means* in Vault — the mount, the policy, the HCL — is the deploy
-pipeline's business; this service never generates any of it.
+The **Tashtiot per-team file** is the second layout: `KVs/Tashtiot/<team>.yaml`, one flat
+file whose `access` list mixes both kinds. It grants a team access into the shared services
+store, so it is per-team rather than per-KV and has no directory of its own. It is a
+different resource with its own routes; everything after the commit is identical.
+
+A grant is one entry: a principal, a path and the capabilities it has there. What a grant
+*means* in Vault — the mount, the policy, the HCL — is the deploy pipeline's business, and
+this service generates none of it.
 
 The create flow is a GitOps chain with two CI gates:
 
-    1. commit the values file to a short-lived branch
+    1. commit the access files to a short-lived branch
     2. open a pull request against the base branch
     3. wait for the **validation** build on the pull request's commit — it blocks the merge
     4. merge the pull request
@@ -24,10 +27,6 @@ result against the commit it built, and Bitbucket keeps it — that store is wha
 request's Builds tab shows. So a gate is "ask Bitbucket about a sha we already hold", which
 is why there are no pipeline matchers and no pre-flight watermark here.
 
-The request blocks until step 5 finishes, then returns "Successful creation of <name>".
-Update and delete run the same chain over a different document — one entry edited, one
-entry removed — so all three share its rollbacks rather than each hand-rolling them.
-
 There is no transaction, so each step rolls back what the earlier steps did:
 committing fails -> delete the branch; the PR fails to open -> delete the branch; the
 validation build fails or times out -> decline the PR and delete the branch. **The merge is
@@ -37,6 +36,7 @@ revert PR and a second human decision.
 """
 
 import uuid
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import yaml
@@ -45,30 +45,36 @@ from tashtiot_apis_library.connectors import ExternalServiceError
 
 from ...clients.bitbucket import BuildStatus, BuildTimeoutError, PullRequest
 from ...helpers import (
-    K8sServiceAccountIdentity,
-    K8sServiceAccountNotFound,
-    add_k8s_service_account,
-    add_kv_store,
+    ACCESS_KEY,
+    K8S_ACCESS_FILE,
+    K8S_AUTH_TYPE,
+    OIDC_ACCESS_FILE,
+    AccessEntryNotFound,
+    DuplicateAccessEntry,
+    access_entry_identity,
+    access_path_for,
+    add_access_entry,
+    auth_type_of,
+    build_access_document,
     build_branch_name,
-    build_k8s_service_account,
-    build_kv_store,
-    find_k8s_service_account,
-    find_kv_store,
-    k8s_service_account_identity,
-    k8s_service_accounts,
-    kv_store_names,
-    remove_k8s_service_account,
+    build_k8s_access_entry,
+    build_oidc_access_entry,
+    kv_store_dir,
+    partition_access,
+    read_access_entries,
+    remove_access_entry,
     render_values_yaml,
-    update_kv_store,
-    values_file_path,
+    replace_access_entries,
+    tashtiot_access_path,
     yaml_data_equals,
 )
 from .conf import config
 from .schemas import (
     BuildInfo,
-    K8sServiceAccountCreate,
+    K8sAccessEntry,
     OperationStatus,
     PullRequestInfo,
+    TashtiotAccessUpsert,
     VaultKVCreate,
     VaultKVUpdate,
     VaultOperationResponse,
@@ -76,7 +82,7 @@ from .schemas import (
 
 
 class VaultOperationError(Exception):
-    """A create flow that failed for a business reason rather than a transport error.
+    """A flow that failed for a business reason rather than a transport error.
 
     Carries everything the route needs to build the failed response body, so the route
     stays a thin mapping layer.
@@ -148,6 +154,72 @@ def _build_failure(kind: str, builds: List[BuildStatus]) -> str:
     return f"{kind} did not pass: " + ", ".join(str(build) for build in failed)
 
 
+def to_document_entry(entry: Any) -> Dict[str, Any]:
+    """A validated request entry as the dict that lands in the file.
+
+    The single bridge between the request models and the document helpers. It is the only
+    place that knows a request's `auth_type` selects which builder to call, which keeps
+    every key name in `helpers.py` and every rule in `schemas.py`.
+    """
+    capabilities = [capability.value for capability in entry.capabilities]
+    if isinstance(entry, K8sAccessEntry):
+        return build_k8s_access_entry(
+            entry.path, entry.name, entry.namespace, entry.cluster, capabilities
+        )
+    return build_oidc_access_entry(entry.path, entry.dn, capabilities)
+
+
+def _entry_text(entry: Dict[str, Any]) -> str:
+    """One grant as a human-readable token, for messages and PR descriptions."""
+    capabilities = ",".join(entry.get("capabilities") or [])
+    if auth_type_of(entry) == K8S_AUTH_TYPE:
+        who = f"{entry.get('name')} in {entry.get('namespace')} on {entry.get('cluster')}"
+    else:
+        who = str(entry.get("dn"))
+    return f"{who} on {entry.get('path')} [{capabilities}]"
+
+
+# --------------------------------------------------------------------------- #
+# what a commit changes
+# --------------------------------------------------------------------------- #
+@dataclass
+class FileWrite:
+    """One file to create or replace on the branch.
+
+    `source_commit_id` is Bitbucket's optimistic-lock token, required when editing a path
+    that already exists and refused when creating one — so it is per-file, not per-commit.
+    A store writes two of these, which is why the chain takes a list.
+    """
+
+    path: str
+    content: str
+    source_commit_id: Optional[str] = None
+
+
+@dataclass
+class Change:
+    """Everything one pull request does to the repo.
+
+    `removes` holds paths *or directories*; deleting a store removes its whole directory.
+    A change can carry both — an update that empties a store's Kubernetes grants rewrites
+    `oidc-access.yaml` and removes `k8s-access.yaml` in the same commit.
+    """
+
+    writes: List[FileWrite]
+    removes: List[str]
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.writes and not self.removes
+
+    @property
+    def primary_path(self) -> str:
+        """What the response and error messages name as the subject."""
+        if self.writes:
+            return self.writes[0].path
+        return self.removes[0] if self.removes else ""
+
+
 # --------------------------------------------------------------------------- #
 # rollback helpers
 # --------------------------------------------------------------------------- #
@@ -172,12 +244,16 @@ async def _decline_and_cleanup(bitbucket: Any, pull_request: PullRequest, branch
     await _delete_branch_quietly(bitbucket, branch)
 
 
+# --------------------------------------------------------------------------- #
+# reading
+# --------------------------------------------------------------------------- #
 async def _read_document(
-    bitbucket: Any, path: str, kv_name: str, file: str
+    bitbucket: Any, path: str, kv_name: str = ""
 ) -> Optional[Dict[str, Any]]:
-    """Parsed values file at the base branch, or None when it does not exist yet.
+    """Parsed file at the base branch, or None when it does not exist.
 
-    None is a legitimate answer, not an error: the first entry in a file creates it.
+    None is a legitimate answer, not an error: a store with no Kubernetes grants has no
+    `k8s-access.yaml`, and the first write to any path creates it.
     """
     base_branch = config.VAULT_VALUES_REPO_BASE_BRANCH
     try:
@@ -188,197 +264,174 @@ async def _read_document(
         raise
 
     try:
-        parsed = yaml.safe_load(raw)
-    except yaml.YAMLError as parse_error:
+        return yaml.safe_load(raw)
+    except yaml.YAMLError as invalid:
         raise VaultOperationError(
-            f"{path} exists on {base_branch} but is not valid YAML: {parse_error}",
+            f"{path} exists on {base_branch} but is not valid YAML: {invalid}",
             kv_name=kv_name,
-            file=file,
-        ) from parse_error
-
-    # `kvStores:` with nothing under it parses to None — an empty file, not a broken one.
-    if parsed is not None and not isinstance(parsed, dict):
-        raise VaultOperationError(
-            f"{path} exists on {base_branch} but is not a YAML mapping",
-            kv_name=kv_name,
-            file=file,
-        )
-    return parsed
+            file=path,
+            status_code=502,
+        ) from invalid
 
 
-async def _walk_values_files(
+async def _walk_store_dirs(
     bitbucket: Any, skipped: Optional[List[str]] = None
-) -> AsyncIterator[Tuple[str, str, Any]]:
-    """Every parsed yaml under `VAULT_VALUES_DIR` on the base branch: file, path, document.
+) -> AsyncIterator[Tuple[str, str, str]]:
+    """Every store directory under the values dir: (team, kv_name, directory path).
 
-    Two callers, and both exist because a store name is the one thing in this format with a
-    values-dir-wide namespace: the create's duplicate scan, and `_resolve_store`, which is
-    how every other route finds a store without the caller naming a file. A file we did not
-    write, or a bad merge, is logged and skipped rather than blocking an unrelated
-    operation.
+    Bitbucket's `files/{dir}` resource lists **recursively**, returning paths relative to
+    the directory, so one call yields `cloudops/my-passwords/oidc-access.yaml` and this
+    only has to group them. A store is any path of exactly three segments whose last is one
+    of the two access files — which is also what keeps the Tashtiot layout out of the walk,
+    since `Tashtiot/cloudops.yaml` is two.
 
-    It costs a directory listing plus a read per file, which is why a caller does it once,
-    up front, and takes everything it needs out of the same pass.
-
-    `file` is the relative path with its extension stripped — the value that round-trips
-    through `values_file_path` for the flat layout this service writes. It is *reported*,
-    never taken as input, so a hand-made file in a sub-directory yields a name that is not
-    addressable and that costs nothing.
+    Yielded once per directory, not once per file, and in a stable order so a duplicate
+    scan and a resolution see the same repo the same way.
     """
     base_branch = config.VAULT_VALUES_REPO_BASE_BRANCH
     values_dir = config.VAULT_VALUES_DIR
 
+    seen: Dict[Tuple[str, str], str] = {}
     for relative_path in await bitbucket.list_files(values_dir, at=base_branch):
-        if not relative_path.endswith((".yaml", ".yml")):
+        parts = relative_path.strip("/").split("/")
+        if len(parts) != 3 or parts[2] not in (OIDC_ACCESS_FILE, K8S_ACCESS_FILE):
+            if skipped is not None and relative_path.endswith((".yaml", ".yml")):
+                # Not a store file. Recorded so a 404 can say what it walked past, but not
+                # an error: the Tashtiot files live here too, and so may a README.
+                skipped.append(f"{values_dir.strip('/')}/{relative_path.lstrip('/')}")
             continue
-        path = f"{values_dir.strip('/')}/{relative_path.lstrip('/')}"
-        try:
-            raw = await bitbucket.get_file_content(path, at=base_branch)
-            parsed = yaml.safe_load(raw)
-        except ExternalServiceError as exc:
-            if exc.status_code == 404:
-                # Listed but unreadable — deleted between the list and the read.
-                continue
-            raise
-        except yaml.YAMLError:
-            logger.warning(f"Skipping unparseable values file: {path}")
-            if skipped is not None:
-                skipped.append(path)
-            continue
+        team, kv_name, _ = parts
+        seen.setdefault((team, kv_name), kv_store_dir(values_dir, team, kv_name))
 
-        yield relative_path.lstrip("/").rsplit(".", 1)[0], path, parsed
+    for (team, kv_name), directory in sorted(seen.items()):
+        yield team, kv_name, directory
 
 
-async def _assert_name_is_free(bitbucket: Any, kv_name: str, file: str) -> None:
-    """Reject a create whose store name is already used **anywhere** in the values dir.
+@dataclass
+class ResolvedStore:
+    """A store found by name: where it lives and everything it grants."""
 
-    Store names are global to Vault, so uniqueness cannot be scoped to one file — and that
-    same global uniqueness is what lets every other route address a store by name alone.
+    team: str
+    kv_name: str
+    directory: str
+    oidc_document: Optional[Dict[str, Any]]
+    k8s_document: Optional[Dict[str, Any]]
 
-    This is a check, not a lock: two creates in flight both pass it, and the second pull
-    request then conflicts at merge. That is the same race the whole GitOps flow already
-    has, and a human resolves it.
+    @property
+    def oidc_path(self) -> str:
+        return f"{self.directory}/{OIDC_ACCESS_FILE}"
+
+    @property
+    def k8s_path(self) -> str:
+        return f"{self.directory}/{K8S_ACCESS_FILE}"
+
+    @property
+    def access(self) -> List[Dict[str, Any]]:
+        """Every grant, both kinds, oidc first — the order a create writes them."""
+        return [
+            *read_access_entries(self.oidc_document),
+            *read_access_entries(self.k8s_document),
+        ]
+
+
+async def _resolve_store(bitbucket: Any, kv_name: str) -> ResolvedStore:
+    """Find a store by name alone, wherever team it belongs to.
+
+    A store name is unique across the whole values directory — the create enforces exactly
+    that — so the name is the address and a caller never has to remember the team. The cost
+    is a directory listing per read, edit and delete; unlike the old flat layout there is no
+    single conventional path to try first, because the team sits between the values dir and
+    the store.
+
+    **If the walk skipped files it could not classify, the 404 names them** — otherwise a
+    values directory in an unexpected shape reads as a deleted store and sends an operator
+    after the wrong problem.
     """
-    async for _, path, parsed in _walk_values_files(bitbucket):
-        if kv_name in kv_store_names(parsed):
-            raise VaultOperationError(
-                f"{kv_name} already exists (defined in {path} on "
-                f"{config.VAULT_VALUES_REPO_BASE_BRANCH})",
-                kv_name=kv_name,
-                file=file,
-                status_code=409,
-            )
-
-
-async def _resolve_store(
-    bitbucket: Any, kv_name: str
-) -> Tuple[str, str, Dict[str, Any], Dict[str, Any]]:
-    """Find the store named `kv_name`: its file, path, whole document and own entry.
-
-    **This is why no route but the create mentions a file.** A store name is unique across
-    the entire values directory — the create enforces exactly that — so the name alone
-    addresses a store, and a caller never has to remember which file it was grouped into.
-
-    Two steps, because the common case should not pay for the general one:
-
-    1. try `<values dir>/<kv_name>.yaml`, the file a create with no `file` writes. One read,
-       and it answers for every store created the normal way. It still has to *find* the
-       store inside: a file may be named after one store while holding another.
-    2. otherwise walk the directory, which is what finds a store grouped into a file under
-       somebody else's name.
-
-    A store that is in no file at all is the 404 — the same answer `GET`/`PATCH`/`DELETE`
-    have always given for a store that is not there.
-    """
-    values_dir = config.VAULT_VALUES_DIR
-    conventional_path = values_file_path(values_dir, kv_name)
-
-    document = await _read_document(bitbucket, conventional_path, kv_name, kv_name)
-    if document is not None:
-        store = find_kv_store(document, kv_name)
-        if store is not None:
-            return kv_name, conventional_path, document, store
-
     skipped: List[str] = []
-    async for file, path, parsed in _walk_values_files(bitbucket, skipped=skipped):
-        if path == conventional_path or not isinstance(parsed, dict):
+    async for team, name, directory in _walk_store_dirs(bitbucket, skipped=skipped):
+        if name != kv_name:
             continue
-        store = find_kv_store(parsed, kv_name)
-        if store is not None:
-            return file, path, parsed, store
+        return ResolvedStore(
+            team=team,
+            kv_name=kv_name,
+            directory=directory,
+            oidc_document=await _read_document(
+                bitbucket, f"{directory}/{OIDC_ACCESS_FILE}", kv_name
+            ),
+            k8s_document=await _read_document(
+                bitbucket, f"{directory}/{K8S_ACCESS_FILE}", kv_name
+            ),
+        )
 
-    # A file the walk could not parse might be the very one holding the store, and "not
-    # defined anywhere" would send an operator looking for the wrong problem. The
-    # conventional path does not need this — `_read_document` reports its own YAML error.
-    unreadable = (
-        f" ({len(skipped)} unparseable file(s) skipped: {', '.join(skipped)})"
-        if skipped
-        else ""
-    )
+    note = f" (skipped: {', '.join(skipped)})" if skipped else ""
     raise VaultOperationError(
-        f"{kv_name} is not defined in any file under {values_dir} on "
-        f"{config.VAULT_VALUES_REPO_BASE_BRANCH}{unreadable}",
+        f"{kv_name} is not defined under {config.VAULT_VALUES_DIR} on "
+        f"{config.VAULT_VALUES_REPO_BASE_BRANCH}{note}",
         kv_name=kv_name,
         status_code=404,
     )
 
 
+async def _assert_name_is_free(bitbucket: Any, kv_name: str) -> None:
+    """A store name is global to Vault, so this scans every team, not just the target one.
+
+    A check, not a lock: two creates in flight both pass and the second pull request
+    conflicts at merge, the same as any other GitOps race.
+    """
+    async for team, name, directory in _walk_store_dirs(bitbucket):
+        if name == kv_name:
+            raise VaultOperationError(
+                f"{kv_name} already exists under {team} ({directory})",
+                kv_name=kv_name,
+                file=directory,
+                status_code=409,
+            )
+
+
 # --------------------------------------------------------------------------- #
-# operations
+# the chain
 # --------------------------------------------------------------------------- #
 async def _open_pull_request(
     bitbucket: Any,
     *,
-    path: str,
+    change: Change,
     branch: str,
     summary: str,
     description: str,
-    content: Optional[str] = None,
-    remove: bool = False,
     kv_name: str = "",
-    source_commit_id: Optional[str] = None,
 ) -> PullRequest:
     """branch -> commit -> open PR, and nothing after that.
 
     Both rollbacks live here: a failed commit or a failed PR deletes the branch, so a
     failure leaves the repo exactly as it was found. Touches no CI and never merges.
 
-    Shared by `_commit_via_pull_request` (which goes on to gate and merge) and all four
-    PR-only operations (which stop here). One implementation means they cannot drift apart
-    in what they roll back. `kv_name` only names the subject in the log line; a binding
-    operation passes the store it edits, since that is what the diff touches.
+    Shared by `_commit_via_pull_request` (which goes on to gate and merge) and every
+    PR-only operation (which stops here). One implementation means they cannot drift apart
+    in what they roll back.
 
-    **`remove=True` commits a deletion of `path` instead of new content**, which is the
-    only step in the chain that is not a REST call — Bitbucket Server cannot delete a file
-    over REST, so `delete_file` pushes the commit over git instead (`app/clients/git.py`).
-    Everything either side of it is identical, rollback included: the branch is deleted the
-    same way whichever produced it. `remove` and `content` are mutually exclusive rather
-    than `content=None` meaning "delete", because a `None` that slipped through by accident
-    would then silently remove a file instead of failing.
+    **A change may touch several paths.** A store is two files, so a create commits twice on
+    the same branch and the pull request carries both — Bitbucket's browse resource writes
+    one path per call. Removals go last, and go through `delete_file`, which is the one
+    operation Bitbucket Server has no REST endpoint for (`app/clients/git.py`).
     """
-    if remove and content is not None:
-        raise ValueError("a removal commits no content")
-    if not remove and content is None:
-        raise ValueError("content is required unless the commit removes the file")
-
     base_branch = config.VAULT_VALUES_REPO_BASE_BRANCH
 
     await bitbucket.create_branch(branch, base_branch)
     try:
-        if remove:
+        for write in change.writes:
+            await bitbucket.put_file(
+                path=write.path,
+                branch=branch,
+                content=write.content,
+                message=summary,
+                source_commit_id=write.source_commit_id,
+            )
+        for path in change.removes:
             await bitbucket.delete_file(
                 path=path,
                 branch=branch,
                 base_branch=base_branch,
                 message=summary,
-            )
-        else:
-            await bitbucket.put_file(
-                path=path,
-                branch=branch,
-                content=content,
-                message=summary,
-                source_commit_id=source_commit_id,
             )
     except Exception:
         await _delete_branch_quietly(bitbucket, branch)
@@ -403,20 +456,15 @@ async def _open_pull_request(
 async def _commit_via_pull_request(
     bitbucket: Any,
     *,
-    path: str,
+    change: Change,
     branch: str,
     summary: str,
     description: str,
-    content: Optional[str] = None,
-    remove: bool = False,
     kv_name: str = "",
-    source_commit_id: Optional[str] = None,
 ) -> Tuple[PullRequest, List[BuildStatus], List[BuildStatus]]:
     """branch -> commit -> PR -> gate 1 -> merge -> gate 2, with every rollback.
 
-    Shared by every mutating flow — stores and bindings alike: the only thing that differs
-    between them is what gets written (or, for a delete, removed) and whether an
-    optimistic-lock token is needed.
+    Shared by every mutating flow: the only thing that differs between them is the `Change`.
     Keeping one implementation means the rollback asymmetry cannot drift between
     operations. `kv_name` is carried only so a failure names its subject.
 
@@ -433,14 +481,11 @@ async def _commit_via_pull_request(
     # ---- 1-2. branch + commit + pull request ------------------------------- #
     pull_request = await _open_pull_request(
         bitbucket,
-        path=path,
-        content=content,
-        remove=remove,
+        change=change,
         branch=branch,
         summary=summary,
         description=description,
         kv_name=kv_name,
-        source_commit_id=source_commit_id,
     )
 
     # ---- 3. validation build (blocks the merge) ---------------------------- #
@@ -539,58 +584,79 @@ async def _commit_via_pull_request(
     return merged, validation, deploy
 
 
-def _branch_for(file: str, kv_name: str, branch_suffix: Optional[str]) -> str:
+def _branch_for(team: str, kv_name: str, branch_suffix: Optional[str]) -> str:
     return build_branch_name(
-        file, kv_name, branch_suffix or uuid.uuid4().hex[:8], config.BRANCH_PREFIX
+        team, kv_name, branch_suffix or uuid.uuid4().hex[:8], config.BRANCH_PREFIX
     )
 
 
-def _create_description(payload: VaultKVCreate) -> str:
-    roles = "\n".join(
-        f"  - {role}: {', '.join(hosts)}" for role, hosts in payload.roles.items()
-    )
+def _describe(subject: str, directory: str, entries: List[Dict[str, Any]], change: str) -> str:
+    grants = "\n".join(f"  - {_entry_text(entry)}" for entry in entries)
     return (
         f"Automated by vault-api.\n\n"
-        f"- file: {config.VAULT_VALUES_DIR}/{payload.kv_name}.yaml\n"
-        f"- store: {payload.kv_name}\n"
-        f"- description: {payload.kv_description}\n"
-        f"- roles:\n{roles}\n"
+        f"- location: {directory}\n"
+        f"- subject: {subject}\n"
+        f"- change: {change}\n"
+        f"- grants:\n{grants}\n"
     )
+
+
+# --------------------------------------------------------------------------- #
+# creating a store
+# --------------------------------------------------------------------------- #
+def _store_writes(
+    directory: str,
+    entries: List[Dict[str, Any]],
+    oidc_source: Optional[str] = None,
+    k8s_source: Optional[str] = None,
+) -> Tuple[List[FileWrite], List[str]]:
+    """Split grants across the store's two files, and say which files to drop.
+
+    The single place the two-file layout is applied. A kind with no grants produces **no
+    file** rather than an empty one — that is the format's shape, and it is what a create
+    writes, so an edit that empties a kind removes its file to match. `partition_access`
+    is what knows which entry goes where.
+    """
+    oidc_entries, k8s_entries = partition_access(entries)
+
+    writes: List[FileWrite] = []
+    removes: List[str] = []
+
+    for file_entries, path, source in (
+        (oidc_entries, f"{directory}/{OIDC_ACCESS_FILE}", oidc_source),
+        (k8s_entries, f"{directory}/{K8S_ACCESS_FILE}", k8s_source),
+    ):
+        if file_entries:
+            writes.append(
+                FileWrite(
+                    path=path,
+                    content=render_values_yaml(build_access_document(file_entries)),
+                    source_commit_id=source,
+                )
+            )
+        elif source is not None:
+            # The file exists on the base branch but has no grants left.
+            removes.append(path)
+
+    return writes, removes
 
 
 async def _prepare_create(
     bitbucket: Any, payload: VaultKVCreate
-) -> Tuple[str, str, Optional[str]]:
+) -> Tuple[str, Change, List[Dict[str, Any]]]:
     """Everything a create needs before it touches a branch.
 
-    Returns the file path, the rendered document with the new store appended, and the
-    optimistic-lock token — `None` when the file does not exist yet, which is what tells
-    Bitbucket to treat the write as a create rather than an edit.
-
-    The store names its own file, so `kv_name` is passed where a file used to be. The
-    duplicate scan still walks the whole values directory rather than just testing whether
-    `<kv_name>.yaml` exists: a store grouped into another file by an older revision of this
-    service would otherwise be invisible to it, and the name has to stay unique against
-    those too.
+    The name scan is the only values-dir-wide question here, and it is a check rather than a
+    lock. Nothing else is read: the store is new, so neither access file exists and no
+    optimistic-lock token applies.
     """
-    path = values_file_path(config.VAULT_VALUES_DIR, payload.kv_name)
+    await _assert_name_is_free(bitbucket, payload.kv_name)
 
-    # Names are global to Vault, so this scans every file, not just the target one.
-    await _assert_name_is_free(bitbucket, payload.kv_name, payload.kv_name)
+    directory = kv_store_dir(config.VAULT_VALUES_DIR, payload.team, payload.kv_name)
+    entries = [to_document_entry(entry) for entry in payload.access]
+    writes, removes = _store_writes(directory, entries)
 
-    current = await _read_document(bitbucket, path, payload.kv_name, payload.kv_name)
-    updated = add_kv_store(
-        current,
-        build_kv_store(payload.kv_name, payload.kv_description, payload.roles),
-    )
-
-    source_commit_id = None
-    if current is not None:
-        source_commit_id = await bitbucket.get_last_commit(
-            path, at=config.VAULT_VALUES_REPO_BASE_BRANCH
-        )
-
-    return path, render_values_yaml(updated), source_commit_id
+    return directory, Change(writes=writes, removes=removes), entries
 
 
 async def create_kv_mount_operation(
@@ -598,25 +664,23 @@ async def create_kv_mount_operation(
     payload: VaultKVCreate,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
-    """Append the store to its file, then block until both pipelines have finished."""
-    path, content, source_commit_id = await _prepare_create(bitbucket, payload)
+    """Write the store's directory, then block until both pipelines have finished."""
+    directory, change, entries = await _prepare_create(bitbucket, payload)
 
     merged, validation, deploy = await _commit_via_pull_request(
         bitbucket,
-        path=path,
-        content=content,
-        branch=_branch_for(payload.kv_name, payload.kv_name, branch_suffix),
-        summary=f"Create KV store {payload.kv_name}",
-        description=_create_description(payload),
+        change=change,
+        branch=_branch_for(payload.team, payload.kv_name, branch_suffix),
+        summary=f"Create KV store {payload.kv_name} for {payload.team}",
+        description=_describe(payload.kv_name, directory, entries, "store created"),
         kv_name=payload.kv_name,
-        source_commit_id=source_commit_id,
     )
 
     return VaultOperationResponse(
         status=OperationStatus.SUCCEEDED,
         message=f"Successful creation of {payload.kv_name}",
         kv_name=payload.kv_name,
-        file=payload.kv_name,
+        file=directory,
         pull_request=_pull_request_info(merged),
         validation_builds=_build_infos(validation),
         deploy_builds=_build_infos(deploy),
@@ -630,24 +694,20 @@ async def create_kv_pull_request_operation(
 ) -> VaultOperationResponse:
     """Open the pull request and stop — no CI gates, no merge.
 
-    The same duplicate guard, branch, commit and pull request as a create, minus everything
-    that waits or merges. Returns as soon as Bitbucket has the PR, so it answers in one
-    round-trip instead of blocking for the length of two pipelines.
-
-    Nothing reaches the base branch: whoever reviews the pull request decides that. Note
-    that this takes no Woodpecker client at all — the argument would be dead weight.
+    The same duplicate guard, branch, commits and pull request as a create, minus everything
+    that waits or merges. Two consequences, both deliberate: the forge still runs the
+    validation pipeline (it is simply not waited on), and a repeat call opens a second pull
+    request, because the name scan reads the base branch and an unmerged PR is not there.
     """
-    path, content, source_commit_id = await _prepare_create(bitbucket, payload)
+    directory, change, entries = await _prepare_create(bitbucket, payload)
 
     pull_request = await _open_pull_request(
         bitbucket,
-        path=path,
-        content=content,
-        branch=_branch_for(payload.kv_name, payload.kv_name, branch_suffix),
-        summary=f"Create KV store {payload.kv_name}",
-        description=_create_description(payload),
+        change=change,
+        branch=_branch_for(payload.team, payload.kv_name, branch_suffix),
+        summary=f"Create KV store {payload.kv_name} for {payload.team}",
+        description=_describe(payload.kv_name, directory, entries, "store created"),
         kv_name=payload.kv_name,
-        source_commit_id=source_commit_id,
     )
 
     return VaultOperationResponse(
@@ -657,28 +717,60 @@ async def create_kv_pull_request_operation(
             f"It is not merged — review, CI and merge are up to you."
         ),
         kv_name=payload.kv_name,
-        file=payload.kv_name,
+        file=directory,
         pull_request=_pull_request_info(pull_request),
     )
 
 
 # --------------------------------------------------------------------------- #
-# edits to an existing store
+# editing a store
 # --------------------------------------------------------------------------- #
-async def _require_document(
-    bitbucket: Any, path: str, kv_name: str, file: str
-) -> Dict[str, Any]:
-    """Like `_read_document`, but a missing file is a 404 rather than an empty start."""
-    document = await _read_document(bitbucket, path, kv_name, file)
-    if document is None:
-        raise VaultOperationError(
-            f"{file} does not exist ({path} is not on "
-            f"{config.VAULT_VALUES_REPO_BASE_BRANCH})",
-            kv_name=kv_name,
-            file=file,
-            status_code=404,
-        )
-    return document
+async def _source_commits(
+    bitbucket: Any, store: ResolvedStore
+) -> Tuple[Optional[str], Optional[str]]:
+    """Bitbucket's optimistic-lock token for each of the store's files.
+
+    Only for a file that already exists: without the token the browse resource rejects an
+    edit as an attempted create, and *with* one it rejects a create as an attempted edit.
+    A store with no `k8s-access.yaml` yields `None` for it, which is exactly right for the
+    edit that adds the first Kubernetes grant.
+    """
+    base_branch = config.VAULT_VALUES_REPO_BASE_BRANCH
+    oidc_source = (
+        await bitbucket.get_last_commit(store.oidc_path, at=base_branch)
+        if store.oidc_document is not None
+        else None
+    )
+    k8s_source = (
+        await bitbucket.get_last_commit(store.k8s_path, at=base_branch)
+        if store.k8s_document is not None
+        else None
+    )
+    return oidc_source, k8s_source
+
+
+def _unchanged(store: ResolvedStore, entries: List[Dict[str, Any]]) -> bool:
+    """Whether an edit would produce the files already on the base branch.
+
+    Compares parsed documents rather than text, so a re-render (an indent rule, a key
+    order) never counts as a change and never opens an empty pull request.
+    """
+    oidc_entries, k8s_entries = partition_access(entries)
+    return yaml_data_equals(
+        [read_access_entries(store.oidc_document), read_access_entries(store.k8s_document)],
+        [oidc_entries, k8s_entries],
+    )
+
+
+async def _apply_store_edit(
+    bitbucket: Any,
+    store: ResolvedStore,
+    entries: List[Dict[str, Any]],
+) -> Change:
+    """The `Change` that makes the store's files hold exactly `entries`."""
+    oidc_source, k8s_source = await _source_commits(bitbucket, store)
+    writes, removes = _store_writes(store.directory, entries, oidc_source, k8s_source)
+    return Change(writes=writes, removes=removes)
 
 
 async def update_kv_mount_operation(
@@ -687,70 +779,42 @@ async def update_kv_mount_operation(
     payload: VaultKVUpdate,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
-    """Edit one store's description and/or roles. Its name and siblings are untouched.
+    """Replace a store's grant list, then block until both pipelines have finished.
 
-    The store is found by name — `_resolve_store` supplies the file, so the caller does
-    not name one and an unknown store is the 404 before any edit is attempted.
+    The store is found by name — `_resolve_store` supplies the team, so the caller does not
+    name one and an unknown store is the 404 before any edit is attempted.
 
-    An edit that changes nothing returns success without opening a pull request — the
-    reason `yaml_data_equals` exists. That keeps repeat requests from filling the values
-    repo with empty pull requests.
+    An edit that changes nothing returns success **without opening a pull request**, which
+    is what keeps repeat requests from filling the values repo with empty diffs.
     """
-    file, path, current, _ = await _resolve_store(bitbucket, kv_name)
+    store = await _resolve_store(bitbucket, kv_name)
+    entries = [to_document_entry(entry) for entry in payload.access]
 
-    updated = update_kv_store(
-        current,
-        kv_name,
-        description=payload.kv_description,
-        roles=payload.roles,
-    )
-
-    if yaml_data_equals(current, updated):
+    if _unchanged(store, entries):
         logger.info(f"No change required for {kv_name}; skipping the pull request")
         return VaultOperationResponse(
             status=OperationStatus.SUCCEEDED,
             message=f"No changes required for {kv_name}",
             kv_name=kv_name,
-            file=file,
+            file=store.directory,
         )
 
-    changes = ", ".join(
-        part
-        for part in (
-            f"description: {payload.kv_description!r}"
-            if payload.kv_description is not None
-            else "",
-            f"roles: {payload.roles}" if payload.roles is not None else "",
-        )
-        if part
-    )
-
-    # Editing an existing file needs Bitbucket's optimistic-lock token for that path.
-    source_commit_id = await bitbucket.get_last_commit(
-        path, at=config.VAULT_VALUES_REPO_BASE_BRANCH
-    )
+    change = await _apply_store_edit(bitbucket, store, entries)
 
     merged, validation, deploy = await _commit_via_pull_request(
         bitbucket,
-        path=path,
-        content=render_values_yaml(updated),
-        branch=_branch_for(file, kv_name, branch_suffix),
-        summary=f"Update KV store {kv_name} in {file}",
-        description=(
-            f"Automated by vault-api.\n\n"
-            f"- file: {path}\n"
-            f"- store: {kv_name}\n"
-            f"- changes: {changes}\n"
-        ),
+        change=change,
+        branch=_branch_for(store.team, kv_name, branch_suffix),
+        summary=f"Update KV store {kv_name} for {store.team}",
+        description=_describe(kv_name, store.directory, entries, "grants replaced"),
         kv_name=kv_name,
-        source_commit_id=source_commit_id,
     )
 
     return VaultOperationResponse(
         status=OperationStatus.SUCCEEDED,
         message=f"Successful update of {kv_name}",
         kv_name=kv_name,
-        file=file,
+        file=store.directory,
         pull_request=_pull_request_info(merged),
         validation_builds=_build_infos(validation),
         deploy_builds=_build_infos(deploy),
@@ -758,36 +822,213 @@ async def update_kv_mount_operation(
 
 
 # --------------------------------------------------------------------------- #
+# one grant at a time
+#
+# The sub-resource form of an edit: `PATCH` replaces the whole list, these change a single
+# entry without the caller sending the rest. One pair of endpoints covers both kinds —
+# which file an entry lands in follows from its `authType`, so there is nothing for a
+# caller to choose and no second route to keep in step.
+# --------------------------------------------------------------------------- #
+async def _prepare_access_change(
+    bitbucket: Any,
+    kv_name: str,
+    entry: Dict[str, Any],
+    removing: bool,
+) -> Tuple[ResolvedStore, Change, str]:
+    """Add or remove one grant in whichever of the store's files it belongs to.
+
+    Only that file is rewritten — the other is not read for a token and not touched, so a
+    Kubernetes grant never shows up in the diff of an OIDC change.
+    """
+    store = await _resolve_store(bitbucket, kv_name)
+    kind = auth_type_of(entry)
+    path = access_path_for(
+        config.VAULT_VALUES_DIR, store.team, store.kv_name, kind
+    )
+    document = store.k8s_document if kind == K8S_AUTH_TYPE else store.oidc_document
+
+    if removing:
+        try:
+            updated = remove_access_entry(document, access_entry_identity(entry))
+        except AccessEntryNotFound as missing:
+            raise VaultOperationError(
+                f"{_entry_text(entry)} is not granted on {kv_name}",
+                kv_name=kv_name,
+                file=store.directory,
+                status_code=404,
+            ) from missing
+    else:
+        try:
+            updated = add_access_entry(document, entry)
+        except DuplicateAccessEntry as duplicate:
+            raise VaultOperationError(
+                f"{_entry_text(entry)} is already granted on {kv_name}",
+                kv_name=kv_name,
+                file=store.directory,
+                status_code=409,
+            ) from duplicate
+
+    base_branch = config.VAULT_VALUES_REPO_BASE_BRANCH
+    source_commit_id = (
+        await bitbucket.get_last_commit(path, at=base_branch)
+        if document is not None
+        else None
+    )
+
+    remaining = read_access_entries(updated)
+    if remaining:
+        change = Change(
+            writes=[
+                FileWrite(
+                    path=path,
+                    content=render_values_yaml(build_access_document(remaining)),
+                    source_commit_id=source_commit_id,
+                )
+            ],
+            removes=[],
+        )
+    else:
+        # The last grant of this kind is gone, so the file goes with it — an empty
+        # `access: []` is a shape no create writes.
+        change = Change(writes=[], removes=[path])
+
+    return store, change, path
+
+
+async def add_access_entry_operation(
+    bitbucket: Any,
+    kv_name: str,
+    payload: Any,
+    branch_suffix: Optional[str] = None,
+) -> VaultOperationResponse:
+    """Grant one principal access to a store, then block until both pipelines finish."""
+    entry = to_document_entry(payload)
+    store, change, _ = await _prepare_access_change(bitbucket, kv_name, entry, removing=False)
+
+    merged, validation, deploy = await _commit_via_pull_request(
+        bitbucket,
+        change=change,
+        branch=_branch_for(store.team, kv_name, branch_suffix),
+        summary=f"Grant {_entry_text(entry)} on {kv_name}",
+        description=_describe(kv_name, store.directory, [entry], "grant added"),
+        kv_name=kv_name,
+    )
+
+    return VaultOperationResponse(
+        status=OperationStatus.SUCCEEDED,
+        message=f"Successfully granted {_entry_text(entry)} on {kv_name}",
+        kv_name=kv_name,
+        file=store.directory,
+        pull_request=_pull_request_info(merged),
+        validation_builds=_build_infos(validation),
+        deploy_builds=_build_infos(deploy),
+    )
+
+
+async def add_access_entry_pull_request_operation(
+    bitbucket: Any,
+    kv_name: str,
+    payload: Any,
+    branch_suffix: Optional[str] = None,
+) -> VaultOperationResponse:
+    """Open the pull request that adds the grant, and stop — no CI gates, no merge."""
+    entry = to_document_entry(payload)
+    store, change, _ = await _prepare_access_change(bitbucket, kv_name, entry, removing=False)
+
+    pull_request = await _open_pull_request(
+        bitbucket,
+        change=change,
+        branch=_branch_for(store.team, kv_name, branch_suffix),
+        summary=f"Grant {_entry_text(entry)} on {kv_name}",
+        description=_describe(kv_name, store.directory, [entry], "grant added"),
+        kv_name=kv_name,
+    )
+
+    return VaultOperationResponse(
+        status=OperationStatus.SUCCEEDED,
+        message=(
+            f"Opened pull request {pull_request.id} to grant {_entry_text(entry)} on "
+            f"{kv_name}. It is not merged — review, CI and merge are up to you."
+        ),
+        kv_name=kv_name,
+        file=store.directory,
+        pull_request=_pull_request_info(pull_request),
+    )
+
+
+async def remove_access_entry_operation(
+    bitbucket: Any,
+    kv_name: str,
+    entry: Dict[str, Any],
+    branch_suffix: Optional[str] = None,
+) -> VaultOperationResponse:
+    """Revoke one grant, then block until both pipelines have finished."""
+    store, change, _ = await _prepare_access_change(bitbucket, kv_name, entry, removing=True)
+
+    merged, validation, deploy = await _commit_via_pull_request(
+        bitbucket,
+        change=change,
+        branch=_branch_for(store.team, kv_name, branch_suffix),
+        summary=f"Revoke {_entry_text(entry)} on {kv_name}",
+        description=_describe(kv_name, store.directory, [entry], "grant removed"),
+        kv_name=kv_name,
+    )
+
+    return VaultOperationResponse(
+        status=OperationStatus.SUCCEEDED,
+        message=f"Successfully revoked {_entry_text(entry)} on {kv_name}",
+        kv_name=kv_name,
+        file=store.directory,
+        pull_request=_pull_request_info(merged),
+        validation_builds=_build_infos(validation),
+        deploy_builds=_build_infos(deploy),
+    )
+
+
+async def remove_access_entry_pull_request_operation(
+    bitbucket: Any,
+    kv_name: str,
+    entry: Dict[str, Any],
+    branch_suffix: Optional[str] = None,
+) -> VaultOperationResponse:
+    """Open the pull request that revokes the grant, and stop — no CI gates, no merge."""
+    store, change, _ = await _prepare_access_change(bitbucket, kv_name, entry, removing=True)
+
+    pull_request = await _open_pull_request(
+        bitbucket,
+        change=change,
+        branch=_branch_for(store.team, kv_name, branch_suffix),
+        summary=f"Revoke {_entry_text(entry)} on {kv_name}",
+        description=_describe(kv_name, store.directory, [entry], "grant removed"),
+        kv_name=kv_name,
+    )
+
+    return VaultOperationResponse(
+        status=OperationStatus.SUCCEEDED,
+        message=(
+            f"Opened pull request {pull_request.id} to revoke {_entry_text(entry)} on "
+            f"{kv_name}. It is not merged — review, CI and merge are up to you."
+        ),
+        kv_name=kv_name,
+        file=store.directory,
+        pull_request=_pull_request_info(pull_request),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # removing a store
 # --------------------------------------------------------------------------- #
-async def _prepare_delete(bitbucket: Any, kv_name: str) -> Tuple[str, str]:
-    """Everything a delete needs before it touches a branch, the file included.
+async def _prepare_delete(bitbucket: Any, kv_name: str) -> ResolvedStore:
+    """Resolve the store, and nothing else.
 
-    The counterpart of `_prepare_create`, and shared by both delete paths for the same
-    reason: they cannot then disagree about what is a 404. `_resolve_store` is that 404 —
-    a store in no file cannot be deleted, and the caller never named a file to be wrong
-    about.
+    A delete removes the store's **directory**, both files with it, so there is no document
+    to render, nothing to diff and no optimistic-lock token to fetch — git resolves the path
+    from the branch it fetched. `_resolve_store` is the 404.
 
-    **A delete removes the file, always.** One file holds one store, so there is no
-    document to render, nothing to diff, and no `source_commit_id` to fetch: git resolves
-    the path from the branch it fetched, and Bitbucket's optimistic-lock token has no part
-    in a removal. That is why this returns only the two coordinates a commit needs, and why
-    it is the shortest prepare of the four.
-
-    It runs **no referential scan** either: a store's Kubernetes service accounts are
-    nested inside it, so the file takes them with it and nothing is left dangling.
+    No referential scan either: a grant lives inside the store it reaches, so the directory
+    takes every grant with it and nothing is left dangling.
     """
-    file, path, _, _ = await _resolve_store(bitbucket, kv_name)
-    return file, path
-
-
-def _delete_description(path: str, kv_name: str) -> str:
-    return (
-        f"Automated by vault-api.\n\n"
-        f"- file: {path}\n"
-        f"- store: {kv_name}\n"
-        f"- change: file deleted\n"
-    )
+    return await _resolve_store(bitbucket, kv_name)
 
 
 async def delete_kv_store_operation(
@@ -795,28 +1036,21 @@ async def delete_kv_store_operation(
     kv_name: str,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
-    """Delete the store's file, then block until both pipelines have finished.
-
-    **A file removal, not a content edit.** A store names its own file and is the only
-    thing in it, so deleting the store deletes the file — leaving `kvStores: []` behind
-    would accumulate a dead file per store ever deleted, in a shape no create would ever
-    produce.
+    """Delete the store's directory, then block until both pipelines have finished.
 
     The chain and every rollback come from `_commit_via_pull_request` unchanged, so the
-    merge is the point of no return here too — a deploy pipeline that fails after a delete
-    is reported, and the message says the removal already needs a revert. Only the commit
-    step differs: Bitbucket Server has no REST endpoint that deletes a file, so that one
-    call is git (`app/clients/git.py`).
+    merge is the point of no return here too. Only the commit differs: Bitbucket Server has
+    no REST endpoint that deletes a path, so that call is git (`app/clients/git.py`), and it
+    removes the directory recursively.
     """
-    file, path = await _prepare_delete(bitbucket, kv_name)
+    store = await _prepare_delete(bitbucket, kv_name)
 
     merged, validation, deploy = await _commit_via_pull_request(
         bitbucket,
-        path=path,
-        remove=True,
-        branch=_branch_for(file, kv_name, branch_suffix),
-        summary=f"Delete KV store {kv_name} from {file}",
-        description=_delete_description(path, kv_name),
+        change=Change(writes=[], removes=[store.directory]),
+        branch=_branch_for(store.team, kv_name, branch_suffix),
+        summary=f"Delete KV store {kv_name} from {store.team}",
+        description=_describe(kv_name, store.directory, store.access, "store deleted"),
         kv_name=kv_name,
     )
 
@@ -824,7 +1058,7 @@ async def delete_kv_store_operation(
         status=OperationStatus.SUCCEEDED,
         message=f"Successful deletion of {kv_name}",
         kv_name=kv_name,
-        file=file,
+        file=store.directory,
         pull_request=_pull_request_info(merged),
         validation_builds=_build_infos(validation),
         deploy_builds=_build_infos(deploy),
@@ -836,25 +1070,20 @@ async def delete_kv_store_pull_request_operation(
     kv_name: str,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
-    """Open the pull request that removes the store, and stop — no CI gates, no merge.
+    """Open the pull request that deletes the store, and stop — no CI gates, no merge.
 
-    The escape hatch matters more for a delete than for a create: it is the most
-    destructive operation here, and this hands the decision to a reviewer. Takes no
-    Woodpecker client, exactly as the PR-only create does.
-
-    Nothing reaches the base branch, so the store is still there afterwards — and a repeat
-    call opens a second pull request for the same removal, for the same reason a repeat
-    PR-only create does.
+    The escape hatch matters more for a delete than for a create: it is the most destructive
+    operation here, and this hands the decision to a reviewer. Nothing reaches the base
+    branch, so a repeat call opens a second removal pull request.
     """
-    file, path = await _prepare_delete(bitbucket, kv_name)
+    store = await _prepare_delete(bitbucket, kv_name)
 
     pull_request = await _open_pull_request(
         bitbucket,
-        path=path,
-        remove=True,
-        branch=_branch_for(file, kv_name, branch_suffix),
-        summary=f"Delete KV store {kv_name} from {file}",
-        description=_delete_description(path, kv_name),
+        change=Change(writes=[], removes=[store.directory]),
+        branch=_branch_for(store.team, kv_name, branch_suffix),
+        summary=f"Delete KV store {kv_name} from {store.team}",
+        description=_describe(kv_name, store.directory, store.access, "store deleted"),
         kv_name=kv_name,
     )
 
@@ -865,302 +1094,171 @@ async def delete_kv_store_pull_request_operation(
             f"It is not merged — review, CI and merge are up to you."
         ),
         kv_name=kv_name,
-        file=file,
+        file=store.directory,
         pull_request=_pull_request_info(pull_request),
     )
+
+
+# --------------------------------------------------------------------------- #
+# the Tashtiot per-team file
+#
+# A different resource, and mostly by *subtraction*: one flat file rather than a directory,
+# both kinds in one `access` list rather than split, addressed by team rather than by a
+# globally unique store name. So there is no name scan (a team owns exactly one of these,
+# and its name is the address), no two-file partition and no directory to remove.
+# Everything from the commit onwards is the same chain.
+# --------------------------------------------------------------------------- #
+def _tashtiot_path(team: str) -> str:
+    return tashtiot_access_path(config.VAULT_VALUES_DIR, config.TASHTIOT_DIR, team)
+
+
+async def _require_tashtiot(bitbucket: Any, team: str) -> Tuple[str, Dict[str, Any]]:
+    """The team's file, or a 404. Used by every route but the create."""
+    path = _tashtiot_path(team)
+    document = await _read_document(bitbucket, path, team)
+    if document is None:
+        raise VaultOperationError(
+            f"{team} has no {config.TASHTIOT_DIR} access file ({path} is not on "
+            f"{config.VAULT_VALUES_REPO_BASE_BRANCH})",
+            kv_name=team,
+            file=path,
+            status_code=404,
+        )
+    return path, document
+
+
+async def upsert_tashtiot_access_operation(
+    bitbucket: Any,
+    team: str,
+    payload: TashtiotAccessUpsert,
+    branch_suffix: Optional[str] = None,
+) -> VaultOperationResponse:
+    """Create or replace one team's grants into the shared services store.
+
+    Create and replace are the same call because the file's identity is the team: there is
+    no name to collide with and nothing to be a duplicate of, so a 409 would have nothing
+    to describe. An upsert that changes nothing short-circuits like an update does.
+    """
+    path = _tashtiot_path(team)
+    entries = [to_document_entry(entry) for entry in payload.access]
+    current = await _read_document(bitbucket, path, team)
+
+    if current is not None and yaml_data_equals(read_access_entries(current), entries):
+        logger.info(f"No change required for {team}; skipping the pull request")
+        return VaultOperationResponse(
+            status=OperationStatus.SUCCEEDED,
+            message=f"No changes required for {team}",
+            kv_name=team,
+            file=path,
+        )
+
+    base_branch = config.VAULT_VALUES_REPO_BASE_BRANCH
+    source_commit_id = (
+        await bitbucket.get_last_commit(path, at=base_branch)
+        if current is not None
+        else None
+    )
+
+    updated = replace_access_entries(current, entries)
+    change = Change(
+        writes=[
+            FileWrite(
+                path=path,
+                content=render_values_yaml(updated),
+                source_commit_id=source_commit_id,
+            )
+        ],
+        removes=[],
+    )
+
+    verb = "updated" if current is not None else "created"
+    merged, validation, deploy = await _commit_via_pull_request(
+        bitbucket,
+        change=change,
+        branch=_branch_for(config.TASHTIOT_DIR.lower(), team, branch_suffix),
+        summary=f"{verb.capitalize()} {config.TASHTIOT_DIR} access for {team}",
+        description=_describe(team, path, entries, f"{config.TASHTIOT_DIR} access {verb}"),
+        kv_name=team,
+    )
+
+    return VaultOperationResponse(
+        status=OperationStatus.SUCCEEDED,
+        message=f"Successfully {verb} {config.TASHTIOT_DIR} access for {team}",
+        kv_name=team,
+        file=path,
+        pull_request=_pull_request_info(merged),
+        validation_builds=_build_infos(validation),
+        deploy_builds=_build_infos(deploy),
+    )
+
+
+async def delete_tashtiot_access_operation(
+    bitbucket: Any,
+    team: str,
+    branch_suffix: Optional[str] = None,
+) -> VaultOperationResponse:
+    """Remove one team's Tashtiot file entirely."""
+    path, document = await _require_tashtiot(bitbucket, team)
+
+    merged, validation, deploy = await _commit_via_pull_request(
+        bitbucket,
+        change=Change(writes=[], removes=[path]),
+        branch=_branch_for(config.TASHTIOT_DIR.lower(), team, branch_suffix),
+        summary=f"Delete {config.TASHTIOT_DIR} access for {team}",
+        description=_describe(
+            team, path, read_access_entries(document), f"{config.TASHTIOT_DIR} access deleted"
+        ),
+        kv_name=team,
+    )
+
+    return VaultOperationResponse(
+        status=OperationStatus.SUCCEEDED,
+        message=f"Successful deletion of {config.TASHTIOT_DIR} access for {team}",
+        kv_name=team,
+        file=path,
+        pull_request=_pull_request_info(merged),
+        validation_builds=_build_infos(validation),
+        deploy_builds=_build_infos(deploy),
+    )
+
+
+async def get_tashtiot_access_operation(bitbucket: Any, team: str) -> Dict[str, Any]:
+    """One team's Tashtiot file, parsed and returned as-is."""
+    _, document = await _require_tashtiot(bitbucket, team)
+    return document
 
 
 # --------------------------------------------------------------------------- #
 # reads
 # --------------------------------------------------------------------------- #
-async def get_kv_file_operation(bitbucket: Any, file: str) -> Dict[str, Any]:
-    """The whole values file — every store it defines."""
-    path = values_file_path(config.VAULT_VALUES_DIR, file)
-    return await _require_document(bitbucket, path, kv_name="", file=file)
-
-
 async def get_kv_store_operation(bitbucket: Any, kv_name: str) -> Dict[str, Any]:
-    """One store, found by name wherever it lives."""
-    _, _, _, store = await _resolve_store(bitbucket, kv_name)
-    return store
+    """One store: where it lives and every grant on it, both kinds together.
 
-
-# --------------------------------------------------------------------------- #
-# Kubernetes service accounts
-#
-# A binding is a sub-resource of a store, not a resource kind of its own, and that changes
-# what these operations have to do rather than how they do it. The chain is unchanged —
-# `_open_pull_request` and `_commit_via_pull_request` are reused verbatim, so the rollback
-# asymmetry is identical and the merge is still the point of no return.
-#
-# What is *absent* is the point. Because the binding lives inside the store, there is no
-# cross-file scan here at all: no uniqueness walk (a binding is unique within its store,
-# and the same service account may legitimately reach many stores), no store-existence
-# check (the store is the thing being edited — if it is not there, that is the 404), and
-# no referential rule (nothing points at a binding, so nothing can dangle).
-# --------------------------------------------------------------------------- #
-def _k8s_sa_branch_for(file: str, kv_name: str, branch_suffix: Optional[str]) -> str:
-    """Its own prefix, so a reviewer can tell the change kind from the branch name.
-
-    Keyed on the store, not the binding: the triple has no name to slug, and the store is
-    what the diff touches.
+    Not a raw file, because a store is two of them. The `access` list is the union, oidc
+    first, which is the order a create writes them.
     """
-    return build_branch_name(
-        file,
-        kv_name,
-        branch_suffix or uuid.uuid4().hex[:8],
-        config.K8S_SA_BRANCH_PREFIX,
-    )
+    store = await _resolve_store(bitbucket, kv_name)
+    return {
+        "team": store.team,
+        "kv_name": store.kv_name,
+        "directory": store.directory,
+        ACCESS_KEY: store.access,
+    }
 
 
-def _identity_text(identity: K8sServiceAccountIdentity) -> str:
-    """The triple as one human-readable token, for messages and PR descriptions."""
-    service_account, namespace, cluster = identity
-    return f"{service_account} in {namespace} on {cluster}"
+async def get_kv_access_operation(bitbucket: Any, kv_name: str) -> List[Dict[str, Any]]:
+    """Just the grants on one store. An empty list is a 200, not a 404."""
+    store = await _resolve_store(bitbucket, kv_name)
+    return store.access
 
 
-def _k8s_sa_description(
-    path: str, kv_name: str, identity: K8sServiceAccountIdentity, change: str
-) -> str:
-    service_account, namespace, cluster = identity
-    return (
-        f"Automated by vault-api.\n\n"
-        f"- file: {path}\n"
-        f"- store: {kv_name}\n"
-        f"- change: {change}\n"
-        f"- serviceAccount: {service_account}\n"
-        f"- namespace: {namespace}\n"
-        f"- cluster: {cluster}\n"
-    )
+async def list_kv_stores_operation(bitbucket: Any) -> List[Dict[str, Any]]:
+    """Every store in the values directory: team, name and directory.
 
-
-async def _prepare_k8s_sa_add(
-    bitbucket: Any, kv_name: str, payload: K8sServiceAccountCreate
-) -> Tuple[str, str, str, Optional[str], K8sServiceAccountIdentity]:
-    """Everything adding a binding needs before it touches a branch, the file included.
-
-    Shared by the blocking path and its PR-only twin, the same way `_prepare_create` is, so
-    the two cannot disagree about what is a 404 and what is a 409. A binding is addressed
-    through its store, so it inherits the store's "found by name" rule for free.
+    The one route that answers without a name, and the cheap half of the walk — it lists
+    directories rather than reading any file.
     """
-    file, path, document, store = await _resolve_store(bitbucket, kv_name)
-
-    account = build_k8s_service_account(
-        payload.service_account, payload.namespace, payload.cluster
-    )
-    identity = k8s_service_account_identity(account)
-
-    # Unique within the store only. The same service account reaching two stores is the
-    # normal case — that is how one workload gets at two secrets.
-    if find_k8s_service_account(store, identity) is not None:
-        raise VaultOperationError(
-            f"{_identity_text(identity)} is already bound to {kv_name} in {path}",
-            kv_name=kv_name,
-            file=file,
-            status_code=409,
-        )
-
-    updated = add_k8s_service_account(document, kv_name, account)
-
-    # The file exists by definition here, so the write is an edit and Bitbucket wants the
-    # optimistic-lock token for that path.
-    source_commit_id = await bitbucket.get_last_commit(
-        path, at=config.VAULT_VALUES_REPO_BASE_BRANCH
-    )
-
-    return file, path, render_values_yaml(updated), source_commit_id, identity
-
-
-async def _prepare_k8s_sa_remove(
-    bitbucket: Any, kv_name: str, identity: K8sServiceAccountIdentity
-) -> Tuple[str, str, str, Optional[str]]:
-    """Everything removing a binding needs before it touches a branch, the file included.
-
-    No `yaml_data_equals` short circuit, for the same reason a store delete has none: if
-    `remove_k8s_service_account` did not raise, the document changed.
-    """
-    file, path, document, _ = await _resolve_store(bitbucket, kv_name)
-
-    try:
-        updated = remove_k8s_service_account(document, kv_name, identity)
-    except K8sServiceAccountNotFound as missing:
-        raise VaultOperationError(
-            f"{_identity_text(identity)} is not bound to {kv_name} in {path}",
-            kv_name=kv_name,
-            file=file,
-            status_code=404,
-        ) from missing
-
-    source_commit_id = await bitbucket.get_last_commit(
-        path, at=config.VAULT_VALUES_REPO_BASE_BRANCH
-    )
-
-    return file, path, render_values_yaml(updated), source_commit_id
-
-
-async def add_k8s_service_account_operation(
-    bitbucket: Any,
-    kv_name: str,
-    payload: K8sServiceAccountCreate,
-    branch_suffix: Optional[str] = None,
-) -> VaultOperationResponse:
-    """Bind a service account to a store, then block until both pipelines have finished."""
-    file, path, content, source_commit_id, identity = await _prepare_k8s_sa_add(
-        bitbucket, kv_name, payload
-    )
-
-    merged, validation, deploy = await _commit_via_pull_request(
-        bitbucket,
-        path=path,
-        content=content,
-        branch=_k8s_sa_branch_for(file, kv_name, branch_suffix),
-        summary=f"Bind service account {payload.service_account} to {kv_name} in {file}",
-        description=_k8s_sa_description(
-            path, kv_name, identity, "added to k8sServiceAccounts"
-        ),
-        kv_name=kv_name,
-        source_commit_id=source_commit_id,
-    )
-
-    return VaultOperationResponse(
-        status=OperationStatus.SUCCEEDED,
-        message=f"Successfully bound {_identity_text(identity)} to {kv_name}",
-        kv_name=kv_name,
-        file=file,
-        pull_request=_pull_request_info(merged),
-        validation_builds=_build_infos(validation),
-        deploy_builds=_build_infos(deploy),
-    )
-
-
-async def add_k8s_service_account_pull_request_operation(
-    bitbucket: Any,
-    kv_name: str,
-    payload: K8sServiceAccountCreate,
-    branch_suffix: Optional[str] = None,
-) -> VaultOperationResponse:
-    """Open the pull request that adds the binding, and stop — no CI gates, no merge.
-
-    Takes no Woodpecker client, exactly as the other PR-only operations do, and carries the
-    same two consequences: the forge still runs the validation pipeline (it is simply not
-    waited on), and a repeat call opens a second pull request because the first is not on
-    the base branch for the duplicate check to see.
-    """
-    file, path, content, source_commit_id, identity = await _prepare_k8s_sa_add(
-        bitbucket, kv_name, payload
-    )
-
-    pull_request = await _open_pull_request(
-        bitbucket,
-        path=path,
-        content=content,
-        branch=_k8s_sa_branch_for(file, kv_name, branch_suffix),
-        summary=f"Bind service account {payload.service_account} to {kv_name} in {file}",
-        description=_k8s_sa_description(
-            path, kv_name, identity, "added to k8sServiceAccounts"
-        ),
-        kv_name=kv_name,
-        source_commit_id=source_commit_id,
-    )
-
-    return VaultOperationResponse(
-        status=OperationStatus.SUCCEEDED,
-        message=(
-            f"Opened pull request {pull_request.id} to bind "
-            f"{_identity_text(identity)} to {kv_name}. "
-            f"It is not merged — review, CI and merge are up to you."
-        ),
-        kv_name=kv_name,
-        file=file,
-        pull_request=_pull_request_info(pull_request),
-    )
-
-
-async def remove_k8s_service_account_operation(
-    bitbucket: Any,
-    kv_name: str,
-    identity: K8sServiceAccountIdentity,
-    branch_suffix: Optional[str] = None,
-) -> VaultOperationResponse:
-    """Unbind a service account from a store, then block until both pipelines finish.
-
-    Removing the store's last binding drops the `k8sServiceAccounts` key entirely, leaving
-    the store exactly as a fresh create would have written it.
-    """
-    file, path, content, source_commit_id = await _prepare_k8s_sa_remove(
-        bitbucket, kv_name, identity
-    )
-
-    service_account, _, _ = identity
-    merged, validation, deploy = await _commit_via_pull_request(
-        bitbucket,
-        path=path,
-        content=content,
-        branch=_k8s_sa_branch_for(file, kv_name, branch_suffix),
-        summary=f"Unbind service account {service_account} from {kv_name} in {file}",
-        description=_k8s_sa_description(
-            path, kv_name, identity, "removed from k8sServiceAccounts"
-        ),
-        kv_name=kv_name,
-        source_commit_id=source_commit_id,
-    )
-
-    return VaultOperationResponse(
-        status=OperationStatus.SUCCEEDED,
-        message=f"Successfully unbound {_identity_text(identity)} from {kv_name}",
-        kv_name=kv_name,
-        file=file,
-        pull_request=_pull_request_info(merged),
-        validation_builds=_build_infos(validation),
-        deploy_builds=_build_infos(deploy),
-    )
-
-
-async def remove_k8s_service_account_pull_request_operation(
-    bitbucket: Any,
-    kv_name: str,
-    identity: K8sServiceAccountIdentity,
-    branch_suffix: Optional[str] = None,
-) -> VaultOperationResponse:
-    """Open the pull request that removes the binding, and stop — no CI gates, no merge."""
-    file, path, content, source_commit_id = await _prepare_k8s_sa_remove(
-        bitbucket, kv_name, identity
-    )
-
-    service_account, _, _ = identity
-    pull_request = await _open_pull_request(
-        bitbucket,
-        path=path,
-        content=content,
-        branch=_k8s_sa_branch_for(file, kv_name, branch_suffix),
-        summary=f"Unbind service account {service_account} from {kv_name} in {file}",
-        description=_k8s_sa_description(
-            path, kv_name, identity, "removed from k8sServiceAccounts"
-        ),
-        kv_name=kv_name,
-        source_commit_id=source_commit_id,
-    )
-
-    return VaultOperationResponse(
-        status=OperationStatus.SUCCEEDED,
-        message=(
-            f"Opened pull request {pull_request.id} to unbind "
-            f"{_identity_text(identity)} from {kv_name}. "
-            f"It is not merged — review, CI and merge are up to you."
-        ),
-        kv_name=kv_name,
-        file=file,
-        pull_request=_pull_request_info(pull_request),
-    )
-
-
-async def get_k8s_service_accounts_operation(
-    bitbucket: Any, kv_name: str
-) -> List[Dict[str, Any]]:
-    """Every binding on one store.
-
-    A store that binds nothing answers 200 with an empty list — it simply has no
-    `k8sServiceAccounts` key. Only a store that is in no file at all is a 404.
-    """
-    _, _, _, store = await _resolve_store(bitbucket, kv_name)
-    return k8s_service_accounts(store)
+    stores: List[Dict[str, Any]] = []
+    async for team, kv_name, directory in _walk_store_dirs(bitbucket):
+        stores.append({"team": team, "kv_name": kv_name, "directory": directory})
+    return stores

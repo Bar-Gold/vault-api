@@ -2,216 +2,334 @@
 
 Everything here is side-effect free: given a request it produces the committed file's path,
 body and any edit applied to it. Keeping it pure means the artefact this service writes is
-unit-testable without touching Bitbucket or Woodpecker.
+unit-testable without touching Bitbucket.
 
 Note what is *not* here: nothing models a Vault mount, an engine version or a policy. This
-service writes a file and watches the pipelines; what the file means is the deploy
+service writes files and watches the pipelines; what the files mean is the deploy
 pipeline's business.
+
+## The document
+
+Every file this service writes has the **same** single top-level key, `access`, holding a
+list of entries. An entry is one grant: who, over which path, with which capabilities.
+`authType` discriminates the two shapes:
+
+    access:
+      - path: "*"
+        authType: oidc
+        dn: "CN=team,OU=Groups,DC=corp,DC=example,DC=com"
+        capabilities:
+          - read
+          - write
+      - path: "services/+/tyk/*"
+        authType: k8s
+        name: argocd
+        namespace: perimeter
+        cluster: dev
+        capabilities:
+          - read
+
+**The model is principal → capabilities**, which is the inverse of the `roles` mapping this
+service used to write (capability → principals). One entry carries one principal's grant on
+one path, so the same DN on two paths is two entries and that is the intended shape.
+
+## Where it goes
+
+Two layouts, one document model:
+
+- **A KV store** is a *directory*, `KVs/<team>/<kv>/`, holding up to two files split by
+  `authType` — `oidc-access.yaml` and `k8s-access.yaml`. The split is the format's, not
+  ours: each file's `access` list holds only its own kind. A store with no Kubernetes
+  grants has no `k8s-access.yaml` at all rather than an empty one.
+- **The Tashtiot per-team file** is flat: `KVs/Tashtiot/<team>.yaml`, one file whose
+  `access` list carries **both** kinds mixed. It grants a team access into the shared
+  services store, so it is per-team rather than per-KV and has no directory of its own.
+
+`partition_access` is the single place that knows entries are split by kind, and
+`build_access_document` the single place that knows the top-level key.
 """
 
 import copy
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import yaml
 
-# The document's only top-level key: a *list* of named stores.
-KV_STORES_KEY = "kvStores"
+# The document's only top-level key, in both layouts.
+ACCESS_KEY = "access"
 
-# Kubernetes service accounts are **not** a second top-level key, and not a sibling of
-# `roles` either. They are a list under `roles`, level with `read`/`write` — two levels
-# inside the store. See the k8sServiceAccounts section at the bottom of this module.
-ROLES_KEY = "roles"
-K8S_SERVICE_ACCOUNTS_KEY = "k8sServiceAccounts"
+# The discriminator, and its two values. These are the pipeline's vocabulary: change them
+# here and in the pipeline together.
+AUTH_TYPE_KEY = "authType"
+OIDC_AUTH_TYPE = "oidc"
+K8S_AUTH_TYPE = "k8s"
+
+CAPABILITIES_KEY = "capabilities"
+
+# The two files a KV store directory holds. A store with no grants of one kind simply has
+# no file of that kind.
+OIDC_ACCESS_FILE = "oidc-access.yaml"
+K8S_ACCESS_FILE = "k8s-access.yaml"
+
+# Field order within an entry, which is the committed text's order — `sort_keys=False` in
+# `render_values_yaml` is what preserves it. Kept as tuples so the order is stated once.
+_OIDC_ENTRY_KEYS = ("path", AUTH_TYPE_KEY, "dn", CAPABILITIES_KEY)
+_K8S_ENTRY_KEYS = ("path", AUTH_TYPE_KEY, "name", "namespace", "cluster", CAPABILITIES_KEY)
 
 
+class AccessEntryNotFound(LookupError):
+    """The identified entry is not in this document."""
+
+
+class DuplicateAccessEntry(LookupError):
+    """An entry with this identity is already in this document."""
+
+
+# --------------------------------------------------------------------------- #
+# naming and paths
+# --------------------------------------------------------------------------- #
 def slugify_mount_path(mount_path: str) -> str:
     """Flatten a path into a single dash-separated token.
 
-    Branch names cannot contain a slash without nesting the ref. Names and files are
-    single-segment now, so this is belt-and-braces rather than load-bearing.
+    Branch names cannot contain a slash without nesting the ref, and a store's coordinates
+    are now two segments (team and name), so this is load-bearing again.
     """
     return mount_path.strip("/").replace("/", "-")
 
 
-def build_branch_name(file: str, kv_name: str, suffix: str, prefix: str) -> str:
+def build_branch_name(team: str, kv_name: str, suffix: str, prefix: str) -> str:
     """Short-lived branch the change is committed to before the PR is opened.
 
-    Carries both coordinates so a reviewer can tell from the branch name alone which file
-    and which store a pull request touches — **unless they are the same**, which is now the
-    normal case: a store names its own file, so carrying both would render
-    `vault-kv/myapp-myapp-abc123`. The file segment is kept only when it differs, which
-    happens for a store an older revision of this service grouped into another file.
+    Carries both coordinates so a reviewer can tell from the branch name alone which team
+    and which store a pull request touches — unless they are the same, which would render
+    `vault-kv/cloudops-cloudops-abc123`.
     """
     store = slugify_mount_path(kv_name)
-    group = slugify_mount_path(file)
-    coordinates = store if group == store else f"{group}-{store}"
+    owner = slugify_mount_path(team)
+    coordinates = store if owner == store else f"{owner}-{store}"
     return f"{prefix}/{coordinates}-{suffix}"
 
 
-def values_file_path(values_dir: str, file: str) -> str:
-    """Repo-relative path of the committed file, e.g. ``kv/payments.yaml``.
+def kv_store_dir(values_dir: str, team: str, kv_name: str) -> str:
+    """Repo-relative directory of one store, e.g. ``KVs/cloudops/my-passwords``.
 
-    Keyed on the *file*, not the store name: one file holds many stores.
+    A store is a *directory* now, not a file: the two access files live inside it, and a
+    delete removes the whole thing.
     """
-    return f"{values_dir.strip('/')}/{file.strip('/')}.yaml"
+    return f"{values_dir.strip('/')}/{team.strip('/')}/{kv_name.strip('/')}"
 
 
-def build_kv_store(
-    kv_name: str, kv_description: str, roles: Dict[str, List[str]]
+def oidc_access_path(values_dir: str, team: str, kv_name: str) -> str:
+    return f"{kv_store_dir(values_dir, team, kv_name)}/{OIDC_ACCESS_FILE}"
+
+
+def k8s_access_path(values_dir: str, team: str, kv_name: str) -> str:
+    return f"{kv_store_dir(values_dir, team, kv_name)}/{K8S_ACCESS_FILE}"
+
+
+def access_path_for(values_dir: str, team: str, kv_name: str, auth_type: str) -> str:
+    """The file an entry of this `authType` belongs in.
+
+    The one place that maps a kind to a file, so a caller never picks the filename itself.
+    """
+    if auth_type == K8S_AUTH_TYPE:
+        return k8s_access_path(values_dir, team, kv_name)
+    return oidc_access_path(values_dir, team, kv_name)
+
+
+def tashtiot_access_path(values_dir: str, tashtiot_dir: str, team: str) -> str:
+    """The flat per-team file, e.g. ``KVs/Tashtiot/cloudops.yaml``.
+
+    Deliberately not a `kv_store_dir`: this layout is one file holding both kinds, so it
+    has no directory and no oidc/k8s split.
+    """
+    return f"{values_dir.strip('/')}/{tashtiot_dir.strip('/')}/{team.strip('/')}.yaml"
+
+
+# --------------------------------------------------------------------------- #
+# building entries
+#
+# These are the *sole* writers of this format's key names. Change one and change the deploy
+# pipeline with it.
+# --------------------------------------------------------------------------- #
+def build_oidc_access_entry(
+    path: str, dn: str, capabilities: Iterable[str]
 ) -> Dict[str, Any]:
-    """One entry in the ``kvStores`` list.
-
-    This is the contract with the deploy pipeline. What the KV means in Vault — the mount,
-    the engine version, the policies — is the pipeline's business, not this service's, so
-    none of it is written here. Change this dict and the pipeline together.
-    """
+    """One OIDC grant: a group DN over a path."""
     return {
-        "name": kv_name,
-        "description": kv_description,
-        "roles": {role: list(hosts) for role, hosts in roles.items()},
+        "path": path,
+        AUTH_TYPE_KEY: OIDC_AUTH_TYPE,
+        "dn": dn,
+        CAPABILITIES_KEY: list(capabilities),
     }
 
 
-def build_kv_stores_document(stores: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """A whole values file from scratch: the ``kvStores`` list and nothing else.
+def build_k8s_access_entry(
+    path: str,
+    name: str,
+    namespace: str,
+    cluster: str,
+    capabilities: Iterable[str],
+) -> Dict[str, Any]:
+    """One Kubernetes grant: a service account triple over a path.
+
+    `name` rather than `serviceAccount` — that is the format's key, and it is not the same
+    name the previous revision of this service wrote.
+    """
+    return {
+        "path": path,
+        AUTH_TYPE_KEY: K8S_AUTH_TYPE,
+        "name": name,
+        "namespace": namespace,
+        "cluster": cluster,
+        CAPABILITIES_KEY: list(capabilities),
+    }
+
+
+def build_access_document(entries: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    """A whole access file from scratch: the `access` list and nothing else.
 
     A constructor, not a transform — the transforms below start from a parsed document and
     keep whatever else it holds.
     """
-    return {KV_STORES_KEY: list(stores)}
+    return {ACCESS_KEY: list(entries)}
 
 
 # --------------------------------------------------------------------------- #
-# entries under one top-level key
-#
-# A values file is a mapping whose top-level keys each hold a list of named entries;
-# `kvStores` is the only one today. Every transform here deep-copies the *whole* document
-# and replaces only its own key, so a sibling key it knows nothing about survives. An
-# earlier version rebuilt the document from the store list alone, which silently dropped
-# every other key — and the erase would have looked like a legitimate diff in the pull
-# request a human is supposed to review.
-#
-# Returning a new document rather than mutating the input is also what lets the update
-# operation diff old against new with `yaml_data_equals` and skip a no-op commit. Anything
-# added here has to keep both properties.
+# reading and identifying
 # --------------------------------------------------------------------------- #
-class KVStoreNotFound(LookupError):
-    """The named entry is not in this file."""
+def read_access_entries(document: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The `access` list, tolerating an absent key and an empty one.
 
-
-def _entries(values: Optional[Dict[str, Any]], key: str) -> List[Any]:
-    """The list under one top-level key, tolerating an empty or absent key.
-
-    A file that exists but has ``kvStores:`` with nothing under it parses to ``None``, which
-    is a legitimate empty file rather than a corrupt one.
+    `access:` with nothing under it parses to None — an empty file, not a corrupt one.
+    Non-dict entries are skipped so a hand-edited file cannot wedge an unrelated edit.
     """
-    if not values:
+    if not isinstance(document, dict):
         return []
-    entries = values.get(key)
-    return list(entries) if entries else []
+    entries = document.get(ACCESS_KEY)
+    if not isinstance(entries, list):
+        return []
+    return [entry for entry in entries if isinstance(entry, dict)]
 
 
-def _find_entry(
-    values: Optional[Dict[str, Any]], key: str, name: str
+def auth_type_of(entry: Dict[str, Any]) -> str:
+    """An entry's kind, defaulting to `oidc` when the key is missing.
+
+    The format's own default: an entry carrying a `dn` and no `authType` is an OIDC grant.
+    """
+    value = entry.get(AUTH_TYPE_KEY)
+    return value if isinstance(value, str) and value else OIDC_AUTH_TYPE
+
+
+def access_entry_identity(entry: Dict[str, Any]) -> Tuple[str, ...]:
+    """What makes an entry unique — everything except its capabilities.
+
+    Capabilities are the *mutable* part: granting `read` and later `read`+`write` to the
+    same principal on the same path is an edit of one entry, not a second entry. Missing
+    keys become "" so a hand-edited file cannot wedge an unrelated removal.
+    """
+    kind = auth_type_of(entry)
+    keys = _K8S_ENTRY_KEYS if kind == K8S_AUTH_TYPE else _OIDC_ENTRY_KEYS
+    return tuple(
+        str(entry.get(key, "") or "") if key != AUTH_TYPE_KEY else kind
+        for key in keys
+        if key != CAPABILITIES_KEY
+    )
+
+
+def access_entry_identities(
+    document: Optional[Dict[str, Any]],
+) -> List[Tuple[str, ...]]:
+    return [access_entry_identity(entry) for entry in read_access_entries(document)]
+
+
+def find_access_entry(
+    document: Optional[Dict[str, Any]], identity: Tuple[str, ...]
 ) -> Optional[Dict[str, Any]]:
-    for entry in _entries(values, key):
-        if isinstance(entry, dict) and entry.get("name") == name:
+    for entry in read_access_entries(document):
+        if access_entry_identity(entry) == identity:
             return entry
     return None
 
 
-def _entry_names(values: Optional[Dict[str, Any]], key: str) -> List[str]:
-    """Malformed entries are skipped so a hand-edited file cannot break a scan."""
-    return [
-        entry["name"]
-        for entry in _entries(values, key)
-        if isinstance(entry, dict) and entry.get("name")
-    ]
+def partition_access(
+    entries: Iterable[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split entries into (oidc, k8s) — the one place that knows the files are split.
 
-
-def _add_entry(
-    values: Optional[Dict[str, Any]], key: str, entry: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Append an entry, returning a **new** document.
-
-    Accepts None so the caller can treat "the file does not exist yet" and "the file exists
-    and we are appending" as the same code path.
+    Order within each kind is preserved, so the committed lists read in the order the
+    caller sent them.
     """
-    document = copy.deepcopy(values) if values else {}
-    document[key] = _entries(document, key) + [copy.deepcopy(entry)]
-    return document
-
-
-def _update_entry(
-    values: Dict[str, Any], key: str, name: str, **fields: Any
-) -> Dict[str, Any]:
-    """Replace the given fields on one entry, leaving its siblings alone.
-
-    A field passed as None is left untouched — that is how a partial edit says "not this
-    one". Values are copied in, so a caller that later mutates what it passed cannot reach
-    into the returned document.
-    """
-    document = copy.deepcopy(values)
-    entries = _entries(document, key)
-
+    oidc: List[Dict[str, Any]] = []
+    k8s: List[Dict[str, Any]] = []
     for entry in entries:
-        if not isinstance(entry, dict) or entry.get("name") != name:
-            continue
-        for field, value in fields.items():
-            if value is not None:
-                entry[field] = copy.deepcopy(value)
-        document[key] = entries
-        return document
-
-    raise KVStoreNotFound(name)
-
-
-def _remove_entry(values: Dict[str, Any], key: str, name: str) -> Dict[str, Any]:
-    """Drop one entry, returning a **new** document.
-
-    The key stays, holding a possibly empty list: an empty list is a file that declares
-    nothing, which the pipeline can act on, whereas a missing key is ambiguous.
-    """
-    document = copy.deepcopy(values)
-    entries = _entries(document, key)
-    remaining = [
-        entry
-        for entry in entries
-        if not (isinstance(entry, dict) and entry.get("name") == name)
-    ]
-
-    if len(remaining) == len(entries):
-        raise KVStoreNotFound(name)
-
-    document[key] = remaining
-    return document
+        (k8s if auth_type_of(entry) == K8S_AUTH_TYPE else oidc).append(entry)
+    return oidc, k8s
 
 
 # --------------------------------------------------------------------------- #
-# the `kvStores` key — thin wrappers so callers name the store, not the key
+# transforms
+#
+# Every transform deep-copies the whole document and replaces only the `access` key, so a
+# sibling key this service knows nothing about survives. It returns a **new** document and
+# never mutates its input — that is what lets an update diff old against new with
+# `yaml_data_equals` and skip a no-op commit. Anything added here must keep both properties.
 # --------------------------------------------------------------------------- #
-def read_kv_stores(values: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """The store list out of a parsed document, tolerating an empty or absent key."""
-    return _entries(values, KV_STORES_KEY)
-
-
-def find_kv_store(values: Dict[str, Any], kv_name: str) -> Optional[Dict[str, Any]]:
-    """The entry with this name, or None. Names are unique within a file."""
-    return _find_entry(values, KV_STORES_KEY, kv_name)
-
-
-def kv_store_names(values: Optional[Dict[str, Any]]) -> List[str]:
-    """Every store name in a document, for the cross-file duplicate scan."""
-    return _entry_names(values, KV_STORES_KEY)
-
-
-def add_kv_store(
-    values: Optional[Dict[str, Any]], store: Dict[str, Any]
+def _with_entries(
+    document: Optional[Dict[str, Any]], entries: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
-    """Append a store to a document, returning a **new** one."""
-    return _add_entry(values, KV_STORES_KEY, store)
+    updated = copy.deepcopy(document) if isinstance(document, dict) else {}
+    updated[ACCESS_KEY] = entries
+    return updated
 
 
+def add_access_entry(
+    document: Optional[Dict[str, Any]], entry: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Append one grant. `None` is accepted: the file may not exist yet.
+
+    Raises `DuplicateAccessEntry` when the identity is already present — the caller turns
+    that into a 409. Two entries differing only in capabilities are the same grant stated
+    twice, which is contradictory rather than additive.
+    """
+    entries = read_access_entries(document)
+    identity = access_entry_identity(entry)
+    if any(access_entry_identity(existing) == identity for existing in entries):
+        raise DuplicateAccessEntry(str(identity))
+    return _with_entries(document, [*copy.deepcopy(entries), copy.deepcopy(entry)])
+
+
+def remove_access_entry(
+    document: Optional[Dict[str, Any]], identity: Tuple[str, ...]
+) -> Dict[str, Any]:
+    """Drop one grant, raising `AccessEntryNotFound` when it is not there.
+
+    Unlike a store delete, an emptied list is **kept** as `access: []` rather than dropping
+    the key: a file that declares nothing is a meaningful statement, and the caller decides
+    separately whether an empty file should be removed.
+    """
+    entries = read_access_entries(document)
+    remaining = [
+        entry for entry in entries if access_entry_identity(entry) != identity
+    ]
+    if len(remaining) == len(entries):
+        raise AccessEntryNotFound(str(identity))
+    return _with_entries(document, copy.deepcopy(remaining))
+
+
+def replace_access_entries(
+    document: Optional[Dict[str, Any]], entries: Iterable[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Swap the whole `access` list, keeping every sibling key.
+
+    What a `PATCH` applies. Wholesale rather than merged: a caller that wants to drop a
+    grant sends the list without it, and nothing here has to guess at intent.
+    """
+    return _with_entries(document, copy.deepcopy(list(entries)))
+
+
+# --------------------------------------------------------------------------- #
+# rendering
+# --------------------------------------------------------------------------- #
 class _BlockStyleDumper(yaml.SafeDumper):
     """SafeDumper that indents block sequences and writes multi-line strings as blocks."""
 
@@ -221,29 +339,27 @@ class _BlockStyleDumper(yaml.SafeDumper):
         PyYAML defaults to the "indentless" form, which is valid YAML and parses
         identically::
 
-            kvStores:
-            - name: athena-passwords
+            access:
+            - path: "*"
 
-        but the deploy pipeline's format (and every hand-written values file) puts the
-        dash under the key::
+        but the deploy pipeline's format (and every hand-written file) puts the dash under
+        the key::
 
-            kvStores:
-              - name: athena-passwords
+            access:
+              - path: "*"
 
         Passing `indentless=False` unconditionally is the documented way to get that. It
-        applies to every sequence, so `roles` entries and `k8sServiceAccounts` indent the
-        same way — the committed file has one style throughout.
+        applies to every sequence, so `capabilities` indents the same way — the committed
+        file has one style throughout.
         """
         return super().increase_indent(flow=flow, indentless=False)
 
 
 def _represent_str(dumper: yaml.Dumper, data: str) -> Any:
-    """Render multi-line strings as ``|`` blocks, everything else normally.
+    """Multi-line strings as `|` blocks.
 
-    A description containing a newline would otherwise become a single escaped,
-    width-wrapped double-quoted scalar (``"line one\\nline two"``), which parses fine but
-    is unreadable in a pull request diff — and a human reviewing that diff is the whole
-    point of the GitOps flow.
+    The default representer emits one escaped, width-wrapped scalar, which is unreadable in
+    the pull request diff a human is supposed to review.
     """
     if "\n" in data:
         return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
@@ -254,7 +370,7 @@ _BlockStyleDumper.add_representer(str, _represent_str)
 
 
 def render_values_yaml(values: Dict[str, Any]) -> str:
-    """Serialise the values dict for committing. Key order is preserved for readable diffs."""
+    """Serialise the document for committing. Key order is preserved for readable diffs."""
     # width: PyYAML wraps at 80 columns by default, which splits long values mid-token and
     # undoes the readability the block style buys.
     return yaml.dump(
@@ -281,244 +397,3 @@ def yaml_data_equals(yaml_data_1, yaml_data_2) -> bool:
     if isinstance(yaml_data_2, str):
         yaml_data_2 = yaml.safe_load(yaml_data_2)
     return _normalize(yaml_data_1) == _normalize(yaml_data_2)
-
-
-# --------------------------------------------------------------------------- #
-# edits to an existing file
-#
-# Neither of these touches `name`: renaming means migrating the secrets in Vault, not
-# editing a field, so a rename is a delete plus a create.
-# --------------------------------------------------------------------------- #
-def update_kv_store(
-    values: Dict[str, Any],
-    kv_name: str,
-    description: Optional[str] = None,
-    roles: Optional[Dict[str, List[str]]] = None,
-) -> Dict[str, Any]:
-    """Replace the description and/or roles of one store, leaving its siblings alone.
-
-    `roles` is replaced wholesale rather than merged: a caller that wants to drop a
-    principal needs to be able to express it, and a merge would make removal impossible.
-
-    **Except for `k8sServiceAccounts`, which is carried across.** The bindings live *under*
-    `roles`, level with `read`/`write`, so a wholesale replacement would delete every one of
-    them — and the update request body cannot express bindings at all, so there would be no
-    way to put them back in the same call. Nothing about editing who may read a secret says
-    anything about which workloads are bound to it; those are separate endpoints, and this
-    keeps them independent. The bindings are re-appended last, so the committed order is
-    unchanged.
-    """
-    if roles is not None:
-        existing = k8s_service_accounts(find_kv_store(values, kv_name))
-        if existing:
-            roles = {**roles, K8S_SERVICE_ACCOUNTS_KEY: existing}
-
-    return _update_entry(
-        values, KV_STORES_KEY, kv_name, description=description, roles=roles
-    )
-
-
-def remove_kv_store(values: Dict[str, Any], kv_name: str) -> Dict[str, Any]:
-    """Drop one store from a document, leaving its siblings alone.
-
-    Removing the last store empties the list rather than dropping the key or the file:
-    `kvStores: []` still parses, still reads back as an empty file, and a later create
-    appends to it normally.
-    """
-    return _remove_entry(values, KV_STORES_KEY, kv_name)
-
-
-# --------------------------------------------------------------------------- #
-# the `k8sServiceAccounts` list — nested **inside `roles`**, level with read/write
-#
-# The pipeline's format binds a workload to a secret by listing the workload inside the
-# store it reaches, under the same `roles` mapping the principals live in:
-#
-#     kvStores:
-#       - name: athena-passwords
-#         description: Passwords for athena
-#         roles:
-#           write:
-#             - CN=<CN>,OU=<OU>,DC=<DC>
-#           k8sServiceAccounts:          # <- level with `write`, not with `roles`
-#             - serviceAccount: "vault"
-#               namespace: "<NAMESPACE>"
-#               cluster: dev
-#
-# That depth has one sharp consequence: `roles` is no longer a homogeneous mapping of
-# capability -> principals, and replacing it wholesale (which is what a PATCH does) would
-# take every binding with it. `update_kv_store` therefore carries the existing bindings
-# across a `roles` replacement — see the note there. The request body cannot express
-# bindings at all, so a PATCH that silently dropped them would be pure data loss, and the
-# erase would have looked like a legitimate diff in the pull request.
-#
-# That direction is the whole design. Because the binding lives *in* the store, there is no
-# reference to dangle: deleting a store takes its bindings with it, so there is no
-# referential check, no cross-file scan and no orphan to refuse. An entry is three scalars
-# and carries no capability of its own — what a service account may *do* with the store is
-# the deploy pipeline's business, exactly as with `roles`.
-#
-# An entry has no name, so `(serviceAccount, namespace, cluster)` is its identity. That is
-# what `k8s_service_account_identity` exists for: nothing outside this module builds that
-# tuple by indexing the document.
-# --------------------------------------------------------------------------- #
-_K8S_SA_ENTRY_KEYS = {
-    "service_account": "serviceAccount",
-    "namespace": "namespace",
-    "cluster": "cluster",
-}
-
-# The identity tuple, in the order `_K8S_SA_ENTRY_KEYS` declares.
-K8sServiceAccountIdentity = Tuple[str, str, str]
-
-
-class K8sServiceAccountNotFound(LookupError):
-    """No entry with that `(serviceAccount, namespace, cluster)` in this store."""
-
-
-def build_k8s_service_account(
-    service_account: str, namespace: str, cluster: str
-) -> Dict[str, str]:
-    """One entry in a store's ``k8sServiceAccounts`` list.
-
-    All three are required and singular — the format repeats the whole triple per binding
-    rather than crossing lists of accounts with lists of namespaces, so two namespaces means
-    two entries. This is the sole writer of these key names; change it and the pipeline
-    together.
-    """
-    return {
-        _K8S_SA_ENTRY_KEYS["service_account"]: service_account,
-        _K8S_SA_ENTRY_KEYS["namespace"]: namespace,
-        _K8S_SA_ENTRY_KEYS["cluster"]: cluster,
-    }
-
-
-def k8s_service_accounts(store: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """The binding list out of one **store entry**, tolerating an absent or empty key.
-
-    Note the argument: a store, not a document — and note that it reaches *through* `roles`,
-    which is where the list lives. A store that binds nothing simply has no
-    `k8sServiceAccounts` key under `roles`, which is what `build_kv_store` produces. A store
-    whose `roles` is missing or malformed reads as no bindings rather than raising.
-    """
-    if not store:
-        return []
-    roles = store.get(ROLES_KEY)
-    if not isinstance(roles, dict):
-        return []
-    accounts = roles.get(K8S_SERVICE_ACCOUNTS_KEY)
-    return list(accounts) if accounts else []
-
-
-def k8s_service_account_identity(entry: Dict[str, Any]) -> K8sServiceAccountIdentity:
-    """`(serviceAccount, namespace, cluster)` for one entry, missing keys as `""`.
-
-    The only place the identity is assembled, so "which fields identify a binding" stays a
-    format decision changeable in one place.
-    """
-    return (
-        str(entry.get(_K8S_SA_ENTRY_KEYS["service_account"]) or ""),
-        str(entry.get(_K8S_SA_ENTRY_KEYS["namespace"]) or ""),
-        str(entry.get(_K8S_SA_ENTRY_KEYS["cluster"]) or ""),
-    )
-
-
-def k8s_service_account_identities(
-    store: Optional[Dict[str, Any]],
-) -> List[K8sServiceAccountIdentity]:
-    """Every binding's identity in one store. Malformed entries are skipped."""
-    return [
-        k8s_service_account_identity(entry)
-        for entry in k8s_service_accounts(store)
-        if isinstance(entry, dict)
-    ]
-
-
-def find_k8s_service_account(
-    store: Optional[Dict[str, Any]], identity: K8sServiceAccountIdentity
-) -> Optional[Dict[str, Any]]:
-    """The binding with that identity, or None."""
-    for entry in k8s_service_accounts(store):
-        if isinstance(entry, dict) and k8s_service_account_identity(entry) == identity:
-            return entry
-    return None
-
-
-def _mutate_store(
-    values: Dict[str, Any], kv_name: str, mutate: Any
-) -> Dict[str, Any]:
-    """Apply `mutate` to one store inside a deep copy of the document, and return it.
-
-    The nested counterpart of `_update_entry`: the same "copy the whole document, touch one
-    entry, never mutate the input" contract, so a caller can still diff old against new with
-    `yaml_data_equals`.
-    """
-    document = copy.deepcopy(values)
-    entries = _entries(document, KV_STORES_KEY)
-
-    for entry in entries:
-        if isinstance(entry, dict) and entry.get("name") == kv_name:
-            mutate(entry)
-            document[KV_STORES_KEY] = entries
-            return document
-
-    raise KVStoreNotFound(kv_name)
-
-
-def add_k8s_service_account(
-    values: Dict[str, Any], kv_name: str, account: Dict[str, str]
-) -> Dict[str, Any]:
-    """Append a binding to one store, returning a **new** document.
-
-    Raises `KVStoreNotFound` when the store is not in the file — unlike `add_kv_store` this
-    takes no `None`, because a binding cannot create the store it lives in.
-    """
-
-    def mutate(store: Dict[str, Any]) -> None:
-        roles = store.get(ROLES_KEY)
-        if not isinstance(roles, dict):
-            roles = {}
-            store[ROLES_KEY] = roles
-        # Appended after the capability keys, so the entry reads in the pull request diff
-        # the way the format spec writes it: principals first, then the workloads.
-        roles[K8S_SERVICE_ACCOUNTS_KEY] = k8s_service_accounts(store) + [
-            copy.deepcopy(account)
-        ]
-
-    return _mutate_store(values, kv_name, mutate)
-
-
-def remove_k8s_service_account(
-    values: Dict[str, Any], kv_name: str, identity: K8sServiceAccountIdentity
-) -> Dict[str, Any]:
-    """Drop one binding from one store, returning a **new** document.
-
-    Removing the last one **drops the key from `roles`** rather than leaving
-    `k8sServiceAccounts: []`. That is deliberately the opposite of `remove_kv_store`, and for
-    the opposite reason: `kvStores: []` is a meaningful statement by a file ("declare
-    nothing"), whereas a store with no bindings is just a store — exactly what
-    `build_kv_store` writes — so keeping an empty list would leave a diff a fresh create
-    would never produce. The `roles` mapping itself always stays, empty or not: it is a
-    required field of a store.
-    """
-
-    def mutate(store: Dict[str, Any]) -> None:
-        existing = k8s_service_accounts(store)
-        remaining = [
-            entry
-            for entry in existing
-            if not (
-                isinstance(entry, dict)
-                and k8s_service_account_identity(entry) == identity
-            )
-        ]
-        if len(remaining) == len(existing):
-            raise K8sServiceAccountNotFound(identity)
-
-        roles = store[ROLES_KEY]
-        if remaining:
-            roles[K8S_SERVICE_ACCOUNTS_KEY] = remaining
-        else:
-            roles.pop(K8S_SERVICE_ACCOUNTS_KEY, None)
-
-    return _mutate_store(values, kv_name, mutate)

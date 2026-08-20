@@ -19,6 +19,11 @@ _BASE_ENV = {
     "VAULT_VALUES_REPO_PROJECT_KEY": "INFRA",
     "VAULT_VALUES_REPO_SLUG": "vault-values",
     "VAULT_VALUES_REPO_BASE_BRANCH": "master",
+    # Pinned, not left to the default: a developer .env setting these would otherwise
+    # change every expected path in the suite, the same way the AUTH_* knobs below could
+    # change auth outcomes.
+    "VAULT_VALUES_DIR": "KVs",
+    "TASHTIOT_DIR": "Tashtiot",
     # Keep the suite fast: no real waiting between polls.
     "CI_POLL_INTERVAL_SECONDS": "0",
     "CI_PIPELINE_START_TIMEOUT_SECONDS": "0",

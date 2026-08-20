@@ -126,6 +126,10 @@ class GitFileRemover:
         `--depth 1` on a single branch keeps this to one commit's worth of tree however
         large the repo's history is. A deletion needs the path's *name*, not its bytes, but
         a blobless fetch is not worth the server-support question for one small file.
+
+        `-r` because a KV store is a **directory** of access files, so most removals here
+        are of a directory rather than a file. git refuses a directory without it, and
+        passing it for a single file is harmless.
         """
         workspace = tempfile.mkdtemp(prefix="vault-api-git-")
         try:
@@ -136,7 +140,7 @@ class GitFileRemover:
                 cwd=workspace,
             )
             self._run(["checkout", "--quiet", "-B", branch, "FETCH_HEAD"], cwd=workspace)
-            self._run(["rm", "--quiet", "--", path], cwd=workspace)
+            self._run(["rm", "--quiet", "-r", "--", path], cwd=workspace)
             self._run(
                 [
                     "-c",
@@ -165,6 +169,9 @@ class GitFileRemover:
         self, path: str, branch: str, base_branch: str, message: str
     ) -> str:
         """Commit the removal of `path` onto `branch`, and return the new commit's sha.
+
+        `path` may be a file or a **directory** — a KV store is a directory of access
+        files, so a store delete passes the directory and `git rm -r` takes it whole.
 
         Runs the blocking git work in a worker thread: this service is async all the way
         down, and a subprocess plus a network round-trip on the event loop would stall

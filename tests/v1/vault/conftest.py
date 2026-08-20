@@ -1,40 +1,100 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from app.v1.vault.schemas import K8sServiceAccountCreate, VaultKVCreate
+from app.helpers import (
+    build_access_document,
+    build_k8s_access_entry,
+    build_oidc_access_entry,
+    render_values_yaml,
+)
+from app.v1.vault.schemas import OidcAccessEntry, VaultKVCreate
 from tests.fakes import FakeBitbucket
+
+TEAM = "cloudops"
+KV = "my-passwords"
+STORE_DIR = f"KVs/{TEAM}/{KV}"
+OIDC_PATH = f"{STORE_DIR}/oidc-access.yaml"
+K8S_PATH = f"{STORE_DIR}/k8s-access.yaml"
+BRANCH = f"vault-kv/{TEAM}-{KV}-abc123"
+
+DN = "CN=cloudops,OU=Groups,DC=corp,DC=example,DC=com"
+OTHER_DN = "CN=platform,OU=Groups,DC=corp,DC=example,DC=com"
+
+
+def oidc_entry(path="*", dn=DN, capabilities=("read", "write")):
+    return build_oidc_access_entry(path, dn, list(capabilities))
+
+
+def k8s_entry(
+    path="*",
+    name="cloudops-external-secrets",
+    namespace="cloudops",
+    cluster="dev",
+    capabilities=("read",),
+):
+    return build_k8s_access_entry(path, name, namespace, cluster, list(capabilities))
+
+
+def seed_store(bitbucket, team=TEAM, kv_name=KV, oidc=(), k8s=()):
+    """Put a store on the fake's base branch, writing only the files it has grants for.
+
+    Mirrors what a create commits: a store with no Kubernetes grants has **no**
+    `k8s-access.yaml`, so a test that seeds one is testing a shape a create never produces.
+    """
+    directory = f"KVs/{team}/{kv_name}"
+    if oidc:
+        bitbucket.existing_files[f"{directory}/oidc-access.yaml"] = render_values_yaml(
+            build_access_document(list(oidc))
+        )
+    if k8s:
+        bitbucket.existing_files[f"{directory}/k8s-access.yaml"] = render_values_yaml(
+            build_access_document(list(k8s))
+        )
+    return directory
 
 
 @pytest.fixture
 def payload():
-    """The whole create request: the store's name, why it exists, and who reaches it.
-
-    No file: the store names its own, so `myapp` lands in `kv/myapp.yaml`.
-    """
+    """A create: one OIDC grant and one Kubernetes grant, so both files get written."""
     return VaultKVCreate(
-        kv_name="myapp",
-        kv_description="payments secrets",
-        roles={"read": ["app01.corp.example.com"]},
+        team=TEAM,
+        kv_name=KV,
+        access=[
+            {
+                "path": "*",
+                "auth_type": "oidc",
+                "dn": DN,
+                "capabilities": ["read", "write"],
+            },
+            {
+                "path": "*",
+                "auth_type": "k8s",
+                "name": "cloudops-external-secrets",
+                "namespace": "cloudops",
+                "cluster": "dev",
+                "capabilities": ["read"],
+            },
+        ],
     )
 
 
 @pytest.fixture
-def account_payload():
-    """A service account binding for the store the `payload` fixture creates."""
-    return K8sServiceAccountCreate(
-        service_account="vault",
-        namespace="payments",
-        cluster="dev",
+def oidc_only_payload():
+    """A create with no Kubernetes grants — it must write no k8s-access.yaml at all."""
+    return VaultKVCreate(
+        team=TEAM,
+        kv_name=KV,
+        access=[
+            {"path": "*", "auth_type": "oidc", "dn": DN, "capabilities": ["read"]}
+        ],
     )
 
 
 @pytest.fixture
-def account_identity(account_payload):
-    """The same binding as the `(serviceAccount, namespace, cluster)` a delete takes."""
-    return (
-        account_payload.service_account,
-        account_payload.namespace,
-        account_payload.cluster,
+def grant_payload():
+    """One grant to append to an existing store."""
+    return OidcAccessEntry(
+        path="*", auth_type="oidc", dn=OTHER_DN, capabilities=["read"]
     )
 
 

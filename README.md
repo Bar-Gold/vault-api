@@ -14,9 +14,9 @@ API. A CI server posts its result *into* Bitbucket against the commit it built, 
 CI is just "ask Bitbucket which builds it holds for this sha". There is no CI URL, token or
 repo id to configure; the pipelines still run, they are simply observed through the forge.
 
-**The service knows nothing about Vault.** It appends an entry to a values file — a KV store
-or a Kubernetes auth role — and reports what the pipelines did with it; mounts, engine
-versions and policies are the deploy pipeline's business.
+**The service knows nothing about Vault.** It writes YAML holding a list of **grants** — who
+may do what, over which secret path — and reports what the pipelines did with it. Mounts,
+engine versions and policies are the deploy pipeline's business.
 
 ---
 
@@ -89,16 +89,17 @@ The index URLs embed a `user:token`, so **`uv.toml` is gitignored** — keep it 
 ```
 POST /api/vault/v1/kv/
   │
-  ├─ 0. reject if the store name is used in ANY file on the base branch    -> 409
-  ├─ 1. create branch  vault-kv/<file>-<kv-name>-<rand>
-  ├─ 2. commit         kv/<file>.yaml   (append to kvStores; create if first)
+  ├─ 0. reject if the store name is used by ANY team on the base branch    -> 409
+  ├─ 1. create branch  vault-kv/<team>-<kv-name>-<rand>
+  ├─ 2. commit         KVs/<team>/<kv-name>/oidc-access.yaml
+  │                    KVs/<team>/<kv-name>/k8s-access.yaml  (only if it has k8s grants)
   ├─ 3. open pull request -> base branch
   ├─ 4. WAIT for the builds on the PR's commit           ── red ────> decline PR + delete branch -> 502
   │       (Bitbucket: fromRef.latestCommit)              ── times out ─> decline PR + delete branch -> 504
   ├─ 5. merge the pull request                           ── fails ──> leave PR open              -> 502
   ├─ 6. WAIT for the builds on the merge commit          ── red ────> report (already merged)    -> 502
   │                                                      ── times out ─> report (already merged) -> 504
-  └─ 201 {"status":"Succeeded","message":"Successful creation of myapp", ...}
+  └─ 201 {"status":"Succeeded","message":"Successful creation of my-passwords", ...}
 ```
 
 **The request blocks for the whole chain.** That is deliberate (the endpoint's contract is the
@@ -126,240 +127,178 @@ for them to settle (`CI_PIPELINE_TIMEOUT_SECONDS`).
 ```jsonc
 POST /api/vault/v1/kv/
 {
-  "kv_name": "athena-passwords",   // unique across ALL files; ^[a-z0-9]+(-[a-z0-9]+)*$
-  "kv_description": "Passwords for athena",
-  "roles": {                       // required: >=1 role with >=1 principal
-    "write": ["CN=svc-athena,OU=ServiceAccounts,DC=corp,DC=example,DC=com"],
-    "read":  ["CN=app-athena,OU=ServiceAccounts,DC=corp,DC=example,DC=com"]
-  }                                // either key, or both; values are not validated
+  "team": "cloudops",              // first directory segment; ^[a-z0-9]+(-[a-z0-9]+)*$
+  "kv_name": "my-passwords",       // second segment, and unique across ALL teams
+  "access": [                      // required: at least one grant
+    {
+      "path": "*",                 // "*" = every secret here; "services/+/tyk/*" scopes it
+      "auth_type": "oidc",         // oidc | k8s — picks which file it lands in
+      "dn": "CN=cloudops,OU=Groups,DC=corp,DC=example,DC=com",
+      "capabilities": ["read", "write"]
+    },
+    {
+      "path": "*",
+      "auth_type": "k8s",
+      "name": "cloudops-external-secrets",   // service account name
+      "namespace": "cloudops",
+      "cluster": "dev",                      // must match a k8sMethods[].name
+      "capabilities": ["read"]
+    }
+  ]
 }
 ```
 
-**Three fields, and none of them names a file.** The store names its own:
-`kv/athena-passwords.yaml`. There is nothing to choose and no way to group two stores into
-one file — sending a `file` key is a `422`, not a silent drop.
+**Three fields, and the body mirrors the committed document.** A caller sends the same
+`access` entries that land in the file, so `path` and `capabilities` are expressible — a
+translated shape could express neither. There is **no** `kv_description`: the format defines
+no home for it, and this service does not invent keys. Sending an unknown field (or one from
+an older revision, like `file` or `roles`) is a `422`, not a silent drop.
 
-**The file is created if it does not exist**, and keys this service does not recognise
-survive every write.
+`team` and `kv_name` are the only values that reach a filesystem path, and their pattern
+blocks `..` and slashes, so a request can never escape the values directory. `path` is a
+*Vault* path, not a filesystem one, so it deliberately allows `/`, `*` and `+`.
 
-`kv_name` is the only field that reaches a filesystem path, and its pattern blocks `..` and
-slashes, so a request can never escape the values directory. It is single-segment because it
-is also the address every other route uses.
+### The committed files (`KVs/cloudops/my-passwords/`)
 
-> Earlier versions took an optional `file`, so files holding several stores may exist. They
-> are still readable, editable and deletable — but a delete removes the whole file, so a
-> grouped file loses every store in it.
+**A store is a directory holding up to two files, split by auth type.** This is the contract
+with the deploy pipeline — **change it in lockstep with the pipeline that consumes it**:
 
-### The committed file (`kv/athena-passwords.yaml`)
-
-**One file holds one store, and the store holds its own service account bindings.** The
-document is still a list under `kvStores` — the format is unchanged, and files holding
-several stores still parse and still work — but a create writes exactly one. This is the
-contract with the deploy pipeline — **change it in lockstep with the pipeline that consumes
-it**:
-
-```yaml
-kvStores:
-  - name: athena-passwords
-    description: Passwords for athena
-    roles:
-      write:
-        - CN=<CN>,OU=<OU>,DC=<DC>       # LDAP DNs, not hostnames
-      k8sServiceAccounts:               # inside `roles`, level with `write`
-        - serviceAccount: "vault"       # the whole triple is the binding's identity
-          namespace: "athena"
-          cluster: dev                  # OS4 cluster suffix
-        - serviceAccount: "vault"       # can be many
-          namespace: "athena-staging"
-          cluster: dev
-  - name: billing
-    description: billing secrets
-    roles:
-      read:
-        - CN=svc-billing,OU=ServiceAccounts,DC=corp,DC=example,DC=com
+```
+KVs/
+  cloudops/
+    my-passwords/
+      oidc-access.yaml
+      k8s-access.yaml
 ```
 
-**A service account is listed inside the store it reaches**, under `roles` and level with
-`read`/`write`. That direction matters: nothing points at a binding from elsewhere, so
-deleting a store removes its bindings in the same diff — there is no dangling reference to
-guard against, and no referential check anywhere in this service.
+`oidc-access.yaml`:
 
-Because the bindings sit *under* `roles`, a `PATCH` that replaces `roles` **keeps them**.
-The update body has no way to express a binding, so dropping them would be data loss you
-could not undo in the same call. Changing who may read a secret and changing which workloads
-are bound to it are separate operations, and stay that way.
+```yaml
+access:
+  - path: '*'
+    authType: oidc
+    dn: CN=cloudops,OU=Groups,DC=corp,DC=example,DC=com
+    capabilities:
+      - read
+      - write
+```
 
-A binding carries **no capability of its own**. Listing the account inside the store *is* the
-grant; what it may then do is the deploy pipeline's to decide, exactly as with `roles`.
+`k8s-access.yaml`:
 
-`read` and `write` are **separate keys** on `roles` — a store may carry either, or both. The
-combined string `read/write` is not a role and is rejected with `422`. `ALLOWED_ROLE_KEYS` in
-`app/v1/vault/schemas.py` is the single place to change if the pipeline ever wants a
-different set.
+```yaml
+access:
+  - path: '*'
+    authType: k8s
+    name: cloudops-external-secrets
+    namespace: cloudops
+    cluster: dev
+    capabilities:
+      - read
+```
 
-The **values** under `roles` are not validated beyond non-blank and unique: the files carry
-LDAP distinguished names as well as bare hostnames, and any pattern tight enough to describe
-one rejects the other.
+Four things about that text are deliberate:
+
+- **A store with no Kubernetes grants gets no `k8s-access.yaml` at all** — not one holding
+  `access: []`. That is the shape a create writes, so an edit that empties a kind removes its
+  file to match.
+- **The model is principal → capabilities**, the inverse of a role map. One entry is one
+  principal's grant on one path, so the same DN on two paths is two entries.
+- **List items indent under their key**, and `capabilities` is a block list. PyYAML's default
+  is the flush form, which parses identically but is not the pipeline's format.
+- **`*` is quoted.** A bare `*` is a YAML alias and would not round-trip.
+
+### The Tashtiot per-team file
+
+The second layout, and the only one that is not a directory:
+
+```jsonc
+PUT /api/vault/v1/kv/tashtiot/cloudops
+{
+  "access": [
+    {"path": "+/cloudops/*", "auth_type": "oidc", "dn": "CN=cloudops,...",
+     "capabilities": ["read"]},
+    {"path": "services/+/tyk/*", "auth_type": "k8s", "name": "argocd",
+     "namespace": "perimeter", "cluster": "dev", "capabilities": ["read", "write"]}
+  ]
+}
+```
+
+lands in `KVs/Tashtiot/cloudops.yaml` as **one flat file mixing both kinds in one list** — no
+directory, no oidc/k8s split. It grants a team access into the shared services store (redis,
+zookeeper, kafka…), which is why its paths are usually scoped rather than `*`: consume one
+service and you want `read` on yours; deploy a service and you want to see all of them.
+
+It is an **upsert**: create and replace are the same call, because the file's identity *is*
+the team, so there is nothing to collide with and a `409` would have nothing to describe. An
+upsert that changes nothing returns `200` with a null pull request.
 
 ### Other routes
 
-| Route | Purpose | Success |
-|-------|---------|---------|
-| `POST /api/vault/v1/kv/pull-request` | open the pull request and stop — no CI wait, no merge | `201` |
-| `GET /api/vault/v1/kv/{kv_name}` | one store, wherever it lives | `200` |
-| `PATCH /api/vault/v1/kv/{kv_name}` | change one store's `description` and/or `roles` | `200` |
-| `DELETE /api/vault/v1/kv/{kv_name}` | remove one store, through the same chain | `200` |
-| `DELETE /api/vault/v1/kv/{kv_name}/pull-request` | open the removal pull request and stop | `201` |
-| `POST /api/vault/v1/kv/{kv_name}/k8s-service-accounts` | bind a service account to that store | `201` |
-| `POST /api/vault/v1/kv/{kv_name}/k8s-service-accounts/pull-request` | open the pull request and stop | `201` |
-| `GET /api/vault/v1/kv/{kv_name}/k8s-service-accounts` | that store's bindings | `200` |
-| `DELETE /api/vault/v1/kv/{kv_name}/k8s-service-accounts` | unbind one, by `?service_account=&namespace=&cluster=` | `200` |
-| `DELETE /api/vault/v1/kv/{kv_name}/k8s-service-accounts/pull-request` | open the removal pull request and stop | `201` |
-| `GET /api/vault/v1/kv/files/{file}` | a whole values file (404 if absent) | `200` |
+| Route | Notes |
+|-------|-------|
+| `GET /stores` | every store: team, name, directory. Lists directories, reads no file |
+| `GET /{kv_name}` | one store, found by name alone — whichever team owns it |
+| `PATCH /{kv_name}` | replaces the grant list wholesale |
+| `GET /{kv_name}/access` | just the grants; an empty list is a `200`, not a `404` |
+| `POST /{kv_name}/access` | append one grant; the `auth_type` picks the file |
+| `DELETE /{kv_name}/access?auth_type=…&path=…` | revoke one grant |
+| `GET`/`DELETE /tashtiot/{team}` | read or remove one team's shared-services file |
 
-**Every one of these addresses a store by name alone.** You do not have to remember which
-file it went into: a store name is unique across the whole values directory — the create
-enforces that — so the name is a sufficient address. The service looks in
-`kv/<kv_name>.yaml` first and walks the directory only if the store was grouped elsewhere.
-A store that is in no file is a `404`, and if a file could not be parsed the `404` names
-it, so a broken file never reads as a deleted store.
+**A store is addressed by name alone.** Names are unique across every team — the create
+enforces it — so a caller never has to remember who owns theirs. `team` appears on the create
+and nowhere else.
 
-`GET /files/{file}` is the one route that still names a file — an operator's view of the
-repo. It returns *the file* — every store, each with its own bindings — as parsed YAML,
-unchanged. It is two segments against a store read's one, so a store named `files` is
-still readable at `GET /files`.
+**Revoking takes query parameters, not a body**, since DELETE bodies are widely dropped by
+proxies. oidc needs `path` and `dn`; k8s needs `path`, `name`, `namespace` and `cluster`. A
+mismatched set is a `422`, not a wrong-grant revoke — a partial identity would otherwise
+resolve to *some* entry.
 
-`kv_name` is pattern-checked in the URL as well as in a create body, and so is `file` on
-the route that takes one, so a malformed value is a `422` here rather than an opaque
-Bitbucket `404` two calls later. The unbind query parameters carry the same patterns the
-bind body enforces.
+**Capabilities are not part of a grant's identity.** Granting `read` and later `read`+`write`
+to the same principal on the same path is an edit of one entry, so a duplicate is a `409` and
+a revoke does not need to know what the grant currently permits.
 
 ### `POST /pull-request` — the non-blocking half
 
-Same body as a create, same uniqueness check, same commit, same pull request — then it
-**returns**, answering `201` in one round-trip instead of blocking for two builds:
+Every mutating route has a `/pull-request` twin that runs steps 1-3 and stops: branch, commit,
+pull request. It answers in one round-trip instead of blocking for two pipelines, and hands
+the merge to a human. Two consequences, both deliberate:
+
+- **The forge still runs CI.** The endpoint does not suppress the validation pipeline; it just
+  does not wait. The build fields are `null` because nothing was *observed*, not because
+  nothing ran.
+- **A repeat call opens a second pull request.** Every scan reads the base branch, and an
+  unmerged PR is not there. Reviewers close the loser.
+
+### `DELETE` — removes the directory
 
 ```jsonc
-{"file": "athena", "kv_name": "athena-passwords", "kv_description": "Passwords for athena",
- "roles": {"write": ["CN=svc-athena,OU=ServiceAccounts,DC=corp,DC=example,DC=com"]}}
-// -> 201 {"status":"Succeeded", "pull_request":{"id":42,"state":"OPEN"},
-//         "validation_builds":null, "deploy_builds":null}
+// DELETE /api/vault/v1/kv/my-passwords
+// -> 200 {"status":"Succeeded","message":"Successful deletion of my-passwords", ...}
 ```
 
-Nothing reaches the base branch — a human reviews and merges. Rollbacks still apply: a failed
-commit or a failed PR deletes the branch it created.
+Same chain, same rollbacks, same point of no return. What is worth knowing:
 
-Two behaviours to know, both intentional:
-
-- **CI still runs.** Opening a pull request triggers the validation pipeline in the forge like
-  any other PR. This endpoint simply does not *wait* for it, which is why the build fields
-  come back `null` — nothing was observed, not nothing happened.
-- **Calling it twice for the same name opens two pull requests.** The name scan reads the base
-  branch, and an unmerged PR is not on it. Reviewers close the loser.
-
-`PATCH` runs the **same** pull request → CI → merge → CI chain as a create, and answers `200`.
-Three behaviours worth relying on:
-
-- **Only the named store changes.** Its siblings in the file are written back untouched.
-- **`roles` is replaced wholesale**, not merged — otherwise a host could never be removed.
-- **An edit that changes nothing opens no pull request.** Re-applying the same change returns
-  `Succeeded` with `"No changes required for <kv name>"` and `pull_request: null`.
-- **`PATCH` cannot rename.** The name is fixed at creation, because renaming means migrating
-  the secrets in Vault, not editing a field.
-
-```jsonc
-// PATCH /api/vault/v1/kv/payments/myapp
-{"kv_description": "new text"}
-{"roles": {"read": ["app02.corp.example.com"]}}    // or both
-```
-
-### `DELETE` — removes the file
-
-```jsonc
-// DELETE /api/vault/v1/kv/payments/myapp
-// -> 200 {"status":"Succeeded","message":"Successful deletion of myapp", ...}
-```
-
-Same pull request → CI → merge → CI chain, same rollbacks, same point of no return. What is
-worth knowing:
-
-- **The file goes with the store.** One file holds one store, so emptying it to
-  `kvStores: []` would leave a dead file behind for every store ever deleted. *This assumes
-  the deploy pipeline treats a vanished file as "remove everything it declared"* — if it only
-  iterates files that exist, a deleted file is unmanaged rather than pruned. Worth confirming
-  with whoever owns the pipeline.
+- **The whole directory goes**, both access files with it. There is nothing to orphan — a
+  grant lives inside the store it reaches.
 - **This is the one operation that is not REST.** Bitbucket Server has no endpoint that
-  deletes a file, so the service pushes a deleting commit over **git-over-HTTPS**, reusing
+  deletes a path, so the service pushes a `git rm -r` commit over **git-over-HTTPS**, reusing
   `BITBUCKET_TOKEN` as a bearer header — no SSH key, no extra secret. It needs the `git`
   binary in the image; the Dockerfile checks for it at build time. Everything either side —
   branch, pull request, both gates, merge, rollback — is unchanged.
-- **A store in a file named after something else is found and its file deleted too.** Only
-  an older revision could have produced one; resolution answers *which* file, not whether to
-  keep it.
-- **A repeat delete is `404`**, the same answer `GET` and `PATCH` already give for a store
-  that is not there. The *state* is idempotent; the status code tells you which call did the
-  work. A client whose connection dropped mid-delete cannot tell "already gone" from "never
-  existed" — confirm with `GET /{kv_name}`.
-- **`DELETE .../pull-request` is the escape hatch**, answering `201` in one round-trip and
-  leaving the removal for a reviewer to merge. It matters more here than for a create: this
-  is the destructive one. Nothing reaches the base branch, so calling it twice opens two
-  pull requests for the same removal.
-- **Deleting a store takes its service account bindings with it**, in the same diff. There is
-  no `409` for a "still referenced" store and no referential check anywhere — the bindings
-  live inside the store, so there is nothing left over to dangle.
-
-### `/k8s-service-accounts` — binding workloads to a store
-
-Same chain, same rollbacks, same point of no return — as a sub-resource of the store, because
-that is where the entry lives in the document:
-
-```jsonc
-POST /api/vault/v1/kv/athena/athena-passwords/k8s-service-accounts
-{
-  "service_account": "vault",    // RFC 1123 subdomain
-  "namespace": "athena",         // RFC 1123 label
-  "cluster": "dev"               // OS4 cluster suffix — required
-}
-```
-
-- **A binding is a coordinate, not a policy.** It names a workload and nothing else. The
-  deploy pipeline owns what a bound account may do with the store; this service never writes a
-  policy name, a policy body, an HCL path, a mount path or an engine version.
-- **The store must already exist** on the base branch, or the request is a `404`. A binding
-  cannot create the store it lives in. Consequence: create a store with
-  `POST /kv/pull-request` and bind to it immediately, and you get a `404` until that pull
-  request merges — the same base-branch-only visibility that makes a repeat `/pull-request`
-  open a second PR.
-- **All three fields are required, and together they are the identity.** There is no name and
-  no `PATCH`: changing a binding is an unbind plus a bind. Unbinding therefore takes all three
-  as query parameters — `DELETE .../k8s-service-accounts?service_account=vault&namespace=athena&cluster=dev`
-  — and a partial triple is a `422`, not a wrong-binding delete. They travel as query
-  parameters because DELETE bodies are widely dropped by proxies and clients.
-- **`*` in `service_account` or `namespace` is rejected** with `422`. It would bind every
-  workload in the cluster; that escalation should need a human editing the YAML, not an API
-  call.
-- **Names follow Kubernetes' rules, not ours.** A namespace is an RFC 1123 *label* (no dots,
-  ≤63); a ServiceAccount name is an RFC 1123 *subdomain* (dots allowed, ≤253). Neither may
-  contain uppercase — a name this service accepted but the cluster rejects would fail at
-  admission, long after the pull request merged.
-- **Unbinding the last one drops the `k8sServiceAccounts` key** from `roles`, leaving the
-  store exactly as a fresh create would have written it, rather than an empty list no create
-  would produce.
+- **A repeat delete is `404`**, the same answer `GET` and `PATCH` give for a store that is not
+  there. The *state* is idempotent; the status code tells you which call did the work.
+- **`DELETE .../pull-request` is the escape hatch**, answering `201` and leaving the removal
+  for a reviewer. It matters more here than for a create: this is the destructive one.
 
 ### Uniqueness
 
-Store names are global to Vault, so a create scans **every** file in the values directory and
-returns `409` if the name is used anywhere — not just in the target file. That costs a
-directory listing plus a read per file, and it is a check, not a lock: two creates in flight
-both pass it and the second pull request conflicts at merge, which a human resolves.
-
-Bindings are scoped far more narrowly: unique on the whole `(serviceAccount, namespace,
-cluster)` triple **within one store**, and nothing beyond it. The same service account
-reaching two stores is the normal case — that is how one workload gets at two secrets — and
-the same account in two namespaces or two clusters is two distinct bindings. Nothing about a
-binding is directory-wide, so binding and unbinding never scan the values directory at all.
-
----
+- **Store names are global.** Unique across every team, which is why a create walks the whole
+  values directory and what makes the name a sufficient address everywhere else. It is a
+  check, not a lock: two creates in flight both pass and the second pull request conflicts at
+  merge, like any other GitOps race.
+- **Grants are unique within their file**, on `(authType, path, dn)` or
+  `(authType, path, name, namespace, cluster)`. The same service account reaching two stores
+  is the normal case; the same account in two namespaces is two distinct grants.
 
 ## How the library is used
 
@@ -394,15 +333,16 @@ a 502 — the same failure contract the reference API uses. `BaseAPI` defaults `
 | File | Responsibility |
 |------|----------------|
 | `conf.py` | the module's `BaseSettings` + `config` singleton (both API prefixes, both branch prefixes) |
-| `schemas.py` | pydantic request/response models (`VaultKVCreate` is a flat four-field body); one `VaultOperationResponse` for both resource kinds |
-| `operations.py` | the create/update/delete chain for both kinds and the rollbacks; receives the connector as an argument |
-| `routes.py` | `get_v1_vault_router(...)`, prefixed with `config.API_PREFIX`; stores and their bindings both hang off it |
+| `schemas.py` | pydantic request/response models; `AccessEntry` is a union discriminated on `auth_type`, and one `VaultOperationResponse` covers every mutating route |
+| `operations.py` | the create/update/delete chain, the grant sub-resource and the Tashtiot routes, plus every rollback; receives the connector as an argument |
+| `routes.py` | `get_v1_vault_router(...)`, prefixed with `config.API_PREFIX`; stores, grants and Tashtiot all hang off it |
 
-`app/helpers.py` holds the pure functions: branch/file naming, both entry shapes, YAML
-rendering and comparison. Every transform returns a **new** document and preserves the sibling
-top-level key, which is what lets the two kinds share one file safely.
+`app/helpers.py` holds the pure functions: path and branch naming, both entry shapes, YAML
+rendering and comparison. Every transform returns a **new** document and preserves any sibling
+top-level key, which is what the no-op short circuit depends on.
 
-All settings added for Kubernetes auth are **defaulted**, so nothing new is required in `.env`.
+All settings added for this format are **defaulted**, so nothing new is required in `.env`
+beyond `VAULT_VALUES_DIR=KVs`.
 
 ---
 
@@ -423,18 +363,17 @@ fails app creation. See `.env.example`.
 app/
   main.py            # create_app(): the wiring point (connectors + routers)
   global_conf.py     # shared BaseSettings (global_config)
-  helpers.py         # naming, values-file shape, YAML rendering (pure)
+  helpers.py         # paths, the access-entry model, YAML rendering (pure)
   clients/
     bitbucket.py     # branch / file / pull-request REST client
-    git.py           # deleting a file: the one operation Bitbucket has no REST for
+    git.py           # deleting a path: the one operation Bitbucket has no REST for
     http.py          # the single funnel that raises ExternalServiceError
   v1/vault/          # conf, schemas, operations, routes
 tests/
-  test_helpers.py    # pure helpers: stores and their nested bindings
+  test_helpers.py    # the document model and the exact committed bytes
   clients/           # the REST client against its real shapes (respx), and
                      #   test_git.py against a real bare repo on disk
   v1/vault/          # schemas, the chains + rollbacks, routes end-to-end
-                     #   test_k8s_service_account_*.py mirror the KV files one-for-one
 tools/
   stub_upstreams.py  # local Bitbucket stand-in, build statuses included (see below)
 ```
@@ -464,18 +403,18 @@ Requires `tashtiot-apis-library >= 1.1.0`.
   the coordinates already in the request). Add it exactly as `example-api` does — guard on
   `CONFIG_API_URL`, call `enable_remote_config_api`, and pass the provider into the router
   factory — if you later need, say, a different values repo per environment.
-- **A second kind of top-level entry.** The `kvStores` helpers in `app/helpers.py` are thin
-  wrappers over one key-parameterised family (`_entries` / `_add_entry` / `_update_entry` /
-  `_remove_entry`, each taking the top-level key). Add a second by parameterising, never by
-  copy-pasting the family — the "return a new document, preserve every sibling key" contract
-  is what `yaml_data_equals` and the no-op short circuit depend on. For a second list *nested
-  inside* a store, `_mutate_store` is the counterpart.
-- **Policy-shaped edits.** Two earlier Kubernetes shapes were removed. The first, plus a
-  `groups` endpoint, edited a `policies` list a create never writes, so they returned `422`
-  unconditionally. The second modelled bindings as a top-level `kubernetesAuth` list of named
-  roles pointing back at stores; the pipeline's format nests them in the store instead.
-  Neither is a source to copy from. Policy *generation* stays out of this service
-  permanently; `groups` has no replacement.
+- **A third `authType`.** Add the variant to the discriminated union in `schemas.py`, a
+  builder in `helpers.py`, and teach `partition_access` / `access_path_for` where it lands.
+  Those two functions are the only places that know entries split by kind, so nothing else
+  has to change. Keep the "return a new document, preserve every sibling key" contract — it is
+  what `yaml_data_equals` and the no-op short circuit depend on.
+- **A third layout.** The store directory and the flat Tashtiot file already share one
+  document model and one chain; a third would too. What differs between them is only which
+  paths a `Change` writes, so it is a `_prepare_*` function and a route, not a package.
+- **Formats that are gone, and are not sources to copy from.** A `kvStores` list of stores
+  carrying a `roles` mapping with `k8sServiceAccounts` nested inside; before it, a top-level
+  `kubernetesAuth` list pointing back at stores; before that, generated `policies` and a
+  `groups` endpoint. Policy *generation* stays out of this service permanently.
 
 ## Docker
 

@@ -1,313 +1,201 @@
-import re
-from enum import Enum
-from typing import Dict, List, Optional
+"""Request and response models.
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+The request shape **mirrors the committed document**: a caller sends the same `access`
+entries that land in the file, rather than a shape this service translates. That is the
+same boundary the rest of the service keeps — the format is the deploy pipeline's, and
+this service is a thin, validating writer of it. The two consequences are that `path` and
+`capabilities` are expressible (they have no equivalent in any translated shape), and that
+a format change is a change here and in the pipeline, with nothing in between.
+
+What is deliberately absent: there is no `kv_description`. The format defines no home for
+it, and this service does not invent keys.
+"""
+
+from enum import Enum
+from typing import Annotated, List, Literal, Optional, Union
+
+from pydantic import BaseModel, Field, field_validator
 
 # A single name segment: lowercase alphanumerics separated by single dashes.
 _SEGMENT = r"[a-z0-9]+(?:-[a-z0-9]+)*"
 
-# The values file a store lives in: `kv/{file}.yaml`. This is the **path-traversal guard**,
-# not just a style rule — it is the only value that reaches the filesystem path, on the one
-# optional create field and the one read route that still names a file. No slash, so no
-# directory can be escaped or created, and `..` cannot match.
-FILE_PATTERN = rf"^{_SEGMENT}$"
-
-# A store's name. Single-segment because it *is* the address every route but the whole-file
-# read uses (`/{kv_name}`), and a slash would turn one store into two path segments. Unlike
-# `file`, this never reaches a filesystem path — it is a value inside the document.
+# A store's name, and the second segment of its directory (`KVs/<team>/<kv_name>/`). Both
+# a **path-traversal guard** and the address every route but the create uses (`/{kv_name}`):
+# no slash, so no directory can be escaped or created, and `..` cannot match.
 KV_NAME_PATTERN = rf"^{_SEGMENT}$"
 
-# The role keys the committed document may carry.
+# The owning team, and the first segment of the directory. Same guard, same reason. It is
+# only ever sent on a create — a store name is unique across the whole values directory, so
+# every other route resolves the team rather than being told it.
+TEAM_PATTERN = rf"^{_SEGMENT}$"
+
+# A Vault secret path pattern, e.g. `*`, `services/+/tyk/*`, `+/cloudops/*`.
 #
-# `read` and `write` are separate keys — a store may carry either, or both (a host that only
-# reads and a host that also writes are different entries). The `<read/write>` in the format
-# spec is a placeholder meaning "one of these", the same as `<name>` and `<FQDN>` around it,
-# not a literal key.
-#
-# Everything outside this module treats `roles` as an opaque mapping of key to host list, so
-# this frozenset is the only thing to change if the deploy pipeline ever wants a different
-# set of role names.
-ALLOWED_ROLE_KEYS = frozenset({"read", "write"})
+# This is a *Vault* path, not a filesystem one — it never reaches a repo path, so traversal
+# is not the risk here and the pattern can be permissive about slashes. `+` (single
+# segment) and `*` (any suffix) are Vault's own wildcards. What it still refuses is an
+# empty string and anything outside the character set the pipeline can parse; `..` is
+# rejected by `no_parent_segments` below, because pydantic-core's regex engine has no
+# look-ahead and the pattern cannot express it.
+VAULT_PATH_PATTERN = r"^[A-Za-z0-9_*+][A-Za-z0-9_*+/.-]*$"
 
-# --------------------------------------------------------------------------- #
-# Kubernetes service accounts
-#
-# A binding is three scalars — `serviceAccount`, `namespace`, `cluster` — living inside the
-# store it reaches. It has no name, so those three *are* its identity, and it carries no
-# capability: what a bound workload may do with the store is the deploy pipeline's
-# business, the same boundary `roles` sits behind. No policy name, policy body, mount path
-# or engine version is generated anywhere in this service.
-# --------------------------------------------------------------------------- #
-
-# The OS4 cluster suffix the binding belongs to, e.g. `dev`. Required — unlike the rest of
-# the triple there is no Kubernetes rule to borrow, so this is our own single-segment shape.
-K8S_CLUSTER_PATTERN = rf"^{_SEGMENT}$"
-K8S_CLUSTER_MAX_LENGTH = 128
-
-# Kubernetes' own naming rules, not ours. A namespace is an RFC 1123 *label* (no dots, 63
-# chars); a ServiceAccount name is an RFC 1123 *subdomain* (dots allowed, 253) — genuinely
-# different limits. Neither may contain uppercase, so a permissive hostname-shaped pattern
-# would let a request pass here and be rejected at admission in the cluster instead.
-K8S_NAMESPACE_PATTERN = r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
-K8S_NAMESPACE_MAX_LENGTH = 63
-K8S_SERVICE_ACCOUNT_PATTERN = (
-    r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
-)
-K8S_SERVICE_ACCOUNT_MAX_LENGTH = 253
+VAULT_PATH_MAX_LENGTH = 256
 
 
-def _validate_bound_name(
-    name: str, field: str, pattern: str, max_length: int
-) -> str:
-    """One Kubernetes name: non-blank, no wildcard, RFC 1123.
+class Capability(str, Enum):
+    """What a grant permits.
 
-    Singular, because the format repeats the whole triple per binding rather than crossing
-    a list of accounts with a list of namespaces — two namespaces is two entries.
-    """
-    stripped = name.strip() if isinstance(name, str) else name
-    if not stripped:
-        raise ValueError(f"{field} must not be blank")
-    if "*" in stripped:
-        raise ValueError(
-            f"{field} must not contain '*': a wildcard binds every workload in the "
-            f"cluster to this store. Name it explicitly, or have a human make that grant "
-            f"by editing the values file directly."
-        )
-    if len(stripped) > max_length:
-        raise ValueError(f"{field} must be at most {max_length} characters")
-    if not re.fullmatch(pattern, stripped):
-        raise ValueError(
-            f"'{stripped}' is not a valid {field}; Kubernetes names are lowercase "
-            f"alphanumerics, dashes and (service accounts only) dots"
-        )
-    return stripped
-
-
-def _validate_roles(roles: Dict[str, List[str]]) -> Dict[str, List[str]]:
-    """At least one known role, each naming at least one non-blank principal.
-
-    A principal is whatever the deploy pipeline binds to a capability — the values files
-    carry LDAP distinguished names (`CN=…,OU=…,DC=…`) as well as bare hostnames, so the
-    entries are deliberately **unvalidated beyond non-blank and unique**. Any pattern
-    tight enough to describe one form rejects the other, and this service does not own
-    that vocabulary.
-    """
-    if not roles:
-        raise ValueError("roles must not be empty")
-
-    unknown = sorted(set(roles) - ALLOWED_ROLE_KEYS)
-    if unknown:
-        allowed = ", ".join(sorted(ALLOWED_ROLE_KEYS))
-        raise ValueError(f"unknown role(s) {unknown}; allowed: {allowed}")
-
-    cleaned: Dict[str, List[str]] = {}
-    for role, principals in roles.items():
-        stripped = [
-            principal.strip() for principal in principals if principal and principal.strip()
-        ]
-        if not stripped:
-            raise ValueError(f"role '{role}' must list at least one principal")
-        if len(stripped) != len(principals):
-            raise ValueError(f"role '{role}' must not contain blank principals")
-        if len(set(stripped)) != len(stripped):
-            raise ValueError(f"role '{role}' must not repeat a principal")
-        cleaned[role] = stripped
-    return cleaned
-
-
-class OperationStatus(str, Enum):
-    SUCCEEDED = "Succeeded"
-    FAILED = "Failed"
-
-
-# Every request model below sets `extra: "forbid"`. Pydantic's default is to ignore an
-# unrecognised field, which reads as success: a caller who sent `environment` or mistyped
-# `file` would get a 201 and a store built from something other than what they asked for.
-# `file` being optional is what makes that sharp — a typo no longer fails on a missing
-# required field, it silently falls back to naming the file after the store.
-class VaultKVCreate(BaseModel):
-    """A create request: the store's name, what it is for, and who reaches it.
-
-    This service appends an entry to a values file and reports what the pipelines did with
-    it. What the KV *means* — mounts, engine version, policies — is the deploy pipeline's
-    business, so none of it is modelled here.
-
-    **Every field is required, and none of them names a file.** One file holds exactly one
-    store, and the file is always named after the store (`kv/<kv_name>.yaml`), so there is
-    nothing for a caller to choose. That is what lets a delete remove the file outright
-    rather than emptying it, and it is why no request in this API mentions a file: a store
-    name is unique across the values directory, so the name is the address everywhere.
+    A closed set, unlike the DN values beside it: these reach the pipeline as Vault policy
+    capabilities, so an unknown one is a request this service should refuse rather than
+    pass on. Add to it only alongside the pipeline.
     """
 
-    # Without an explicit example, Swagger UI synthesises one from `pattern` and renders an
-    # unreadable regex-derived string in the "Example Value" box. These give it something a
-    # human can edit.
-    model_config = {
-        # A field this model does not know is a 422, never a silent drop.
-        "extra": "forbid",
-        "json_schema_extra": {
-            "example": {
-                "kv_name": "athena-passwords",
-                "kv_description": "Passwords for athena",
-                "roles": {
-                    "write": ["CN=svc-athena,OU=ServiceAccounts,DC=corp,DC=example,DC=com"]
-                },
-            }
-        }
-    }
+    READ = "read"
+    WRITE = "write"
 
-    kv_name: str = Field(
+
+class AuthType(str, Enum):
+    """Which identity provider a grant is for — and which file it lands in.
+
+    `oidc` entries go to `oidc-access.yaml`, `k8s` entries to `k8s-access.yaml`. The
+    Tashtiot per-team file mixes both in one list.
+    """
+
+    OIDC = "oidc"
+    K8S = "k8s"
+
+
+def _validate_capabilities(values: List[Capability]) -> List[Capability]:
+    """At least one, and no duplicates.
+
+    An entry granting nothing is not a grant, and the same capability twice is a diff a
+    reviewer has to think about for no reason.
+    """
+    if not values:
+        raise ValueError("capabilities must not be empty")
+    seen = [value.value for value in values]
+    if len(set(seen)) != len(seen):
+        raise ValueError("capabilities must not repeat")
+    return values
+
+
+class _AccessEntryBase(BaseModel):
+    """Fields both kinds of grant carry."""
+
+    model_config = {"extra": "forbid"}
+
+    path: str = Field(
         ...,
-        max_length=128,
-        pattern=KV_NAME_PATTERN,
-        examples=["myapp"],
+        max_length=VAULT_PATH_MAX_LENGTH,
+        pattern=VAULT_PATH_PATTERN,
+        examples=["*"],
         description=(
-            "Name of the KV store. Must be unique across every file in the values "
-            "directory, and may not contain a slash. It also names the file the store is "
-            "committed to, '<values dir>/<kv_name>.yaml'."
+            "Secret path pattern this grant covers. '*' means every secret in the store; "
+            "'services/+/tyk/*' scopes it, where '+' matches one segment."
         ),
     )
 
-    kv_description: str = Field(
+    capabilities: List[Capability] = Field(
+        ...,
+        examples=[["read", "write"]],
+        description="What the principal may do on that path. At least one, no repeats.",
+    )
+
+    @field_validator("capabilities")
+    @classmethod
+    def valid_capabilities(cls, v: List[Capability]) -> List[Capability]:
+        return _validate_capabilities(v)
+
+    @field_validator("path")
+    @classmethod
+    def no_parent_segments(cls, v: str) -> str:
+        """`..` is refused here rather than in the pattern.
+
+        A Vault path never reaches a repo path, so this is not the traversal guard — that
+        is `TEAM_PATTERN`/`KV_NAME_PATTERN`. It is refused because it is meaningless to
+        Vault and almost certainly a mistake. It lives in a validator because
+        pydantic-core's regex engine does not support the look-ahead the pattern would
+        need.
+        """
+        if ".." in v:
+            raise ValueError("path must not contain '..'")
+        return v
+
+
+class OidcAccessEntry(_AccessEntryBase):
+    """A group's grant, written to `oidc-access.yaml`.
+
+    `dn` is an LDAP distinguished name and is deliberately **unvalidated** beyond non-blank:
+    any pattern tight enough to describe a DN rejects the forms this service does not own,
+    and the vocabulary is the directory's, not ours.
+    """
+
+    auth_type: Literal[AuthType.OIDC] = Field(
+        ...,
+        description="oidc — a group or user from the directory.",
+    )
+
+    dn: str = Field(
         ...,
         min_length=1,
-        max_length=256,
-        examples=["payments secrets"],
-        description="What this KV store is for. Recorded in the committed entry.",
+        max_length=512,
+        examples=["CN=svc-athena,OU=ServiceAccounts,DC=corp,DC=example,DC=com"],
+        description="Distinguished Name of the group being granted access.",
     )
 
-    roles: Dict[str, List[str]] = Field(
-        ...,
-        examples=[{"write": ["CN=svc-athena,OU=ServiceAccounts,DC=corp,DC=example,DC=com"]}],
-        description=(
-            "Principals granted each role — an LDAP distinguished name or a hostname, "
-            "whichever the deploy pipeline expects. At least one role with at least one "
-            f"principal is required. Allowed roles: {', '.join(sorted(ALLOWED_ROLE_KEYS))}."
-        ),
-    )
-
-    @field_validator("kv_description")
+    @field_validator("dn")
     @classmethod
     def not_blank(cls, v: str) -> str:
         if not v.strip():
-            raise ValueError("kv_description must not be blank")
+            raise ValueError("dn must not be blank")
         return v.strip()
 
-    @field_validator("roles")
-    @classmethod
-    def valid_roles(cls, v: Dict[str, List[str]]) -> Dict[str, List[str]]:
-        return _validate_roles(v)
 
-
-class VaultKVUpdate(BaseModel):
-    """Editable fields. The name is not one of them — renaming is a Vault migration.
-
-    `kv_name` comes from the URL path; the body carries only the change.
-    """
-
-    model_config = {
-        # A field this model does not know is a 422, never a silent drop.
-        "extra": "forbid",
-        "json_schema_extra": {
-            "example": {
-                "kv_description": "Passwords for athena, rotated quarterly",
-                "roles": {
-                    "write": ["CN=svc-athena,OU=ServiceAccounts,DC=corp,DC=example,DC=com"]
-                },
-            }
-        }
-    }
-
-    kv_description: Optional[str] = Field(
-        default=None,
-        min_length=1,
-        max_length=256,
-        examples=["Passwords for athena, rotated quarterly"],
-        description="Replacement description.",
-    )
-
-    roles: Optional[Dict[str, List[str]]] = Field(
-        default=None,
-        examples=[
-            {"write": ["CN=svc-athena,OU=ServiceAccounts,DC=corp,DC=example,DC=com"]}
-        ],
-        description=(
-            "Replacement roles. Replaces the existing mapping wholesale rather than "
-            "merging into it, so a principal can be removed by omitting it. Does not "
-            "touch the store's k8sServiceAccounts."
-        ),
-    )
-
-    @field_validator("kv_description")
-    @classmethod
-    def not_blank(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None and not v.strip():
-            raise ValueError("kv_description must not be blank")
-        return v.strip() if v is not None else None
-
-    @field_validator("roles")
-    @classmethod
-    def valid_roles(cls, v: Optional[Dict[str, List[str]]]) -> Optional[Dict[str, List[str]]]:
-        return _validate_roles(v) if v is not None else None
-
-    @model_validator(mode="after")
-    def at_least_one_field(self) -> "VaultKVUpdate":
-        """An empty edit would open a pull request that changes nothing."""
-        if self.kv_description is None and self.roles is None:
-            raise ValueError("provide at least one of 'kv_description' or 'roles'")
-        return self
-
-
-# --------------------------------------------------------------------------- #
-# Kubernetes service accounts
+# Kubernetes' own rules, not ours — a looser pattern would let a request pass here and fail
+# at admission long after the pull request merged.
 #
-# A binding is added to a store that already exists, so this request carries no `file` or
-# `kv_name` — both come from the URL path. There is no update model: an entry is three
-# scalars that together *are* its identity, so "editing" one is removing it and adding
-# another, and a PATCH would have nothing left to change.
-# --------------------------------------------------------------------------- #
-class K8sServiceAccountCreate(BaseModel):
-    """One `(serviceAccount, namespace, cluster)` binding on a KV store.
+# A namespace is an RFC 1123 *label* (no dots, <=63) and a service account name an RFC 1123
+# *subdomain* (dots allowed, <=253). Genuinely different limits: do not collapse them.
+K8S_SERVICE_ACCOUNT_PATTERN = r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+K8S_SERVICE_ACCOUNT_MAX_LENGTH = 253
+K8S_NAMESPACE_PATTERN = r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+K8S_NAMESPACE_MAX_LENGTH = 63
 
-    All three are required and singular. The format repeats the whole triple per binding
-    rather than crossing lists, so binding one service account in two namespaces is two
-    requests — which also makes each one individually removable.
+# The OpenShift cluster suffix. No Kubernetes rule to borrow, so this is our own
+# single-segment shape. The pipeline matches it against a k8sMethods[].name.
+K8S_CLUSTER_PATTERN = rf"^{_SEGMENT}$"
+K8S_CLUSTER_MAX_LENGTH = 64
 
-    There is no capability field: listing a service account inside a store *is* the grant,
-    and what it may do with the store is the deploy pipeline's business.
+
+class K8sAccessEntry(_AccessEntryBase):
+    """A service account's grant, written to `k8s-access.yaml`.
+
+    The three scalars together are the workload's identity — the same account in two
+    namespaces or two clusters is two different principals.
+
+    `*` is **rejected** in `name` and `namespace`: it would grant every workload in the
+    cluster, and that escalation should need a human editing the YAML, not an API call.
     """
 
-    model_config = {
-        # A field this model does not know is a 422, never a silent drop.
-        "extra": "forbid",
-        "json_schema_extra": {
-            "example": {
-                "service_account": "vault",
-                "namespace": "athena",
-                "cluster": "dev",
-            }
-        }
-    }
+    auth_type: Literal[AuthType.K8S] = Field(
+        ...,
+        description="k8s — a Kubernetes service account.",
+    )
 
-    service_account: str = Field(
+    name: str = Field(
         ...,
         max_length=K8S_SERVICE_ACCOUNT_MAX_LENGTH,
-        examples=["vault"],
-        description=(
-            "ServiceAccount name allowed to reach this store. An RFC 1123 subdomain "
-            "(lowercase, dots allowed); '*' is rejected."
-        ),
+        pattern=K8S_SERVICE_ACCOUNT_PATTERN,
+        examples=["cloudops-external-secrets"],
+        description="Service account name (RFC 1123 subdomain). No wildcards.",
     )
 
     namespace: str = Field(
         ...,
         max_length=K8S_NAMESPACE_MAX_LENGTH,
-        examples=["athena"],
-        description=(
-            "Namespace that service account comes from. An RFC 1123 label (lowercase, no "
-            "dots); '*' is rejected."
-        ),
+        pattern=K8S_NAMESPACE_PATTERN,
+        examples=["cloudops"],
+        description="Namespace the service account lives in (RFC 1123 label). No wildcards.",
     )
 
     cluster: str = Field(
@@ -315,28 +203,199 @@ class K8sServiceAccountCreate(BaseModel):
         max_length=K8S_CLUSTER_MAX_LENGTH,
         pattern=K8S_CLUSTER_PATTERN,
         examples=["dev"],
+        description="OpenShift cluster suffix; must match a k8sMethods[].name in the pipeline.",
+    )
+
+
+# Discriminated on `auth_type`, so a malformed entry reports the field that is wrong rather
+# than "did not match any variant". An entry with no `auth_type` is rejected rather than
+# defaulted, because the two shapes carry different required fields and guessing between
+# them turns a typo into the wrong file.
+AccessEntry = Annotated[
+    Union[OidcAccessEntry, K8sAccessEntry],
+    Field(discriminator="auth_type"),
+]
+"""One grant, either kind.
+
+Used both inside `access` lists and **as a request body on its own** — the sub-resource
+form of an edit posts a single entry rather than the whole list, and needs no wrapper
+object to do it.
+"""
+
+
+def _validate_access(entries: List[AccessEntry]) -> List[AccessEntry]:
+    """At least one grant, and no two grants of the same identity.
+
+    Identity is everything but the capabilities: the same principal on the same path twice
+    is a contradiction, not an addition. This mirrors `access_entry_identity` in
+    `helpers.py`; that one works on committed dicts, this one on the request.
+    """
+    if not entries:
+        raise ValueError("access must not be empty")
+
+    seen = set()
+    for entry in entries:
+        if isinstance(entry, K8sAccessEntry):
+            identity = ("k8s", entry.path, entry.name, entry.namespace, entry.cluster)
+        else:
+            identity = ("oidc", entry.path, entry.dn)
+        if identity in seen:
+            raise ValueError(f"duplicate access entry: {identity}")
+        seen.add(identity)
+    return entries
+
+
+class OperationStatus(str, Enum):
+    SUCCEEDED = "Succeeded"
+    FAILED = "Failed"
+
+
+class VaultKVCreate(BaseModel):
+    """A create request: who owns the store, what it is called, and who reaches it.
+
+    The store becomes a **directory**, `KVs/<team>/<kv_name>/`, holding up to two files
+    split by `auth_type`. The caller never names a file: the split is the format's and this
+    service applies it.
+
+    `kv_name` is unique across the *whole* values directory, not just within the team, which
+    is what lets every other route address a store by name alone.
+    """
+
+    model_config = {
+        "extra": "forbid",
+        "populate_by_name": True,
+        "json_schema_extra": {
+            "example": {
+                "team": "cloudops",
+                "kv_name": "my-passwords",
+                "access": [
+                    {
+                        "path": "*",
+                        "auth_type": "oidc",
+                        "dn": "CN=cloudops,OU=Groups,DC=corp,DC=example,DC=com",
+                        "capabilities": ["read", "write"],
+                    },
+                    {
+                        "path": "*",
+                        "auth_type": "k8s",
+                        "name": "cloudops-external-secrets",
+                        "namespace": "cloudops",
+                        "cluster": "dev",
+                        "capabilities": ["read"],
+                    },
+                ],
+            }
+        },
+    }
+
+    team: str = Field(
+        ...,
+        max_length=128,
+        pattern=TEAM_PATTERN,
+        examples=["cloudops"],
         description=(
-            "OS4 cluster suffix the binding belongs to. Required — the same service "
-            "account and namespace in two clusters are two distinct bindings."
+            "Team that owns the store. Becomes the first directory segment, "
+            "'<values dir>/<team>/<kv_name>/'."
         ),
     )
 
-    @field_validator("service_account")
-    @classmethod
-    def valid_service_account(cls, v: str) -> str:
-        return _validate_bound_name(
-            v,
-            "service_account",
-            K8S_SERVICE_ACCOUNT_PATTERN,
-            K8S_SERVICE_ACCOUNT_MAX_LENGTH,
-        )
+    kv_name: str = Field(
+        ...,
+        max_length=128,
+        pattern=KV_NAME_PATTERN,
+        examples=["my-passwords"],
+        description=(
+            "Name of the KV store, and its directory. Must be unique across every team in "
+            "the values directory, and may not contain a slash."
+        ),
+    )
 
-    @field_validator("namespace")
+    access: List[AccessEntry] = Field(
+        ...,
+        description=(
+            "The grants this store starts with. oidc entries are written to "
+            "oidc-access.yaml and k8s entries to k8s-access.yaml; a store with no k8s "
+            "grants gets no k8s-access.yaml at all."
+        ),
+    )
+
+    @field_validator("access")
     @classmethod
-    def valid_namespace(cls, v: str) -> str:
-        return _validate_bound_name(
-            v, "namespace", K8S_NAMESPACE_PATTERN, K8S_NAMESPACE_MAX_LENGTH
-        )
+    def valid_access(cls, v: List[AccessEntry]) -> List[AccessEntry]:
+        return _validate_access(v)
+
+
+class VaultKVUpdate(BaseModel):
+    """The replacement grant list for an existing store.
+
+    Wholesale, not merged: a caller that wants to drop a grant sends the list without it,
+    and nothing here has to guess at intent. The name and team are not editable — a rename
+    means migrating secrets in Vault, not editing a field, so it is a delete plus a create.
+    """
+
+    model_config = {
+        "extra": "forbid",
+        "populate_by_name": True,
+        "json_schema_extra": {
+            "example": {
+                "access": [
+                    {
+                        "path": "*",
+                        "auth_type": "oidc",
+                        "dn": "CN=cloudops,OU=Groups,DC=corp,DC=example,DC=com",
+                        "capabilities": ["read"],
+                    }
+                ]
+            }
+        },
+    }
+
+    access: List[AccessEntry] = Field(
+        ...,
+        description="The full grant list after the edit. Replaces what is there.",
+    )
+
+    @field_validator("access")
+    @classmethod
+    def valid_access(cls, v: List[AccessEntry]) -> List[AccessEntry]:
+        return _validate_access(v)
+
+
+class TashtiotAccessUpsert(BaseModel):
+    """The whole grant list for one team's Tashtiot file.
+
+    A different resource from a KV store: it is per-team, lands in a single flat file
+    (`<values dir>/Tashtiot/<team>.yaml`) and mixes both `auth_type`s in one list rather
+    than splitting them. It grants a team access into the shared services store, which is
+    why its paths are usually scoped (`services/+/redis/*`) rather than `*`.
+    """
+
+    model_config = {
+        "extra": "forbid",
+        "populate_by_name": True,
+        "json_schema_extra": {
+            "example": {
+                "access": [
+                    {
+                        "path": "+/cloudops/*",
+                        "auth_type": "oidc",
+                        "dn": "CN=cloudops,OU=Groups,DC=corp,DC=example,DC=com",
+                        "capabilities": ["read"],
+                    }
+                ]
+            }
+        },
+    }
+
+    access: List[AccessEntry] = Field(
+        ...,
+        description="Every grant this team has into the shared services store.",
+    )
+
+    @field_validator("access")
+    @classmethod
+    def valid_access(cls, v: List[AccessEntry]) -> List[AccessEntry]:
+        return _validate_access(v)
 
 
 # --------------------------------------------------------------------------- #

@@ -40,8 +40,14 @@ class VaultV1StaticSettings(BaseSettings):
     )
 
     VAULT_VALUES_DIR: str = Field(
-        default="kv",
-        description="Directory inside the values repo holding the KV mount definitions.",
+        default="KVs",
+        description="Directory inside the values repo holding the KV store directories.",
+    )
+
+    TASHTIOT_DIR: str = Field(
+        default="Tashtiot",
+        description="Sub-directory of the values dir holding the per-team access files for "
+        "the shared services store. One flat '<team>.yaml' each, not a store directory.",
     )
 
     # --- Pull request shaping ---

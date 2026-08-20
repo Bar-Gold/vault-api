@@ -28,20 +28,16 @@ so the service should answer 504). `polls` is how many reads a build stays INPRO
 before settling. `workflows` is how many build statuses a pipeline posts against one
 commit, which is what makes the "wait for the slowest one" path reachable.
 
-**One thing this stub cannot do: a whole-file delete.** Removing a store now removes its
-file, and Bitbucket Server has no REST endpoint for that — the service pushes a deleting
-commit over git instead (`app/clients/git.py`). Faking that would mean speaking git's smart
-HTTP protocol and backing this stub with a real repository, rather than the in-memory dicts
-below. So a `DELETE` of a store that is alone in its file will fail here with a git error
-surfaced as a 502, and that is expected. Two ways round it while developing:
+**One thing this stub cannot do: a delete.** A KV store is a *directory*, and removing one
+removes the directory — which Bitbucket Server has no REST endpoint for, so the service
+pushes a `git rm -r` commit instead (`app/clients/git.py`). Faking that would mean speaking
+git's smart HTTP protocol and backing this stub with a real repository rather than the
+in-memory dicts below, so a `DELETE` fails here with a git error surfaced as a 502. That is
+expected; point `BITBUCKET_URL` at a real Bitbucket to exercise it. The same applies to the
+one edit that removes a file — an update that empties a store's Kubernetes grants.
 
-  * exercise the *grouped* branch, which is still an ordinary `put_file` edit: create two
-    stores into one file (only reachable through an older revision, or by seeding
-    `state.files` directly) and delete one of them;
-  * or point `BITBUCKET_URL` at a real Bitbucket for the delete path specifically.
-
-Everything else — create, update, both PR-only variants and both service-account
-operations — runs against this stub unchanged.
+Everything else — create, update, both PR-only variants, adding a grant and the Tashtiot
+routes — runs against this stub unchanged.
 
 Deliberately faithful in three places, because they are the easy things to break:
   * a pull request's `version` is bumped every time a build status changes, so merging
@@ -317,7 +313,9 @@ async def list_files(
     key: str, slug: str, directory: str, at: Optional[str] = None,
     start: int = 0, limit: int = 1000,
 ):
-    """Files under a directory — the create flow scans these for a duplicate store name.
+    """Files under a directory, **recursively**, relative to it — the real resource's
+    behaviour, and what the store walk relies on to see `<team>/<kv>/oidc-access.yaml`
+    from one call on the values dir.
 
     Paginated like the real thing, so the client's nextPageStart loop is actually
     exercised rather than assumed. A missing directory is a 404, which the client turns
