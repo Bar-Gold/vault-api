@@ -459,14 +459,10 @@ class VaultOperationResponse(BaseModel):
     validation_builds: Optional[List[BuildInfo]] = Field(
         default=None,
         description=(
-            "Builds Bitbucket reported against the pull request's commit — the gate on the "
-            "merge. A list because a CI server may report one build per workflow."
+            "Builds Bitbucket reported against the pull request's commit. A list because a "
+            "CI server may report one build per workflow, and all of them must be green. "
+            "Null on the routes that open a pull request without waiting for CI."
         ),
-    )
-
-    deploy_builds: Optional[List[BuildInfo]] = Field(
-        default=None,
-        description="Builds reported against the merge commit — the ones that apply the change.",
     )
 
     error: Optional[str] = Field(

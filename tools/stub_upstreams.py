@@ -22,6 +22,12 @@ Then drive scenarios:
     curl -X POST 127.0.0.1:9000/__control -H 'Content-Type: application/json' \
          -d '{"validation":"failure"}'          # -> 502, PR declined, branch deleted
     curl 127.0.0.1:9000/__state                 # inspect branches / PRs / builds
+    curl -X POST 127.0.0.1:9000/__merge/100     # play the reviewer: merge PR 100
+
+**`__merge` is how you get past one create.** The service opens a pull request and stops —
+it never merges — so nothing it does reaches the base branch, and every read, edit and
+delete resolves against it. Merge the pull request yourself and the rest of the surface
+becomes reachable.
 
 `validation` and `deploy` accept `success`, `failure` or `hang` (never leaves INPROGRESS,
 so the service should answer 504). `polls` is how many reads a build stays INPROGRESS
@@ -220,6 +226,25 @@ async def git_smart_http(rest: str) -> JSONResponse:
             ]
         },
     )
+
+
+@app.post("/__merge/{pull_id}")
+async def play_the_reviewer(pull_id: int):
+    """Merge a pull request as a **human reviewer would** — the service never does.
+
+    Since the service stops at a green pull request, nothing it does can put a store on the
+    base branch, and every read, edit and delete route resolves against the base branch. So
+    without this the local loop dead-ends after one create: `GET /stores` stays empty
+    forever and there is nothing to PATCH.
+
+    This is the reviewer, not a shortcut around one: it reuses the real merge resource, so
+    merging still lands the branch's files on the base branch and fires the deploy
+    pipeline's build statuses exactly as the real forge would.
+    """
+    pull = state.pulls.get(pull_id)
+    if pull is None:
+        return _error(404, f"Pull request {pull_id} not found")
+    return await merge_pull_request("", "", pull_id, version=pull.version)
 
 
 @app.post("/__reset")

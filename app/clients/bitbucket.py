@@ -393,6 +393,13 @@ class BitbucketClient:
         response = await self._request("GET", f"{self._api}/pull-requests/{pull_request_id}")
         return PullRequest.from_api(response.json())
 
+    # NOTE: `merge_pull_request` and `get_branch_head` have **no caller** in `app/v1/`.
+    # This service opens a pull request, waits for the validation build and stops — it
+    # never merges, and there is no deploy gate to resolve a merge commit for. Both are
+    # kept because they are this client's REST surface and are covered by tests, and
+    # because merging is the obvious thing to re-add. `await_builds(..., exclude_keys=…)`
+    # is unused for the same reason: it existed only so a deploy gate on a fast-forward
+    # merge would not re-read the validation gate's results.
     async def merge_pull_request(self, pull_request_id: int, version: int) -> PullRequest:
         """Merge the PR. `version` guards against merging a PR that changed underneath us."""
         logger.info(f"Merging pull request {pull_request_id} (version {version})")

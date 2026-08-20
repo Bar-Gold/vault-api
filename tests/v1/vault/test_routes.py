@@ -61,16 +61,20 @@ def test_docs_need_no_token(client):
 # --------------------------------------------------------------------------- #
 # create
 # --------------------------------------------------------------------------- #
-def test_create_returns_201_and_the_success_message(client, auth_headers, bitbucket):
+def test_create_returns_201_and_leaves_the_pull_request_open(
+    client, auth_headers, bitbucket
+):
     response = client.post(CREATE_URL, json=BODY, headers=auth_headers)
 
     assert response.status_code == 201
     body = response.json()
     assert body["status"] == "Succeeded"
-    assert body["message"] == f"Successful creation of {KV}"
+    assert f"to create {KV}" in body["message"]
     assert body["kv_name"] == KV
     assert body["file"] == STORE_DIR
-    assert body["pull_request"]["state"] == "MERGED"
+    # Open, not merged: this service proposes and a human merges.
+    assert body["pull_request"]["state"] == "OPEN"
+    assert body["validation_builds"][0]["state"] == "SUCCESSFUL"
 
 
 def test_create_commits_the_access_file(client, auth_headers, bitbucket):
@@ -109,13 +113,11 @@ def test_a_build_timeout_returns_504(client, auth_headers, bitbucket):
     assert response.status_code == 504
 
 
-def test_a_failed_deploy_build_says_it_is_merged(client, auth_headers, bitbucket):
-    bitbucket.builds = [passing(), failing("ci/woodpecker/push/deploy")]
+def test_there_is_no_deploy_build_field(client, auth_headers, bitbucket):
+    """Nothing waits for a deploy any more, so the field would always be null."""
+    body = client.post(CREATE_URL, json=BODY, headers=auth_headers).json()
 
-    response = client.post(CREATE_URL, json=BODY, headers=auth_headers)
-
-    assert response.status_code == 502
-    assert "needs a revert" in response.json()["error"]
+    assert "deploy_builds" not in body
 
 
 @pytest.mark.parametrize("field,value", [
@@ -195,7 +197,7 @@ def test_patch_replaces_the_grants(client, auth_headers, bitbucket):
         headers=auth_headers,
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 201
     assert yaml.safe_load(bitbucket.committed[OIDC_PATH])["access"][0]["dn"] == OTHER_DN
 
 
@@ -211,6 +213,7 @@ def test_a_no_op_patch_returns_200_with_no_pull_request(client, auth_headers, bi
         headers=auth_headers,
     )
 
+    # 200, not 201: no pull request was opened, so 201 would be a lie.
     assert response.status_code == 200
     assert response.json()["pull_request"] is None
 
@@ -255,14 +258,14 @@ def test_adding_a_duplicate_grant_returns_409(client, auth_headers, bitbucket):
     assert response.status_code == 409
 
 
-def test_revoking_a_grant_returns_200(client, auth_headers, bitbucket):
+def test_revoking_a_grant_returns_201(client, auth_headers, bitbucket):
     seed_store(bitbucket, oidc=[oidc_entry(), oidc_entry(dn=OTHER_DN)])
 
     response = client.delete(
         f"{ACCESS_URL}?auth_type=oidc&path=*&dn={OTHER_DN}", headers=auth_headers
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 201
     assert yaml.safe_load(bitbucket.committed[OIDC_PATH])["access"][0]["dn"] == DN
 
 
@@ -275,7 +278,7 @@ def test_revoking_a_k8s_grant_takes_all_three_scalars(client, auth_headers, bitb
         headers=auth_headers,
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 201
     assert bitbucket.deleted == [K8S_PATH]
 
 
@@ -323,12 +326,12 @@ def test_mixing_the_two_identities_is_422(client, auth_headers, bitbucket):
 # --------------------------------------------------------------------------- #
 # delete
 # --------------------------------------------------------------------------- #
-def test_delete_returns_200_and_removes_the_directory(client, auth_headers, bitbucket):
+def test_delete_returns_201_and_removes_the_directory(client, auth_headers, bitbucket):
     seed_store(bitbucket, oidc=[oidc_entry()], k8s=[k8s_entry()])
 
     response = client.delete(STORE_URL, headers=auth_headers)
 
-    assert response.status_code == 200
+    assert response.status_code == 201
     assert bitbucket.deleted == [STORE_DIR]
 
 
@@ -363,7 +366,7 @@ TASHTIOT_PATH = f"KVs/Tashtiot/{TEAM}.yaml"
 def test_tashtiot_upsert_writes_one_flat_file(client, auth_headers, bitbucket):
     response = client.put(TASHTIOT_URL, json=TASHTIOT_BODY, headers=auth_headers)
 
-    assert response.status_code == 200
+    assert response.status_code == 201
     assert list(bitbucket.committed) == [TASHTIOT_PATH]
 
 
@@ -397,7 +400,7 @@ def test_a_second_tashtiot_upsert_replaces(client, auth_headers, bitbucket):
         headers=auth_headers,
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 201
     assert len(yaml.safe_load(bitbucket.committed[TASHTIOT_PATH])["access"]) == 1
 
 
@@ -430,7 +433,7 @@ def test_deleting_tashtiot_removes_the_file(client, auth_headers, bitbucket):
 
     response = client.delete(TASHTIOT_URL, headers=auth_headers)
 
-    assert response.status_code == 200
+    assert response.status_code == 201
     assert bitbucket.deleted == [TASHTIOT_PATH]
 
 

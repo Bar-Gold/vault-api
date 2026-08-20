@@ -4,9 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A FastAPI service that **writes access files to a Bitbucket repo and watches the builds that
-act on them**. A create request opens a pull request, waits for the validating build, merges,
-waits for the deploying build, and returns `Successful creation of <kv name>`.
+A FastAPI service that **proposes access-file changes as pull requests and confirms CI is
+green**. A create request opens a pull request, waits for the validating build, and returns
+with the pull request open and waiting for review.
+
+**This service never merges.** It proposes a change and confirms CI is happy with it; who
+merges, and when, is a human decision it deliberately does not make. Nothing it does ever
+reaches the base branch — which is why every failure is fully rolled back and there is no
+point of no return anywhere in this codebase.
 
 **Bitbucket is the only upstream.** The gates are not read from the CI server: a CI server
 posts its result *into* Bitbucket against the commit it built, and Bitbucket keeps one result
@@ -125,9 +130,9 @@ curl -X POST 127.0.0.1:9000/__reset
 stays `INPROGRESS`; `workflows` is how many build statuses one pipeline posts against a
 commit, which is what makes the "wait for the slowest one" path reachable. The stub
 reproduces three traps on purpose: a PR's `version` is bumped on every build-status change
-(so a stale version 409s at merge), a merge lands the file on the base branch (so a repeat
-create hits the duplicate guard), and commit ids are **hex** rather than derived from the
-branch name — a branch name contains slashes, which would silently become extra URL path
+(so a stale version 409s when declining), a merge lands the file on the base branch (so a
+repeat create hits the duplicate guard), and commit ids are **hex** rather than derived from
+the branch name — a branch name contains slashes, which would silently become extra URL path
 segments in the builds endpoint. Keep all three if you extend it.
 
 `.woodpecker/build.yaml` runs the suite on push to `master` and builds/pushes the image on git
@@ -137,21 +142,21 @@ segments in the builds endpoint. Keep all three if you extend it.
 
 | Route | Body | Notes |
 |-------|------|-------|
-| `POST /api/vault/v1/kv/` | `{team, kv_name, access}` | the chain below; blocks until the deploy build ends; 201 |
-| `POST /api/vault/v1/kv/pull-request` | same body | steps 1-3 only: opens the PR and returns. No CI wait, no merge; 201 |
+| `POST /api/vault/v1/kv/` | `{team, kv_name, access}` | the chain below; blocks until the validation build ends; 201 |
+| `POST /api/vault/v1/kv/pull-request` | same body | steps 1-3 only: opens the PR and returns **without waiting for CI**; 201 |
 | `GET /api/vault/v1/kv/stores` | — | every store: `{team, kv_name, directory}`. Lists directories, reads no file |
 | `GET /api/vault/v1/kv/{kv_name}` | — | one store: its team, directory and every grant, both kinds, oidc first |
-| `PATCH /api/vault/v1/kv/{kv_name}` | `{access}` | replaces the grant list wholesale; 200 |
-| `DELETE /api/vault/v1/kv/{kv_name}` | — | **removes the store's directory**, both files with it; 200 |
+| `PATCH /api/vault/v1/kv/{kv_name}` | `{access}` | replaces the grant list wholesale; 201 (200 if unchanged) |
+| `DELETE /api/vault/v1/kv/{kv_name}` | — | **removes the store's directory**, both files with it; 201 |
 | `DELETE /api/vault/v1/kv/{kv_name}/pull-request` | — | steps 1-3 only for a removal; 201 |
 | `POST /api/vault/v1/kv/{kv_name}/access` | one entry | appends one grant to whichever file its `auth_type` selects; 201 |
 | `POST /api/vault/v1/kv/{kv_name}/access/pull-request` | same body | steps 1-3 only; 201 |
 | `GET /api/vault/v1/kv/{kv_name}/access` | — | that store's grants (empty list, not 404, when it grants none) |
-| `DELETE /api/vault/v1/kv/{kv_name}/access` | `?auth_type=&path=&…` | revokes one grant; 200 |
+| `DELETE /api/vault/v1/kv/{kv_name}/access` | `?auth_type=&path=&…` | revokes one grant; 201 |
 | `DELETE /api/vault/v1/kv/{kv_name}/access/pull-request` | same query | steps 1-3 only; 201 |
-| `PUT /api/vault/v1/kv/tashtiot/{team}` | `{access}` | create-or-replace one team's shared-services grants; 200 |
+| `PUT /api/vault/v1/kv/tashtiot/{team}` | `{access}` | create-or-replace one team's shared-services grants; 201 (200 if unchanged) |
 | `GET /api/vault/v1/kv/tashtiot/{team}` | — | that team's file, parsed and returned as-is |
-| `DELETE /api/vault/v1/kv/tashtiot/{team}` | — | removes the team's file; 200 |
+| `DELETE /api/vault/v1/kv/tashtiot/{team}` | — | removes the team's file; 201 |
 
 **A store is addressed by name alone.** A caller should not have to remember which team owns
 their store, and does not have to: a store name is unique across the whole values directory —
@@ -335,8 +340,8 @@ Four things about it are deliberate:
 - **It runs in `asyncio.to_thread`.** A subprocess plus two network round-trips on the event
   loop would stall every other in-flight request.
 - **It produces one commit on one topic branch and stops.** It never pushes to the base
-  branch, so the pull request, both gates, the merge and every rollback are unchanged — the
-  branch is deleted over REST exactly as if `put_file` had made it.
+  branch, so the pull request, the gate and every rollback are unchanged — the branch is
+  deleted over REST exactly as if `put_file` had made it.
 - **Every failure leaves as `ExternalServiceError`**, matching `http.py`, so the routes map
   it without knowing a subprocess was involved. A git timeout is a **504** for the same
   reason a read timeout is.
@@ -370,14 +375,15 @@ would silently pass a gate for any workflow nobody listed, so it is not the defa
 
 `PENDING_BUILD_STATES` is `{INPROGRESS}` and `SUCCESSFUL_BUILD_STATE` is `SUCCESSFUL`. Those
 are separate constants on purpose: `CANCELLED` and `UNKNOWN` are **terminal but not success**,
-so a gate keyed off "not FAILED" would merge both. A gate passes only when *every* build
+so a gate keyed off "not FAILED" would pass both. The gate passes only when *every* build
 succeeded — Bitbucket stores one result per key per commit, so a pipeline with several
 workflows lands several rows.
 
 **Known consequence, documented rather than worked around:** a CI server that posts one
 status per workflow may not post them all at once, so a gate that sees a single finished
 build while a sibling has yet to appear returns early. Bitbucket's own required-builds merge
-check is the backstop if that matters for a given repo.
+check is the backstop — and it matters less now, since a human reviews the pull request
+before merging it anyway.
 
 **Shared helpers (`app/helpers.py`)** are pure. Paths: `kv_store_dir`, `oidc_access_path`,
 `k8s_access_path`, `access_path_for`, `tashtiot_access_path`, `build_branch_name`,
@@ -419,13 +425,26 @@ PyYAML does not, both about the committed text rather than its meaning:
 away from the spec's shape. Note also that `*` is emitted as `'*'` — a bare `*` is a YAML
 alias and would not round-trip.
 
-## The create chain — read this before editing `operations.py`
+## The chain — read this before editing `operations.py`
 
-**Two shared helpers, nested.** `_open_pull_request` owns branch → commit(s) → PR and both of
-their rollbacks (either failure deletes the branch). `_commit_via_pull_request` calls it and
-then adds the gates and the merge. **Every mutating operation goes through them** — the
-blocking ones via `_commit_via_pull_request`, the PR-only variants stopping at
+**Two shared helpers, nested.** `_open_pull_request` owns branch -> commit(s) -> PR and both
+of their rollbacks (either failure deletes the branch). `_open_and_validate` calls it and
+then waits for the validation build. **Every mutating operation goes through them** — the
+blocking ones via `_open_and_validate`, the PR-only variants stopping at
 `_open_pull_request`. One implementation each means the rollback shape cannot drift.
+
+**Nothing merges.** The old chain went on to merge the pull request and wait for a deploy
+build on the merge commit; it does not any more. What went with that decision:
+
+- `merge_pull_request` and `get_branch_head` on the client now have **no caller**. Both are
+  kept — they are the client's REST surface, they are tested, and merging is the obvious
+  thing to re-add — but nothing in `app/v1/` reaches them.
+- `await_builds(..., exclude_keys=…)` is unused for the same reason. It existed only so a
+  deploy gate on a **fast-forward merge** would not re-read the validation gate's results,
+  and there is no second gate to protect.
+- `deploy_builds` is gone from `VaultOperationResponse`. Nothing could populate it.
+- **There is no point of no return.** Every failure is fully rolled back, and that is a
+  consequence of not merging rather than an effort.
 
 **A change is a `Change`, not a path.** `Change(writes=[FileWrite…], removes=[path…])` is what
 the chain commits. That is what lets a create write **two files on one branch** (Bitbucket's
@@ -445,13 +464,11 @@ states — adding the first Kubernetes grant edits `oidc-access.yaml` and create
    conflicts at merge, same as any other GitOps race.
 1. `_store_writes` partitions the grants and renders one file per non-empty kind. Nothing is
    read: the store is new, so neither file exists and no lock token applies.
-2. `create_branch` → `put_file` per file
+2. `create_branch` -> `put_file` per file
 3. `create_pull_request`
-4. **gate 1**: `await_builds` on `pull_request.from_commit` (`fromRef.latestCommit`) — the sha
-   the PR's Builds tab shows
-5. `get_pull_request` (re-read for the current `version`) → `merge_pull_request`
-6. **gate 2**: `await_builds` on the merge commit (`properties.mergeCommit.id`, falling back
-   to `get_branch_head(base)` — not every merge strategy reports one)
+4. **the gate**: `await_builds` on `pull_request.from_commit` (`fromRef.latestCommit`) — the
+   sha the PR's Builds tab shows
+5. return. The pull request is open, green, and a human's to merge.
 
 There is **no transaction**; each step hand-rolls its own rollback:
 
@@ -459,25 +476,17 @@ There is **no transaction**; each step hand-rolls its own rollback:
 |---------|----------|
 | any `put_file` / `delete_file` | delete the branch |
 | `create_pull_request` | delete the branch |
-| gate 1 fails or times out | decline the PR **and** delete the branch |
-| merge fails | **nothing** — leave the PR open for a human |
-| gate 2 fails or times out | **nothing** — already merged; the message says a revert is needed |
+| the validation build fails or times out | decline the PR **and** delete the branch |
 
-**Step 5 is the point of no return.** Preserve that asymmetry when editing. Rollback failures
-are logged and never raised over the original error.
+Rollback failures are logged and never raised over the original error.
 
-Three details that are easy to break:
-- **The version re-read before merging/declining.** Bitbucket's `version` is an optimistic
-  lock that CI status updates bump; merging with the stale one from `create_pull_request`
-  409s.
-- **`exclude_keys` on gate 2.** A **fast-forward merge** leaves the base branch pointing at
-  the very commit the pull request built, so gate 1's results are already sitting on gate 2's
-  sha; without excluding the keys gate 1 saw, gate 2 would open on its predecessor's answer
-  and call the deploy a success before it started. Applied *only* when
-  `merge_commit == from_commit`, so a normal merge commit excludes nothing.
-- **Gate 1 needs `from_commit`.** If Bitbucket reports no `fromRef.latestCommit` there is no
-  sha to watch, and merging unvalidated is not the fallback — the chain declines the PR and
-  deletes the branch, exactly as a red build would.
+Two details that are easy to break:
+- **The version re-read before declining.** Bitbucket's `version` is an optimistic lock that
+  CI status updates bump, so `_decline_and_cleanup` re-reads the pull request rather than
+  declining with the stale version `create_pull_request` returned.
+- **The gate needs `from_commit`.** If Bitbucket reports no `fromRef.latestCommit` there is
+  no sha to watch, and reporting an unvalidated pull request as validated is not the fallback
+  — the chain declines the PR and deletes the branch, exactly as a red build would.
 
 ### Update, delete and the sub-resource
 
@@ -555,16 +564,16 @@ visibility that makes a repeat `/pull-request` open a second PR.
 
 ## Notes
 
-- The create endpoint **blocks** for the whole chain. Any proxy in front needs a read timeout
-  above `CI_PIPELINE_START_TIMEOUT_SECONDS + 2 × CI_PIPELINE_TIMEOUT_SECONDS`. `/pull-request`
-  is the escape hatch when that is unacceptable: it answers in one round-trip and hands the
-  merge to a human.
-- Status codes: **201** creates, grants and every PR-only route; **200** edits, deletes, the
-  Tashtiot upsert and reads; **409** duplicate store name or duplicate grant; **404** unknown
-  store, grant or Tashtiot file; **502** build/transport failure; **504** build or upstream
-  timeout; **422** request, path-parameter or query-parameter validation. The rule: an
-  endpoint that opens a PR and stops answers 201; one that runs the full chain answers 201 for
-  a create or a grant and 200 for an edit, a delete or a revoke.
+- The mutating endpoints **block** until the validation build finishes. Any proxy in front
+  needs a read timeout above `CI_PIPELINE_START_TIMEOUT_SECONDS + CI_PIPELINE_TIMEOUT_SECONDS`
+  — one gate's worth, not two. `/pull-request` is the escape hatch when even that is
+  unacceptable: it answers in one round-trip without waiting for CI at all.
+- Status codes, and the rule is now one line: **201 when a pull request was opened, 200 when
+  none was.** Every mutating route declares 201; the only 200s are the no-op short circuits
+  (an update or upsert whose document already matched) and the reads. `_execute` owns that
+  downgrade, so no route has to know it. Then **409** duplicate store name or duplicate grant;
+  **404** unknown store, grant or Tashtiot file; **502** build/transport failure; **504** build
+  or upstream timeout; **422** request, path-parameter or query-parameter validation.
 - **`routes.py` has two funnels, not one.** `_execute` is for mutations; the `GET`s go through
   **`_read`**, which differs in both directions: an upstream **404 stays a 404** (a missing
   store is the caller's mistake, not a bad gateway), and its failure body is a bare
@@ -574,10 +583,11 @@ visibility that makes a repeat `/pull-request` open a second PR.
 - **One response model for every mutating route**, `VaultOperationResponse`. `(file, kv_name)`
   addresses stores, grants and Tashtiot files alike — `file` carries the *directory* for a
   store and the file path for a Tashtiot upsert.
-- **The CI outcome is reported as `validation_builds` / `deploy_builds`** — lists of
-  `BuildInfo{key, state, name, url}`. Lists because Bitbucket stores one result per key per
+- **The CI outcome is reported as `validation_builds`** — a list of
+  `BuildInfo{key, state, name, url}`. A list because Bitbucket stores one result per key per
   commit, so a multi-workflow pipeline lands several; `key` rather than `number` because the
-  key is what identifies a build to Bitbucket and what tells two workflows apart.
+  key is what identifies a build to Bitbucket and what tells two workflows apart. There is no
+  `deploy_builds`: nothing waits for a deploy, so nothing could populate it.
 - **Failures are `return`ed as a `JSONResponse`, not raised.** So the decorator's
   `status_code=` and `response_model=` describe the success path only — FastAPI does not
   validate or document the failure bodies. Adding a field to `VaultOperationResponse` means
@@ -618,11 +628,18 @@ visibility that makes a repeat `/pull-request` open a second PR.
     is the validation gate and element 1 the deploy gate; an `Exception` in the list is raised
     instead of returned. Running dry is an `AssertionError`, so a test running two full chains
     must script four entries.
-- **`tools/stub_upstreams.py` cannot serve a delete.** A store is a directory and removing one
-  is a `git rm -r`, which needs git's smart HTTP protocol and a real repository rather than the
-  stub's in-memory dicts. A `DELETE` fails there with a git error surfaced as a 502; that is
-  expected. Everything else — create, update, both PR-only variants, adding a grant and the
-  Tashtiot routes — runs against it unchanged.
+- **`tools/stub_upstreams.py` needs `POST /__merge/{id}` to get past one create.** Since the
+  service never merges, nothing it does reaches the base branch — and every read, edit and
+  delete resolves against the base branch. Without playing the reviewer the local loop
+  dead-ends: `GET /stores` stays empty forever and there is nothing to PATCH. That endpoint
+  reuses the stub's real merge resource, so merging still lands the files and fires the
+  deploy pipeline's build statuses exactly as the forge would.
+- **The stub cannot serve anything that removes a path.** A store delete is a `git rm -r`, and
+  so is an edit that empties one kind of grant (removing that access file). Both need git's
+  smart HTTP protocol and a real repository rather than the stub's in-memory dicts, so they
+  fail there with a git error surfaced as a 502. That is expected; everything else — create,
+  a non-emptying update, both PR-only variants, adding a grant and the Tashtiot routes — runs
+  against it unchanged.
 - Commits are expected to be **Conventional Commits** (`feat:`, `fix:`, `test:`, `feat!:` for
   a breaking change) — follow the existing `git log`. There is no changelog tooling. The
   version is a literal in `pyproject.toml` plus the `APP_VERSION` build arg.

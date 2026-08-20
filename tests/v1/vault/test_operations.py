@@ -69,17 +69,19 @@ async def test_create_returns_the_success_message(bitbucket, payload):
     result = await _create(bitbucket, payload)
 
     assert result.status.value == "Succeeded"
-    assert result.message == f"Successful creation of {KV}"
+    assert f"to create {KV}" in result.message
+    assert "waiting for review" in result.message
     assert result.kv_name == KV
     assert result.file == STORE_DIR
 
 
-async def test_create_reports_the_merge_and_both_pipelines(bitbucket, payload):
+async def test_create_leaves_the_pull_request_open(bitbucket, payload):
+    """The whole point: this service proposes, a human merges."""
     result = await _create(bitbucket, payload)
 
-    assert result.pull_request.state == "MERGED"
+    assert result.pull_request.state == "OPEN"
     assert [b.state for b in result.validation_builds] == ["SUCCESSFUL"]
-    assert [b.state for b in result.deploy_builds] == ["SUCCESSFUL"]
+    assert "merge_pull_request" not in bitbucket.calls
 
 
 async def test_create_call_order(bitbucket, payload):
@@ -91,11 +93,11 @@ async def test_create_call_order(bitbucket, payload):
         "put_file",  # oidc-access.yaml
         "put_file",  # k8s-access.yaml, same branch
         "create_pull_request",
-        "await_builds",  # gate 1, on the pull request's commit
-        "get_pull_request",  # re-read for the current version
-        "merge_pull_request",
-        "await_builds",  # gate 2, on the merge commit
+        "await_builds",  # the validation build, on the pull request's commit
     ]
+    # And nothing after it: no merge, no second gate.
+    assert "merge_pull_request" not in bitbucket.calls
+    assert bitbucket.calls.count("await_builds") == 1
 
 
 async def test_create_sends_no_optimistic_lock_token(bitbucket, payload):
@@ -112,11 +114,12 @@ async def test_the_branch_names_team_and_store(bitbucket, payload):
     assert stored.from_branch == f"vault-kv/{TEAM}-{KV}-abc123"
 
 
-async def test_both_gates_watch_the_right_commits(bitbucket, payload):
+async def test_the_gate_watches_the_pull_requests_commit(bitbucket, payload):
+    """One gate, on the sha the PR's Builds tab shows — never the base branch."""
     result = await _create(bitbucket, payload)
 
     stored = bitbucket.pull_requests[result.pull_request.id]
-    assert bitbucket.awaited_commits == [stored.from_commit, bitbucket.merge_commit]
+    assert bitbucket.awaited_commits == [stored.from_commit]
 
 
 # --------------------------------------------------------------------------- #
@@ -185,28 +188,25 @@ async def test_a_red_validation_build_declines_and_deletes(bitbucket, payload):
     assert bitbucket.calls[-2:] == ["decline_pull_request", "delete_branch"]
 
 
-async def test_a_failed_merge_leaves_the_pull_request_open(bitbucket, payload):
-    """Step 5 is the point of no return, so nothing before it is undone here."""
-    bitbucket.fail_on["merge_pull_request"] = ExternalServiceError(
-        service_name="bitbucket", detail="conflict", status_code=409
-    )
+async def test_nothing_is_ever_merged(bitbucket, payload):
+    """There is no point of no return any more — the service cannot reach the base branch."""
+    await _create(bitbucket, payload)
+
+    assert "merge_pull_request" not in bitbucket.calls
+    assert bitbucket.pull_requests[101].state == "OPEN"
+
+
+async def test_a_build_timeout_declines_and_deletes(bitbucket, payload):
+    """A slow gate rolls back exactly like a red one: there is nothing merged to keep."""
+    from app.clients.bitbucket import BuildTimeoutError
+
+    bitbucket.builds = [BuildTimeoutError("nothing reported", [])]
 
     with pytest.raises(VaultOperationError) as error:
         await _create(bitbucket, payload)
 
-    assert "could not be merged" in error.value.message
-    assert "decline_pull_request" not in bitbucket.calls
-    assert "delete_branch" not in bitbucket.calls
-
-
-async def test_a_red_deploy_build_is_reported_not_rolled_back(bitbucket, payload):
-    bitbucket.builds = [passing(), failing("ci/woodpecker/push/deploy")]
-
-    with pytest.raises(VaultOperationError) as error:
-        await _create(bitbucket, payload)
-
-    assert "needs a revert" in error.value.message
-    assert "decline_pull_request" not in bitbucket.calls
+    assert error.value.status_code == 504
+    assert bitbucket.calls[-2:] == ["decline_pull_request", "delete_branch"]
 
 
 # --------------------------------------------------------------------------- #
@@ -482,7 +482,7 @@ async def test_delete_removes_the_whole_directory(bitbucket):
 
     assert bitbucket.deleted == [STORE_DIR]
     assert bitbucket.committed == {}
-    assert result.message == f"Successful deletion of {KV}"
+    assert f"to delete {KV}" in result.message
 
 
 async def test_delete_needs_no_optimistic_lock_token(bitbucket):

@@ -205,9 +205,19 @@ async def _execute(operation: Any) -> Any:
     a renderable body, and an `ExternalServiceError` becomes a 504 when the upstream timed
     out and a 502 otherwise. Failures are *returned*, not raised, so they reuse
     `VaultOperationResponse` without FastAPI validating them against the success model.
+
+    It also owns the one success-status decision: **201 when a pull request was opened,
+    200 when nothing was.** Every mutating route declares 201, and this downgrades the
+    no-op short circuits, so no route has to know the rule.
     """
     try:
-        return await operation
+        result = await operation
+        if isinstance(result, VaultOperationResponse) and result.pull_request is None:
+            # Nothing was opened, so 201 would be a lie. The only way to get here is a
+            # short circuit: an update or upsert whose document already matched. One rule,
+            # one place — every route's decorator can then say 201 unconditionally.
+            return _json(result, 200)
+        return result
 
     except VaultOperationError as operation_error:
         logger.error(f"Vault KV operation failed: {operation_error.message}")
@@ -307,6 +317,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
     @router.put(
         "/tashtiot/{team}",
         response_model=VaultOperationResponse,
+        status_code=201,
         summary="Create or replace one team's shared-services grants",
         description=(
             "Writes '<values dir>/<Tashtiot dir>/<team>.yaml'. An upsert: create and "
@@ -331,6 +342,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
     @router.delete(
         "/tashtiot/{team}",
         response_model=VaultOperationResponse,
+        status_code=201,
         summary="Remove one team's shared-services grants",
         description="Deletes the team's file and runs the full chain.",
     )
@@ -398,6 +410,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
     @router.delete(
         "/{kv_name}/access",
         response_model=VaultOperationResponse,
+        status_code=201,
         summary="Revoke one grant",
         description=(
             "The grant's identity travels as query parameters, since DELETE bodies are "
@@ -479,6 +492,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
     @router.patch(
         "/{kv_name}",
         response_model=VaultOperationResponse,
+        status_code=201,
         summary="Replace a store's grants",
         description=(
             "The access list is replaced wholesale. An edit that changes nothing returns "
@@ -492,7 +506,8 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
     @router.delete(
         "/{kv_name}",
         response_model=VaultOperationResponse,
-        summary="Delete a KV store and wait for both pipelines",
+        status_code=201,
+        summary="Open a pull request that deletes a KV store",
         description=(
             "Removes the store's whole directory, both access files with it, and runs the "
             "full chain. A repeat delete is a 404."

@@ -4,9 +4,10 @@ A FastAPI service that **writes a file to a Bitbucket repo and watches the build
 on it**, built on the internal **`tashtiot-apis-library`** and following the patterns in the
 reference `example-api`.
 
-A create request is not a direct write to Vault. It opens a pull request against the values
-repo, waits for CI to validate it, merges it, and waits for the deploy build that applies
-the change — then answers `Successful creation of <kv name>`.
+A create request is not a direct write to Vault, and not a merge either. It opens a pull
+request against the values repo, waits for CI to validate it, and answers with the pull
+request **open and waiting for review**. Who merges, and when, is a human decision this
+service deliberately does not make — so nothing it does ever reaches the base branch.
 
 **Bitbucket is the only upstream.** The CI gates are read from Bitbucket's own build-status
 store — the thing a pull request's **Builds** tab renders — rather than from the CI server's
@@ -96,23 +97,22 @@ POST /api/vault/v1/kv/
   ├─ 3. open pull request -> base branch
   ├─ 4. WAIT for the builds on the PR's commit           ── red ────> decline PR + delete branch -> 502
   │       (Bitbucket: fromRef.latestCommit)              ── times out ─> decline PR + delete branch -> 504
-  ├─ 5. merge the pull request                           ── fails ──> leave PR open              -> 502
-  ├─ 6. WAIT for the builds on the merge commit          ── red ────> report (already merged)    -> 502
-  │                                                      ── times out ─> report (already merged) -> 504
-  └─ 201 {"status":"Succeeded","message":"Successful creation of my-passwords", ...}
+  └─ 201 {"status":"Succeeded","message":"Opened pull request 42 to create my-passwords. ..."}
+
+         the pull request is OPEN and green. A human merges it.
 ```
 
-**The request blocks for the whole chain.** That is deliberate (the endpoint's contract is the
-final answer, not a job handle) — see `POST /pull-request` below for the non-blocking
-alternative — but it has two consequences:
+**The request blocks until CI answers.** That is deliberate — the endpoint's contract is "the
+change is proposed *and* green", not a job handle. See `POST /pull-request` below if even that
+is too long to wait. Two consequences:
 
-- any proxy/ingress in front of this service needs a read timeout larger than
-  `CI_PIPELINE_START_TIMEOUT_SECONDS + 2 × CI_PIPELINE_TIMEOUT_SECONDS`;
-- **step 5 is the point of no return.** Steps 1–4 are fully rolled back on failure. Once the PR
-  is merged, a failing deploy build is *reported*, not undone — un-merging needs a revert PR,
-  which is a human decision. The error message says so explicitly.
+- any proxy/ingress in front needs a read timeout larger than
+  `CI_PIPELINE_START_TIMEOUT_SECONDS + CI_PIPELINE_TIMEOUT_SECONDS` — one gate's worth;
+- **there is no point of no return.** Every failure is fully rolled back: a bad commit or a
+  failed PR deletes the branch, and a red or slow build declines the pull request *and*
+  deletes the branch. Nothing is ever half-applied, and nothing ever needs a revert.
 
-**What a gate actually reads.** `GET /rest/build-status/1.0/commits/{sha}`, polled until every
+**What the gate actually reads.** `GET /rest/build-status/1.0/commits/{sha}`, polled until every
 build on that commit has left `INPROGRESS`. That resource is deprecated but is the only one
 that *lists* a commit's builds: the repo-scoped 7.4+ replacement requires a `key` parameter and
 answers with one build, which cannot serve a gate that does not know the keys yet. `SUCCESSFUL`
@@ -230,7 +230,8 @@ service and you want `read` on yours; deploy a service and you want to see all o
 
 It is an **upsert**: create and replace are the same call, because the file's identity *is*
 the team, so there is nothing to collide with and a `409` would have nothing to describe. An
-upsert that changes nothing returns `200` with a null pull request.
+upsert that changes nothing returns `200` with a null pull request; one that changes
+something returns `201`.
 
 ### Other routes
 
@@ -260,11 +261,12 @@ a revoke does not need to know what the grant currently permits.
 ### `POST /pull-request` — the non-blocking half
 
 Every mutating route has a `/pull-request` twin that runs steps 1-3 and stops: branch, commit,
-pull request. It answers in one round-trip instead of blocking for two pipelines, and hands
-the merge to a human. Two consequences, both deliberate:
+pull request. **The difference is only the wait** — the main routes also open a pull request
+and leave it for a human; these just do not block on CI first. Use them when a round-trip
+matters more than knowing the build is green. Two consequences, both deliberate:
 
 - **The forge still runs CI.** The endpoint does not suppress the validation pipeline; it just
-  does not wait. The build fields are `null` because nothing was *observed*, not because
+  does not wait. `validation_builds` is `null` because nothing was *observed*, not because
   nothing ran.
 - **A repeat call opens a second pull request.** Every scan reads the base branch, and an
   unmerged PR is not there. Reviewers close the loser.
@@ -273,7 +275,8 @@ the merge to a human. Two consequences, both deliberate:
 
 ```jsonc
 // DELETE /api/vault/v1/kv/my-passwords
-// -> 200 {"status":"Succeeded","message":"Successful deletion of my-passwords", ...}
+// -> 201 {"status":"Succeeded","message":"Opened pull request 43 to delete my-passwords. ..."}
+//        the store is still there: the pull request that removes it is open for review.
 ```
 
 Same chain, same rollbacks, same point of no return. What is worth knowing:
@@ -284,7 +287,7 @@ Same chain, same rollbacks, same point of no return. What is worth knowing:
   deletes a path, so the service pushes a `git rm -r` commit over **git-over-HTTPS**, reusing
   `BITBUCKET_TOKEN` as a bearer header — no SSH key, no extra secret. It needs the `git`
   binary in the image; the Dockerfile checks for it at build time. Everything either side —
-  branch, pull request, both gates, merge, rollback — is unchanged.
+  branch, pull request, the gate, rollback — is unchanged.
 - **A repeat delete is `404`**, the same answer `GET` and `PATCH` give for a store that is not
   there. The *state* is idempotent; the status code tells you which call did the work.
 - **`DELETE .../pull-request` is the escape hatch**, answering `201` and leaving the removal

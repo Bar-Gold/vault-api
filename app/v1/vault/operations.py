@@ -14,25 +14,26 @@ A grant is one entry: a principal, a path and the capabilities it has there. Wha
 *means* in Vault — the mount, the policy, the HCL — is the deploy pipeline's business, and
 this service generates none of it.
 
-The create flow is a GitOps chain with two CI gates:
+The flow is a GitOps chain that stops at a green pull request:
 
     1. commit the access files to a short-lived branch
     2. open a pull request against the base branch
-    3. wait for the **validation** build on the pull request's commit — it blocks the merge
-    4. merge the pull request
-    5. wait for the **deploy** build on the merge commit — it applies the change to Vault
+    3. wait for the **validation** build on the pull request's commit
+    4. return — the pull request is open, green, and waiting for a human
 
-Both gates are read from **Bitbucket**, not from the CI server: the CI server posts its
-result against the commit it built, and Bitbucket keeps it — that store is what a pull
-request's Builds tab shows. So a gate is "ask Bitbucket about a sha we already hold", which
-is why there are no pipeline matchers and no pre-flight watermark here.
+**This service never merges.** It proposes a change and confirms CI is happy with it; who
+merges, and when, is a human decision it deliberately does not make. Nothing it does ever
+reaches the base branch.
 
-There is no transaction, so each step rolls back what the earlier steps did:
-committing fails -> delete the branch; the PR fails to open -> delete the branch; the
-validation build fails or times out -> decline the PR and delete the branch. **The merge is
-the point of no return**: once step 4 succeeds the change is on the base branch, so a
-failing deploy build is reported as-is rather than rolled back — un-merging would need a
-revert PR and a second human decision.
+The gate is read from **Bitbucket**, not from the CI server: the CI server posts its result
+against the commit it built, and Bitbucket keeps it — that store is what a pull request's
+Builds tab shows. So the gate is "ask Bitbucket about a sha we already hold", which is why
+there are no pipeline matchers and no pre-flight watermark here.
+
+**Every failure is fully rolled back**, and that is a consequence of not merging rather than
+an effort: committing fails -> delete the branch; the PR fails to open -> delete the branch;
+the validation build fails or times out -> decline the PR *and* delete the branch. There is
+no point of no return, nothing half-applied, and nothing that needs a revert.
 """
 
 import uuid
@@ -96,7 +97,6 @@ class VaultOperationError(Exception):
         status_code: int = 502,
         pull_request: Optional[PullRequest] = None,
         validation_builds: Optional[List[BuildStatus]] = None,
-        deploy_builds: Optional[List[BuildStatus]] = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -105,7 +105,6 @@ class VaultOperationError(Exception):
         self.status_code = status_code
         self.pull_request = pull_request
         self.validation_builds = validation_builds
-        self.deploy_builds = deploy_builds
 
     def to_response(self) -> "VaultOperationResponse":
         """The failed response body, so the route only has to pick the HTTP status.
@@ -121,7 +120,6 @@ class VaultOperationError(Exception):
             file=self.file,
             pull_request=_pull_request_info(self.pull_request),
             validation_builds=_build_infos(self.validation_builds),
-            deploy_builds=_build_infos(self.deploy_builds),
             error=self.message,
         )
 
@@ -405,9 +403,9 @@ async def _open_pull_request(
     Both rollbacks live here: a failed commit or a failed PR deletes the branch, so a
     failure leaves the repo exactly as it was found. Touches no CI and never merges.
 
-    Shared by `_commit_via_pull_request` (which goes on to gate and merge) and every
-    PR-only operation (which stops here). One implementation means they cannot drift apart
-    in what they roll back.
+    Shared by `_open_and_validate` (which goes on to wait for the validation build) and
+    every PR-only operation (which stops here). One implementation means they cannot drift
+    apart in what they roll back.
 
     **A change may touch several paths.** A store is two files, so a create commits twice on
     the same branch and the pull request carries both — Bitbucket's browse resource writes
@@ -453,7 +451,7 @@ async def _open_pull_request(
     return pull_request
 
 
-async def _commit_via_pull_request(
+async def _open_and_validate(
     bitbucket: Any,
     *,
     change: Change,
@@ -461,23 +459,31 @@ async def _commit_via_pull_request(
     summary: str,
     description: str,
     kv_name: str = "",
-) -> Tuple[PullRequest, List[BuildStatus], List[BuildStatus]]:
-    """branch -> commit -> PR -> gate 1 -> merge -> gate 2, with every rollback.
+) -> Tuple[PullRequest, List[BuildStatus]]:
+    """branch -> commit -> PR -> validation build, and **stop**.
 
     Shared by every mutating flow: the only thing that differs between them is the `Change`.
-    Keeping one implementation means the rollback asymmetry cannot drift between
-    operations. `kv_name` is carried only so a failure names its subject.
+    Keeping one implementation means the rollback shape cannot drift between operations.
+    `kv_name` is carried only so a failure names its subject.
 
-    Both gates ask Bitbucket which builds it holds for a commit. There is no watermark to
-    take before the branch is created: each gate names a commit that did not exist until
-    this request made it, so nothing older can be mistaken for ours.
+    **This service never merges.** It proposes a change and confirms CI is happy with it;
+    a human reviews and merges. That single decision removes the whole second half of the
+    old chain — no merge, no deploy gate, no merge-commit resolution, and no `exclude_keys`
+    watermark (that existed only because a fast-forward merge left gate 1's results sitting
+    on the commit gate 2 would have asked about).
 
-    Returns the merged pull request and both gates' builds. Raises `VaultOperationError`
-    for every business failure, having already rolled back whatever is still safe to roll
-    back.
+    **There is no longer a point of no return.** Every failure here is fully rolled back:
+    a bad commit or a failed PR deletes the branch, and a red or slow validation build
+    declines the pull request *and* deletes the branch. Nothing this service does can reach
+    the base branch, so nothing it does can need a revert.
+
+    The gate asks Bitbucket which builds it holds for a commit. There is no watermark to
+    take beforehand: the commit did not exist until this request made it, so nothing older
+    can be mistaken for ours.
+
+    Returns the open pull request and the validation builds. Raises `VaultOperationError`
+    for every business failure, having already rolled everything back.
     """
-    base_branch = config.VAULT_VALUES_REPO_BASE_BRANCH
-
     # ---- 1-2. branch + commit + pull request ------------------------------- #
     pull_request = await _open_pull_request(
         bitbucket,
@@ -488,10 +494,11 @@ async def _commit_via_pull_request(
         kv_name=kv_name,
     )
 
-    # ---- 3. validation build (blocks the merge) ---------------------------- #
+    # ---- 3. validation build ----------------------------------------------- #
     if not pull_request.from_commit:
-        # Without the source commit there is no sha to ask about, and merging unvalidated
-        # is not an option — roll all the way back rather than degrade the gate.
+        # Without the source commit there is no sha to ask about, and reporting an
+        # unvalidated pull request as validated is not the fallback — roll all the way
+        # back rather than degrade the gate.
         await _decline_and_cleanup(bitbucket, pull_request, branch)
         raise VaultOperationError(
             f"Bitbucket did not report a source commit for pull request "
@@ -521,67 +528,11 @@ async def _commit_via_pull_request(
             validation_builds=validation,
         )
 
-    # ---- 4. merge (point of no return) ------------------------------------- #
-    try:
-        current = await bitbucket.get_pull_request(pull_request.id)
-        merged = await bitbucket.merge_pull_request(current.id, current.version)
-    except ExternalServiceError as merge_error:
-        # The PR is valid but unmergeable (conflict, missing approvals, stale version).
-        # Leave it open — a human can resolve and merge it.
-        raise VaultOperationError(
-            f"Pull request {pull_request.id} passed validation but could not be merged: "
-            f"{merge_error.detail}",
-            kv_name=kv_name,
-            pull_request=pull_request,
-            validation_builds=validation,
-        ) from merge_error
-
-    logger.info(f"Merged pull request {merged.id} for {kv_name}")
-
-    # ---- 5. deploy build --------------------------------------------------- #
-    deploy_commit = merged.merge_commit or await bitbucket.get_branch_head(base_branch)
-    if not deploy_commit:
-        raise VaultOperationError(
-            f"Pull request {merged.id} merged, but Bitbucket reported no commit on "
-            f"{base_branch} to watch the deploy build on",
-            kv_name=kv_name,
-            pull_request=merged,
-            validation_builds=validation,
-        )
-
-    # A fast-forward merge leaves the base branch on the very commit the pull request
-    # built, so its validation results are already sitting there. Skipping the keys gate 1
-    # saw is what makes this wait for the deploy build instead of re-reading gate 1.
-    already_seen: frozenset = (
-        frozenset(build.key for build in validation)
-        if deploy_commit == pull_request.from_commit
-        else frozenset()
+    logger.info(
+        f"Pull request {pull_request.id} for {kv_name} passed validation and is open "
+        f"for review"
     )
-
-    try:
-        deploy = await bitbucket.await_builds(deploy_commit, exclude_keys=already_seen)
-    except BuildTimeoutError as timeout_error:
-        raise VaultOperationError(
-            f"Deploy build did not complete: {timeout_error.message}. "
-            f"The change is already merged to {base_branch}.",
-            kv_name=kv_name,
-            status_code=504,
-            pull_request=merged,
-            validation_builds=validation,
-            deploy_builds=timeout_error.builds,
-        ) from timeout_error
-
-    if not all(build.succeeded for build in deploy):
-        raise VaultOperationError(
-            f"{_build_failure('Deploy', deploy)}. "
-            f"The change is already merged to {base_branch} and needs a revert.",
-            kv_name=kv_name,
-            pull_request=merged,
-            validation_builds=validation,
-            deploy_builds=deploy,
-        )
-
-    return merged, validation, deploy
+    return pull_request, validation
 
 
 def _branch_for(team: str, kv_name: str, branch_suffix: Optional[str]) -> str:
@@ -664,10 +615,14 @@ async def create_kv_mount_operation(
     payload: VaultKVCreate,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
-    """Write the store's directory, then block until both pipelines have finished."""
+    """Open a validated pull request that creates the store's directory.
+
+    The store does not exist when this returns — the pull request does. It blocks for the
+    validation build so the caller knows CI is green before a reviewer looks at it.
+    """
     directory, change, entries = await _prepare_create(bitbucket, payload)
 
-    merged, validation, deploy = await _commit_via_pull_request(
+    pull_request, validation = await _open_and_validate(
         bitbucket,
         change=change,
         branch=_branch_for(payload.team, payload.kv_name, branch_suffix),
@@ -678,12 +633,14 @@ async def create_kv_mount_operation(
 
     return VaultOperationResponse(
         status=OperationStatus.SUCCEEDED,
-        message=f"Successful creation of {payload.kv_name}",
+        message=(
+            f"Opened pull request {pull_request.id} to create {payload.kv_name}. "
+            f"It passed validation and is waiting for review."
+        ),
         kv_name=payload.kv_name,
         file=directory,
-        pull_request=_pull_request_info(merged),
+        pull_request=_pull_request_info(pull_request),
         validation_builds=_build_infos(validation),
-        deploy_builds=_build_infos(deploy),
     )
 
 
@@ -779,13 +736,14 @@ async def update_kv_mount_operation(
     payload: VaultKVUpdate,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
-    """Replace a store's grant list, then block until both pipelines have finished.
+    """Open a validated pull request that replaces a store's grant list.
 
     The store is found by name — `_resolve_store` supplies the team, so the caller does not
     name one and an unknown store is the 404 before any edit is attempted.
 
     An edit that changes nothing returns success **without opening a pull request**, which
-    is what keeps repeat requests from filling the values repo with empty diffs.
+    is what keeps repeat requests from filling the values repo with empty diffs — and is
+    the only success path that answers 200 rather than 201.
     """
     store = await _resolve_store(bitbucket, kv_name)
     entries = [to_document_entry(entry) for entry in payload.access]
@@ -801,7 +759,7 @@ async def update_kv_mount_operation(
 
     change = await _apply_store_edit(bitbucket, store, entries)
 
-    merged, validation, deploy = await _commit_via_pull_request(
+    pull_request, validation = await _open_and_validate(
         bitbucket,
         change=change,
         branch=_branch_for(store.team, kv_name, branch_suffix),
@@ -812,12 +770,14 @@ async def update_kv_mount_operation(
 
     return VaultOperationResponse(
         status=OperationStatus.SUCCEEDED,
-        message=f"Successful update of {kv_name}",
+        message=(
+            f"Opened pull request {pull_request.id} to update {kv_name}. "
+            f"It passed validation and is waiting for review."
+        ),
         kv_name=kv_name,
         file=store.directory,
-        pull_request=_pull_request_info(merged),
+        pull_request=_pull_request_info(pull_request),
         validation_builds=_build_infos(validation),
-        deploy_builds=_build_infos(deploy),
     )
 
 
@@ -901,11 +861,11 @@ async def add_access_entry_operation(
     payload: Any,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
-    """Grant one principal access to a store, then block until both pipelines finish."""
+    """Open a validated pull request that grants one principal access to a store."""
     entry = to_document_entry(payload)
     store, change, _ = await _prepare_access_change(bitbucket, kv_name, entry, removing=False)
 
-    merged, validation, deploy = await _commit_via_pull_request(
+    pull_request, validation = await _open_and_validate(
         bitbucket,
         change=change,
         branch=_branch_for(store.team, kv_name, branch_suffix),
@@ -916,12 +876,15 @@ async def add_access_entry_operation(
 
     return VaultOperationResponse(
         status=OperationStatus.SUCCEEDED,
-        message=f"Successfully granted {_entry_text(entry)} on {kv_name}",
+        message=(
+            f"Opened pull request {pull_request.id} to grant "
+            f"{_entry_text(entry)} on {kv_name}. "
+            f"It passed validation and is waiting for review."
+        ),
         kv_name=kv_name,
         file=store.directory,
-        pull_request=_pull_request_info(merged),
+        pull_request=_pull_request_info(pull_request),
         validation_builds=_build_infos(validation),
-        deploy_builds=_build_infos(deploy),
     )
 
 
@@ -962,10 +925,10 @@ async def remove_access_entry_operation(
     entry: Dict[str, Any],
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
-    """Revoke one grant, then block until both pipelines have finished."""
+    """Open a validated pull request that revokes one grant."""
     store, change, _ = await _prepare_access_change(bitbucket, kv_name, entry, removing=True)
 
-    merged, validation, deploy = await _commit_via_pull_request(
+    pull_request, validation = await _open_and_validate(
         bitbucket,
         change=change,
         branch=_branch_for(store.team, kv_name, branch_suffix),
@@ -976,12 +939,15 @@ async def remove_access_entry_operation(
 
     return VaultOperationResponse(
         status=OperationStatus.SUCCEEDED,
-        message=f"Successfully revoked {_entry_text(entry)} on {kv_name}",
+        message=(
+            f"Opened pull request {pull_request.id} to revoke "
+            f"{_entry_text(entry)} on {kv_name}. "
+            f"It passed validation and is waiting for review."
+        ),
         kv_name=kv_name,
         file=store.directory,
-        pull_request=_pull_request_info(merged),
+        pull_request=_pull_request_info(pull_request),
         validation_builds=_build_infos(validation),
-        deploy_builds=_build_infos(deploy),
     )
 
 
@@ -1036,16 +1002,16 @@ async def delete_kv_store_operation(
     kv_name: str,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
-    """Delete the store's directory, then block until both pipelines have finished.
+    """Open a validated pull request that deletes the store's directory.
 
-    The chain and every rollback come from `_commit_via_pull_request` unchanged, so the
-    merge is the point of no return here too. Only the commit differs: Bitbucket Server has
-    no REST endpoint that deletes a path, so that call is git (`app/clients/git.py`), and it
-    removes the directory recursively.
+    The store is *not* deleted when this returns: the pull request is open and green, and a
+    human merges it. Only the commit differs from any other change here — Bitbucket Server
+    has no REST endpoint that deletes a path, so that call is git
+    (`app/clients/git.py`), and it removes the directory recursively.
     """
     store = await _prepare_delete(bitbucket, kv_name)
 
-    merged, validation, deploy = await _commit_via_pull_request(
+    pull_request, validation = await _open_and_validate(
         bitbucket,
         change=Change(writes=[], removes=[store.directory]),
         branch=_branch_for(store.team, kv_name, branch_suffix),
@@ -1056,12 +1022,14 @@ async def delete_kv_store_operation(
 
     return VaultOperationResponse(
         status=OperationStatus.SUCCEEDED,
-        message=f"Successful deletion of {kv_name}",
+        message=(
+            f"Opened pull request {pull_request.id} to delete {kv_name}. "
+            f"It passed validation and is waiting for review."
+        ),
         kv_name=kv_name,
         file=store.directory,
-        pull_request=_pull_request_info(merged),
+        pull_request=_pull_request_info(pull_request),
         validation_builds=_build_infos(validation),
-        deploy_builds=_build_infos(deploy),
     )
 
 
@@ -1133,11 +1101,12 @@ async def upsert_tashtiot_access_operation(
     payload: TashtiotAccessUpsert,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
-    """Create or replace one team's grants into the shared services store.
+    """Open a validated pull request that sets one team's shared-services grants.
 
     Create and replace are the same call because the file's identity is the team: there is
     no name to collide with and nothing to be a duplicate of, so a 409 would have nothing
-    to describe. An upsert that changes nothing short-circuits like an update does.
+    to describe. An upsert that changes nothing short-circuits like an update does, and
+    answers 200.
     """
     path = _tashtiot_path(team)
     entries = [to_document_entry(entry) for entry in payload.access]
@@ -1172,7 +1141,7 @@ async def upsert_tashtiot_access_operation(
     )
 
     verb = "updated" if current is not None else "created"
-    merged, validation, deploy = await _commit_via_pull_request(
+    pull_request, validation = await _open_and_validate(
         bitbucket,
         change=change,
         branch=_branch_for(config.TASHTIOT_DIR.lower(), team, branch_suffix),
@@ -1183,12 +1152,15 @@ async def upsert_tashtiot_access_operation(
 
     return VaultOperationResponse(
         status=OperationStatus.SUCCEEDED,
-        message=f"Successfully {verb} {config.TASHTIOT_DIR} access for {team}",
+        message=(
+            f"Opened pull request {pull_request.id} to {verb} "
+            f"{config.TASHTIOT_DIR} access for {team}. "
+            f"It passed validation and is waiting for review."
+        ),
         kv_name=team,
         file=path,
-        pull_request=_pull_request_info(merged),
+        pull_request=_pull_request_info(pull_request),
         validation_builds=_build_infos(validation),
-        deploy_builds=_build_infos(deploy),
     )
 
 
@@ -1197,10 +1169,10 @@ async def delete_tashtiot_access_operation(
     team: str,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
-    """Remove one team's Tashtiot file entirely."""
+    """Open a validated pull request that removes one team's Tashtiot file."""
     path, document = await _require_tashtiot(bitbucket, team)
 
-    merged, validation, deploy = await _commit_via_pull_request(
+    pull_request, validation = await _open_and_validate(
         bitbucket,
         change=Change(writes=[], removes=[path]),
         branch=_branch_for(config.TASHTIOT_DIR.lower(), team, branch_suffix),
@@ -1213,12 +1185,15 @@ async def delete_tashtiot_access_operation(
 
     return VaultOperationResponse(
         status=OperationStatus.SUCCEEDED,
-        message=f"Successful deletion of {config.TASHTIOT_DIR} access for {team}",
+        message=(
+            f"Opened pull request {pull_request.id} to delete "
+            f"{config.TASHTIOT_DIR} access for {team}. "
+            f"It passed validation and is waiting for review."
+        ),
         kv_name=team,
         file=path,
-        pull_request=_pull_request_info(merged),
+        pull_request=_pull_request_info(pull_request),
         validation_builds=_build_infos(validation),
-        deploy_builds=_build_infos(deploy),
     )
 
 
