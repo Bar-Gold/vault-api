@@ -57,9 +57,7 @@ from ...helpers import (
     k8s_service_account_identity,
     k8s_service_accounts,
     kv_store_names,
-    read_kv_stores,
     remove_k8s_service_account,
-    remove_kv_store,
     render_values_yaml,
     update_kv_store,
     values_file_path,
@@ -762,9 +760,7 @@ async def update_kv_mount_operation(
 # --------------------------------------------------------------------------- #
 # removing a store
 # --------------------------------------------------------------------------- #
-async def _prepare_delete(
-    bitbucket: Any, kv_name: str
-) -> Tuple[str, str, Optional[str], Optional[str]]:
+async def _prepare_delete(bitbucket: Any, kv_name: str) -> Tuple[str, str]:
     """Everything a delete needs before it touches a branch, the file included.
 
     The counterpart of `_prepare_create`, and shared by both delete paths for the same
@@ -772,55 +768,25 @@ async def _prepare_delete(
     a store in no file cannot be deleted, and the caller never named a file to be wrong
     about.
 
-    It still runs **no referential scan**: a store's Kubernetes service accounts are
-    nested inside it, so removing the store removes its bindings in the same diff and no
-    reference is left dangling. There is no `yaml_data_equals` short circuit either — if
-    `remove_kv_store` did not raise, the document changed. A removal is never a no-op.
+    **A delete removes the file, always.** One file holds one store, so there is no
+    document to render, nothing to diff, and no `source_commit_id` to fetch: git resolves
+    the path from the branch it fetched, and Bitbucket's optimistic-lock token has no part
+    in a removal. That is why this returns only the two coordinates a commit needs, and why
+    it is the shortest prepare of the four.
 
-    **Returns `content=None` when the file is to be deleted outright**, which is the normal
-    case: a store names its own file and is the only thing in it, so emptying the file to
-    `kvStores: []` would leave a dead file behind for every store ever deleted.
-
-    A file that still holds *other* stores after this one is removed is edited instead, and
-    survives. That only happens for a file an older revision of this service grouped
-    several stores into — a create cannot produce one any more. It is two lines and it is
-    the difference between deleting a store and deleting somebody else's alongside it.
+    It runs **no referential scan** either: a store's Kubernetes service accounts are
+    nested inside it, so the file takes them with it and nothing is left dangling.
     """
-    file, path, current, _ = await _resolve_store(bitbucket, kv_name)
-    updated = remove_kv_store(current, kv_name)
-
-    if not read_kv_stores(updated):
-        # Nothing left to keep the file alive. No `source_commit_id`: git resolves the
-        # path from the branch it fetched, so Bitbucket's optimistic-lock token has no
-        # part in a removal.
-        return file, path, None, None
-
-    logger.info(
-        f"{path} still holds {len(read_kv_stores(updated))} store(s) after removing "
-        f"{kv_name}; editing the file rather than deleting it"
-    )
-
-    # The file exists by definition here, so the write is an edit and Bitbucket wants the
-    # optimistic-lock token for that path.
-    source_commit_id = await bitbucket.get_last_commit(
-        path, at=config.VAULT_VALUES_REPO_BASE_BRANCH
-    )
-
-    return file, path, render_values_yaml(updated), source_commit_id
+    file, path, _, _ = await _resolve_store(bitbucket, kv_name)
+    return file, path
 
 
-def _delete_description(path: str, kv_name: str, removed_file: bool) -> str:
-    """The reviewer needs to see which of the two diffs this is before opening it."""
-    change = (
-        "file deleted"
-        if removed_file
-        else "removed from kvStores (file kept — it still holds other stores)"
-    )
+def _delete_description(path: str, kv_name: str) -> str:
     return (
         f"Automated by vault-api.\n\n"
         f"- file: {path}\n"
         f"- store: {kv_name}\n"
-        f"- change: {change}\n"
+        f"- change: file deleted\n"
     )
 
 
@@ -829,31 +795,29 @@ async def delete_kv_store_operation(
     kv_name: str,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
-    """Remove one store from its file, then block until both pipelines have finished.
+    """Delete the store's file, then block until both pipelines have finished.
 
     **A file removal, not a content edit.** A store names its own file and is the only
     thing in it, so deleting the store deletes the file — leaving `kvStores: []` behind
-    would accumulate a dead file per store ever deleted. The exception is a file an older
-    revision grouped several stores into: that one is edited so its other stores survive.
+    would accumulate a dead file per store ever deleted, in a shape no create would ever
+    produce.
 
     The chain and every rollback come from `_commit_via_pull_request` unchanged, so the
     merge is the point of no return here too — a deploy pipeline that fails after a delete
     is reported, and the message says the removal already needs a revert. Only the commit
-    step differs, and only when the whole file goes: Bitbucket Server has no REST endpoint
-    that deletes a file, so that one call is git (`app/clients/git.py`).
+    step differs: Bitbucket Server has no REST endpoint that deletes a file, so that one
+    call is git (`app/clients/git.py`).
     """
-    file, path, content, source_commit_id = await _prepare_delete(bitbucket, kv_name)
+    file, path = await _prepare_delete(bitbucket, kv_name)
 
     merged, validation, deploy = await _commit_via_pull_request(
         bitbucket,
         path=path,
-        content=content,
-        remove=content is None,
+        remove=True,
         branch=_branch_for(file, kv_name, branch_suffix),
         summary=f"Delete KV store {kv_name} from {file}",
-        description=_delete_description(path, kv_name, removed_file=content is None),
+        description=_delete_description(path, kv_name),
         kv_name=kv_name,
-        source_commit_id=source_commit_id,
     )
 
     return VaultOperationResponse(
@@ -882,18 +846,16 @@ async def delete_kv_store_pull_request_operation(
     call opens a second pull request for the same removal, for the same reason a repeat
     PR-only create does.
     """
-    file, path, content, source_commit_id = await _prepare_delete(bitbucket, kv_name)
+    file, path = await _prepare_delete(bitbucket, kv_name)
 
     pull_request = await _open_pull_request(
         bitbucket,
         path=path,
-        content=content,
-        remove=content is None,
+        remove=True,
         branch=_branch_for(file, kv_name, branch_suffix),
         summary=f"Delete KV store {kv_name} from {file}",
-        description=_delete_description(path, kv_name, removed_file=content is None),
+        description=_delete_description(path, kv_name),
         kv_name=kv_name,
-        source_commit_id=source_commit_id,
     )
 
     return VaultOperationResponse(

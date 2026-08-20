@@ -67,11 +67,10 @@ removes that file. The document is still a *list* under `kvStores` — the forma
 changed and the helpers still append, edit and remove entries — but nothing this service
 does can put a second store in a file any more.
 
-Files an older revision grouped are still handled everywhere, and the handling is worth
-knowing because it is the only place two behaviours diverge: a delete that would leave other
-stores behind **edits the file instead of removing it**. A store is never deleted along with
-somebody else's. A key this service does not recognise survives every transform either —
-pinned by the `SIBLING_KEY` tests in `tests/test_helpers.py`.
+Files an older revision grouped several stores into are still *readable* — `_resolve_store`
+walks the directory to find one — but a delete removes whichever file holds the store, whole.
+A key this service does not recognise survives every transform — pinned by the `SIBLING_KEY`
+tests in `tests/test_helpers.py`.
 
 Mounts, KV engine versions, policies, HCL — none of it is modelled here. That is the deploy
 pipeline's business. A binding names a workload and nothing else; **it carries no
@@ -96,7 +95,7 @@ uv-managed (Python 3.12). Package indexes come from `uv.toml` (internal Artifact
 ```bash
 uv sync --group dev                 # install deps into .venv — ON-PREM ONLY, see below
 uv run --no-sync python -m app.main # serves on 0.0.0.0:5000 (--host/--port override)
-uv run --no-sync pytest             # everything under tests/ (508 tests, ~20s)
+uv run --no-sync pytest             # everything under tests/ (506 tests, ~19s)
 uv run --no-sync pytest tests/v1/vault                                        # one suite
 uv run --no-sync pytest tests/v1/vault/test_operations.py::test_happy_path_call_order  # one test
 docker build -t vault-api . && docker run -p 5000:5000 --env-file .env vault-api
@@ -449,6 +448,10 @@ into a 404. `remove_kv_store` leaves `kvStores: []` behind rather than dropping 
 an empty file. `build_kv_stores_document` is a *constructor* for a fresh file, not a
 transform; nothing that starts from a parsed document should call it.
 
+**`remove_kv_store` has no production caller any more** — a delete removes the file rather
+than editing the store out of it. It is still exported and still tested; if nothing grows a
+use for it, it is a deletion candidate.
+
 `read_kv_stores` tolerates `kvStores:` with nothing under it (parses to `None`) — an empty
 file, not a corrupt one. `kv_store_names` skips malformed entries so a hand-edited file
 cannot break the duplicate scan.
@@ -530,11 +533,11 @@ behind would accumulate one dead file per store ever deleted, in a shape no crea
 writes. `_prepare_delete` signals this by returning `content=None`, and
 `_open_pull_request` turns that into `remove=True`.
 
-**The exception, and the only branch in the whole delete path:** if removing the store would
-leave *other* stores in the file, the file is edited and survives — with a
-`source_commit_id`, since that is an ordinary `put_file`. Only a file an older revision
-grouped can hit this, and it is the difference between deleting one store and deleting
-somebody else's alongside it.
+**There is no branch and no exception**: a delete always removes the file. One file holds
+one store, so `_prepare_delete` renders no document, diffs nothing and fetches no
+`source_commit_id` — it resolves the store and returns two coordinates. A file an older
+revision grouped several stores into resolves the same way and is removed the same way; the
+walk in `_resolve_store` only answers *which* file, never *whether* to keep it.
 
 `remove=True` is a separate flag rather than `content=None` meaning "delete", because a
 `None` arriving by accident would then silently remove a file instead of raising.
@@ -711,7 +714,7 @@ Two details that are easy to break:
 - The committed entries are the contract with the deploy pipeline — change `build_kv_store` /
   `build_k8s_service_account` and the pipeline together. Both are the *sole* writers of their
   own key names.
-- Tests: 508 of them. `tests/test_helpers.py` (pure, no library import), `tests/clients/` (the
+- Tests: 506 of them. `tests/test_helpers.py` (pure, no library import), `tests/clients/` (the
   Bitbucket client — repo operations *and* build statuses — plus `http.py`'s error mapping,
   against the real REST shapes via respx),
   `tests/clients/test_git.py` (real git against a real bare repo — no mocks),
@@ -749,7 +752,7 @@ Two details that are easy to break:
     `bitbucket.awaited_commits` and
     `bitbucket.excluded_keys` record what each gate was opened on — that is what pins gate 1
     to the PR's commit and gate 2 to the merge commit.
-- **Delete removes the file**, and it ships in two variants
+- **Delete removes the file, unconditionally**, and it ships in two variants
   (`delete_kv_store_operation`, `delete_kv_store_pull_request_operation`) that reuse
   `_commit_via_pull_request` / `_open_pull_request` — now with `remove=True`, which swaps the
   `put_file` for a `delete_file`. A repeat delete is a 404, which is how `GET`/`PATCH`

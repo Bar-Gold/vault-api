@@ -4,7 +4,6 @@ A delete is a *content edit* — the entry goes, the file stays — so it takes 
 and the same rollbacks as a create. Most of these assert on what is still there afterwards.
 """
 import pytest
-import yaml
 from tashtiot_apis_library.connectors import ExternalServiceError
 
 from app.helpers import (
@@ -39,10 +38,6 @@ def _seed(bitbucket, *names, path=VALUES_PATH):
             [build_kv_store(n, "payments secrets", ROLES) for n in names]
         )
     )
-
-
-def _committed(bitbucket):
-    return yaml.safe_load(bitbucket.committed[VALUES_PATH])
 
 
 async def _delete(bitbucket, kv_name=KV):
@@ -81,23 +76,6 @@ async def test_delete_reports_the_merge_and_both_pipelines(bitbucket):
     assert [b.state for b in result.deploy_builds] == ["SUCCESSFUL"]
 
 
-async def test_delete_removes_only_the_named_store(bitbucket):
-    """A grouped file is edited, never deleted — its other stores are not ours to remove.
-
-    Only an older revision of this service could have produced a file like this, but one
-    that exists must not lose two stores because somebody deleted one.
-    """
-    _seed(bitbucket, "sibling", KV, "another", path=GROUPED_PATH)
-
-    await _delete(bitbucket)
-
-    assert bitbucket.deleted == []
-    assert [s["name"] for s in yaml.safe_load(bitbucket.committed[GROUPED_PATH])["kvStores"]] == [
-        "sibling",
-        "another",
-    ]
-
-
 async def test_deleting_the_only_store_deletes_the_file(bitbucket):
     """A store names its own file, so removing it removes the file.
 
@@ -124,16 +102,6 @@ async def test_a_file_removal_needs_no_optimistic_lock_token(bitbucket):
 
     assert bitbucket.source_commit_ids == []
     assert "get_last_commit" not in bitbucket.calls
-
-
-async def test_editing_a_grouped_file_still_sends_the_token(bitbucket):
-    """The other branch: the file survives, so the write is an ordinary edit."""
-    _seed(bitbucket, "sibling", KV, path=GROUPED_PATH)
-
-    await _delete(bitbucket)
-
-    assert bitbucket.source_commit_ids == ["file-commit-sha"]
-    assert bitbucket.calls.index("get_last_commit") < bitbucket.calls.index("put_file")
 
 
 async def test_delete_call_order(bitbucket):
@@ -250,31 +218,30 @@ async def test_deleting_a_bound_store_removes_its_bindings(bitbucket):
     assert bitbucket.committed == {}
 
 
-async def test_deleting_one_store_leaves_a_siblings_bindings_alone(bitbucket):
-    _seed_bound(bitbucket, KV, "billing")
+async def test_a_sibling_stores_file_is_untouched(bitbucket):
+    """A store bound to the same service account, in its own file, is unaffected."""
+    _seed_bound(bitbucket, KV)
+    _seed_bound(bitbucket, "billing", path="kv/billing.yaml")
 
     await _delete(bitbucket)
 
-    remaining = _committed(bitbucket)["kvStores"]
-    assert [s["name"] for s in remaining] == ["billing"]
-    assert remaining[0]["roles"]["k8sServiceAccounts"] == [ACCOUNT]
+    assert bitbucket.deleted == [VALUES_PATH]
+    assert "kv/billing.yaml" in bitbucket.existing_files
 
 
-async def test_delete_of_a_grouped_store_walks_to_find_its_file(bitbucket):
-    """The caller names no file, so a store grouped under another name costs the walk.
+async def test_a_store_in_a_differently_named_file_still_resolves(bitbucket):
+    """A create names the file after the store, so this only happens to legacy files.
 
-    The walk is *resolution*, not a referential scan — there is still nothing pointing at
-    this store to check, and only its own file is committed.
+    The walk is *resolution* — finding which file holds the store — not a referential
+    scan. Whatever file it lands on is the file that gets deleted.
     """
-    _seed_bound(bitbucket, "sibling", KV, path=GROUPED_PATH)
+    _seed_bound(bitbucket, KV, path=GROUPED_PATH)
     _seed_bound(bitbucket, "elsewhere", path="kv/platform.yaml")
 
     await _delete(bitbucket)
 
     assert "list_files" in bitbucket.calls
-    # The file survives: it still holds `sibling`, so this is an edit, not a removal.
-    assert list(bitbucket.committed) == [GROUPED_PATH]
-    assert bitbucket.deleted == []
+    assert bitbucket.deleted == [GROUPED_PATH]
 
 
 async def test_a_store_in_its_own_file_costs_one_read_and_no_walk(bitbucket):
@@ -291,14 +258,14 @@ async def test_a_store_in_its_own_file_costs_one_read_and_no_walk(bitbucket):
 
 async def test_pull_request_only_delete_resolves_the_same_way(bitbucket):
     """Both delete paths share `_prepare_delete`, so they cannot resolve differently."""
-    _seed_bound(bitbucket, "sibling", KV, path=GROUPED_PATH)
+    _seed_bound(bitbucket, KV, path=GROUPED_PATH)
     _seed_bound(bitbucket, "elsewhere", path="kv/platform.yaml")
 
     result = await _delete_pr_only(bitbucket)
 
     assert result.status.value == "Succeeded"
     assert result.file == GROUPED_FILE
-    assert list(bitbucket.committed) == [GROUPED_PATH]
+    assert bitbucket.deleted == [GROUPED_PATH]
 
 
 async def test_a_binding_on_another_store_never_blocks(bitbucket):
@@ -432,16 +399,16 @@ async def test_pull_request_only_reports_no_pipelines(bitbucket):
     assert result.deploy_builds is None
 
 
-async def test_pull_request_only_commits_the_same_document(bitbucket):
+async def test_pull_request_only_removes_the_same_path(bitbucket):
     """The branch content must not depend on which endpoint asked for it."""
-    _seed(bitbucket, "sibling", KV)
+    _seed(bitbucket, KV)
     await _delete_pr_only(bitbucket)
-    pr_only = bitbucket.committed[VALUES_PATH]
+    pr_only = list(bitbucket.deleted)
 
-    bitbucket.committed.clear()
+    bitbucket.deleted.clear()
     await _delete(bitbucket)
 
-    assert bitbucket.committed[VALUES_PATH] == pr_only
+    assert bitbucket.deleted == pr_only == [VALUES_PATH]
 
 
 async def test_pull_request_only_shares_the_404s(bitbucket):

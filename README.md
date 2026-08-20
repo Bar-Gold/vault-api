@@ -146,9 +146,9 @@ survive every write.
 slashes, so a request can never escape the values directory. It is single-segment because it
 is also the address every other route uses.
 
-> Earlier versions took an optional `file`, so files holding several stores exist in the
-> wild. They are still readable, editable and deletable — and a delete that would strand
-> another team's store edits the file instead of removing it.
+> Earlier versions took an optional `file`, so files holding several stores may exist. They
+> are still readable, editable and deletable — but a delete removes the whole file, so a
+> grouped file loses every store in it.
 
 ### The committed file (`kv/athena-passwords.yaml`)
 
@@ -293,8 +293,9 @@ worth knowing:
   `BITBUCKET_TOKEN` as a bearer header — no SSH key, no extra secret. It needs the `git`
   binary in the image; the Dockerfile checks for it at build time. Everything either side —
   branch, pull request, both gates, merge, rollback — is unchanged.
-- **A file holding several stores is edited, not deleted.** Only an older revision could have
-  produced one, but a store there must not take its neighbours with it.
+- **A store in a file named after something else is found and its file deleted too.** Only
+  an older revision could have produced one; resolution answers *which* file, not whether to
+  keep it.
 - **A repeat delete is `404`**, the same answer `GET` and `PATCH` already give for a store
   that is not there. The *state* is idempotent; the status code tells you which call did the
   work. A client whose connection dropped mid-delete cannot tell "already gone" from "never

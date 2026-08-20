@@ -3,7 +3,6 @@
 Two shapes live on the same prefix here — `/{kv_name}` and `/{kv_name}/pull-request` — so
 the routing tests matter as much as the status codes.
 """
-import yaml
 
 from app.helpers import (
     build_k8s_service_account,
@@ -32,10 +31,6 @@ def _seed(bitbucket, *names):
     )
 
 
-def _committed(bitbucket):
-    return yaml.safe_load(bitbucket.committed[VALUES_PATH])
-
-
 # --------------------------------------------------------------------------- #
 # auth — the middleware is global, so every route must be covered
 # --------------------------------------------------------------------------- #
@@ -51,7 +46,7 @@ def test_delete_pull_request_only_requires_a_token(client):
 # delete
 # --------------------------------------------------------------------------- #
 def test_delete_returns_200_and_the_success_message(client, auth_headers, bitbucket):
-    _seed(bitbucket, "sibling", KV)
+    _seed(bitbucket, KV)
 
     response = client.delete(STORE_URL, headers=auth_headers)
 
@@ -62,7 +57,7 @@ def test_delete_returns_200_and_the_success_message(client, auth_headers, bitbuc
     assert body["kv_name"] == KV
     assert body["file"] == FILE
     assert body["pull_request"]["state"] == "MERGED"
-    assert [s["name"] for s in _committed(bitbucket)["kvStores"]] == ["sibling"]
+    assert bitbucket.deleted == [VALUES_PATH]
 
 
 def test_deleting_the_only_store_deletes_the_file(client, auth_headers, bitbucket):
