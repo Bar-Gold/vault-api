@@ -67,11 +67,23 @@ def test_slugify_flattens_slashes(value, expected):
     assert slugify_mount_path(value) == expected
 
 
-def test_branch_name_carries_both_coordinates():
-    """A reviewer should see which file and which store a PR touches."""
+def test_branch_name_carries_both_coordinates_when_they_differ():
+    """A reviewer should see which file and which store a PR touches.
+
+    Only reachable for a store an older revision of this service grouped into a file named
+    after something else — a create names the file after the store now.
+    """
     assert (
         build_branch_name("payments", "myapp", "ab12cd34", "vault-kv")
         == "vault-kv/payments-myapp-ab12cd34"
+    )
+
+
+def test_branch_name_names_the_store_once_when_the_file_matches():
+    """The normal case: carrying both would render `vault-kv/myapp-myapp-ab12cd34`."""
+    assert (
+        build_branch_name("myapp", "myapp", "ab12cd34", "vault-kv")
+        == "vault-kv/myapp-ab12cd34"
     )
 
 

@@ -21,9 +21,9 @@ from app.v1.vault.schemas import OperationStatus
 from tests.fakes import FakeBitbucket, failing, passing
 
 KV = "myapp"
-FILE = "payments"
-VALUES_PATH = "kv/payments.yaml"
-BRANCH = "vault-kv/payments-myapp-abc123"
+FILE = KV  # a store names its own file now
+VALUES_PATH = f"kv/{KV}.yaml"
+BRANCH = f"vault-kv/{KV}-abc123"
 ROLES = {"read": ["app01.corp.example.com"]}
 # What FakeBitbucket reports as the head of the branch put_file committed to.
 PR_COMMIT = f"sha-{BRANCH}"

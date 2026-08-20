@@ -65,13 +65,13 @@ def test_delete_returns_200_and_the_success_message(client, auth_headers, bitbuc
     assert [s["name"] for s in _committed(bitbucket)["kvStores"]] == ["sibling"]
 
 
-def test_deleting_the_last_store_leaves_the_file_with_an_empty_list(
-    client, auth_headers, bitbucket
-):
+def test_deleting_the_only_store_deletes_the_file(client, auth_headers, bitbucket):
+    """End to end: a 200 and the path gone, not rewritten to an empty list."""
     _seed(bitbucket, KV)
 
     assert client.delete(STORE_URL, headers=auth_headers).status_code == 200
-    assert _committed(bitbucket) == {"kvStores": []}
+    assert bitbucket.deleted == [VALUES_PATH]
+    assert bitbucket.committed == {}
 
 
 def test_delete_of_a_store_in_no_file_returns_404(client, auth_headers):
@@ -101,7 +101,7 @@ def test_deleting_a_bound_store_succeeds(client, auth_headers, bitbucket):
     response = client.delete(STORE_URL, headers=auth_headers)
 
     assert response.status_code == 200
-    assert _committed(bitbucket) == {"kvStores": []}
+    assert bitbucket.deleted == [VALUES_PATH]
 
 
 def test_delete_failed_validation_returns_502(client, auth_headers, bitbucket):

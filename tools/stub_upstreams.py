@@ -28,6 +28,21 @@ so the service should answer 504). `polls` is how many reads a build stays INPRO
 before settling. `workflows` is how many build statuses a pipeline posts against one
 commit, which is what makes the "wait for the slowest one" path reachable.
 
+**One thing this stub cannot do: a whole-file delete.** Removing a store now removes its
+file, and Bitbucket Server has no REST endpoint for that — the service pushes a deleting
+commit over git instead (`app/clients/git.py`). Faking that would mean speaking git's smart
+HTTP protocol and backing this stub with a real repository, rather than the in-memory dicts
+below. So a `DELETE` of a store that is alone in its file will fail here with a git error
+surfaced as a 502, and that is expected. Two ways round it while developing:
+
+  * exercise the *grouped* branch, which is still an ordinary `put_file` edit: create two
+    stores into one file (only reachable through an older revision, or by seeding
+    `state.files` directly) and delete one of them;
+  * or point `BITBUCKET_URL` at a real Bitbucket for the delete path specifically.
+
+Everything else — create, update, both PR-only variants and both service-account
+operations — runs against this stub unchanged.
+
 Deliberately faithful in three places, because they are the easy things to break:
   * a pull request's `version` is bumped every time a build status changes, so merging
     with the version handed back by create -> 409, exactly like the real optimistic lock;
@@ -185,6 +200,30 @@ app = FastAPI(title="Bitbucket stub")
 async def set_control(payload: Dict[str, Any]) -> Dict[str, Any]:
     state.control.update(payload)
     return state.control
+
+
+@app.api_route("/scm/{rest:path}", methods=["GET", "POST"])
+async def git_smart_http(rest: str) -> JSONResponse:
+    """Not implemented — but say so in words, rather than letting git guess.
+
+    A whole-file delete clones over git, and this stub speaks JSON, not git's smart HTTP
+    protocol. Without this route git reports "repository not found" against a URL that
+    looks perfectly plausible, and the developer goes looking for a config mistake. See
+    the module docstring for the two ways to exercise a delete locally.
+    """
+    return JSONResponse(
+        status_code=501,
+        content={
+            "errors": [
+                {
+                    "message": (
+                        "stub_upstreams.py does not serve git. A delete that removes a "
+                        "whole file needs a real Bitbucket; see this module's docstring."
+                    )
+                }
+            ]
+        },
+    )
 
 
 @app.post("/__reset")

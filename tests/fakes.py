@@ -54,6 +54,8 @@ class FakeBitbucket:
         self.merge_commit = merge_commit
         self.pull_requests: Dict[int, PullRequest] = {}
         self.committed: Dict[str, str] = {}
+        # Paths removed outright, in order. See `delete_file`.
+        self.deleted: List[str] = []
         self.commit_messages: List[str] = []
         # What put_file received as sourceCommitId, so the edit flow's optimistic-lock
         # handling can be asserted on.
@@ -128,6 +130,23 @@ class FakeBitbucket:
         self.commit_messages.append(message)
         self.source_commit_ids.append(source_commit_id)
         return {"id": "commit-sha"}
+
+    async def delete_file(
+        self, path: str, branch: str, base_branch: str, message: str, **kwargs
+    ) -> str:
+        """The git-backed removal, faked at the same seam as `put_file`.
+
+        Records into `deleted` rather than `committed`, so a test can tell "the file was
+        removed" from "the file was rewritten without that store" — the two produce very
+        different diffs and only one of them leaves the path behind.
+        """
+        self._record("delete_file")
+        self.deleted.append(path)
+        self.commit_messages.append(message)
+        # `existing_files` is the *base branch*, and this commit lands on a topic branch —
+        # only a merge would remove it there. A test that wants the merged state says so,
+        # exactly as it does for `committed`.
+        return f"sha-deleted-{path}"
 
     async def create_pull_request(
         self, title: str, description: str, from_branch: str, to_branch: str, reviewers=None

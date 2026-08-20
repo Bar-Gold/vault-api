@@ -135,27 +135,26 @@ POST /api/vault/v1/kv/
 }
 ```
 
-**Three fields. `file` is optional and you normally leave it out** — it defaults to the
-store's own name, so this request lands in `kv/athena-passwords.yaml`. Send it only to group
-several stores into one file:
+**Three fields, and none of them names a file.** The store names its own:
+`kv/athena-passwords.yaml`. There is nothing to choose and no way to group two stores into
+one file — sending a `file` key is a `422`, not a silent drop.
 
-```jsonc
-{"file": "athena", "kv_name": "athena-certs", ...}   // -> appended to kv/athena.yaml
-```
+**The file is created if it does not exist**, and keys this service does not recognise
+survive every write.
 
-Either way **the file is created if it does not exist, and if it does, the store is appended
-to its `kvStores` list — nothing already in the file is overwritten**, including keys this
-service does not recognise.
+`kv_name` is the only field that reaches a filesystem path, and its pattern blocks `..` and
+slashes, so a request can never escape the values directory. It is single-segment because it
+is also the address every other route uses.
 
-This is the *only* request that mentions a file at all. `file` is the only field that
-reaches a filesystem path, and its pattern blocks `..` and slashes, so a request can never
-escape the values directory. `kv_name` is single-segment because it *is* the address every
-other route uses.
+> Earlier versions took an optional `file`, so files holding several stores exist in the
+> wild. They are still readable, editable and deletable — and a delete that would strand
+> another team's store edits the file instead of removing it.
 
-### The committed file (`kv/payments.yaml`)
+### The committed file (`kv/athena-passwords.yaml`)
 
-**One file holds many stores, and each store holds its own service account bindings.** A
-create appends to `kvStores`, creating the file only if this is its first store. This is the
+**One file holds one store, and the store holds its own service account bindings.** The
+document is still a list under `kvStores` — the format is unchanged, and files holding
+several stores still parse and still work — but a create writes exactly one. This is the
 contract with the deploy pipeline — **change it in lockstep with the pipeline that consumes
 it**:
 
@@ -274,7 +273,7 @@ Three behaviours worth relying on:
 {"roles": {"read": ["app02.corp.example.com"]}}    // or both
 ```
 
-### `DELETE` — a content edit, not a file removal
+### `DELETE` — removes the file
 
 ```jsonc
 // DELETE /api/vault/v1/kv/payments/myapp
@@ -284,13 +283,18 @@ Three behaviours worth relying on:
 Same pull request → CI → merge → CI chain, same rollbacks, same point of no return. What is
 worth knowing:
 
-- **Only the named entry goes.** Its siblings in the file are written back untouched.
-- **Deleting the last store leaves the file behind**, holding `kvStores: []`.
-  `GET /files/{file}`
-  keeps answering `200`, and a later create appends to it normally. *This assumes the deploy
-  pipeline reads an empty list as "remove everything this file declared"* — if it cannot,
-  the file has to be deleted instead, which needs a Bitbucket call this service does not make
-  today.
+- **The file goes with the store.** One file holds one store, so emptying it to
+  `kvStores: []` would leave a dead file behind for every store ever deleted. *This assumes
+  the deploy pipeline treats a vanished file as "remove everything it declared"* — if it only
+  iterates files that exist, a deleted file is unmanaged rather than pruned. Worth confirming
+  with whoever owns the pipeline.
+- **This is the one operation that is not REST.** Bitbucket Server has no endpoint that
+  deletes a file, so the service pushes a deleting commit over **git-over-HTTPS**, reusing
+  `BITBUCKET_TOKEN` as a bearer header — no SSH key, no extra secret. It needs the `git`
+  binary in the image; the Dockerfile checks for it at build time. Everything either side —
+  branch, pull request, both gates, merge, rollback — is unchanged.
+- **A file holding several stores is edited, not deleted.** Only an older revision could have
+  produced one, but a store there must not take its neighbours with it.
 - **A repeat delete is `404`**, the same answer `GET` and `PATCH` already give for a store
   that is not there. The *state* is idempotent; the status code tells you which call did the
   work. A client whose connection dropped mid-delete cannot tell "already gone" from "never
@@ -421,11 +425,13 @@ app/
   helpers.py         # naming, values-file shape, YAML rendering (pure)
   clients/
     bitbucket.py     # branch / file / pull-request REST client
+    git.py           # deleting a file: the one operation Bitbucket has no REST for
     http.py          # the single funnel that raises ExternalServiceError
   v1/vault/          # conf, schemas, operations, routes
 tests/
   test_helpers.py    # pure helpers: stores and their nested bindings
-  clients/           # both clients against their real REST shapes (respx)
+  clients/           # the REST client against its real shapes (respx), and
+                     #   test_git.py against a real bare repo on disk
   v1/vault/          # schemas, the chains + rollbacks, routes end-to-end
                      #   test_k8s_service_account_*.py mirror the KV files one-for-one
 tools/

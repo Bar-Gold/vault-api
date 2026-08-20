@@ -254,7 +254,7 @@ def test_a_store_named_k8s_service_accounts_stays_addressable(client, auth_heade
     )
 
     assert response.status_code == 200
-    assert _committed(bitbucket, path="kv/k8s-service-accounts.yaml") == {"kvStores": []}
+    assert bitbucket.deleted == ["kv/k8s-service-accounts.yaml"]
 
 
 def test_the_binding_route_wins_over_the_delete_pull_request_route(

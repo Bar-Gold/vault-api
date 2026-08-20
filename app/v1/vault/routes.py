@@ -176,7 +176,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         ),
     )
     async def create(payload: VaultKVCreate):
-        logger.info(f"Creating KV store {payload.kv_name} in {payload.file}")
+        logger.info(f"Creating KV store {payload.kv_name}")
         return await _execute(create_kv_mount_operation(bitbucket, payload))
 
     # Registered before the `/{kv_name}` routes. There is no POST on those paths today, so
@@ -197,7 +197,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
     )
     async def create_pull_request_only(payload: VaultKVCreate):
         logger.info(
-            f"Opening a pull request for KV store {payload.kv_name} in {payload.file} "
+            f"Opening a pull request for KV store {payload.kv_name} "
             f"(no CI, no merge)"
         )
         return await _execute(create_kv_pull_request_operation(bitbucket, payload))

@@ -63,6 +63,25 @@ class VaultV1StaticSettings(BaseSettings):
         description="Bitbucket usernames added as reviewers on every opened pull request.",
     )
 
+    # --- Git (deleting a file, the one operation Bitbucket has no REST endpoint for) ---
+    # All defaulted: the config singletons are built at import time, so a new *required*
+    # setting would break every test at collection.
+    GIT_AUTHOR_NAME: str = Field(
+        default="vault-api",
+        description="Author/committer name on the commit that removes a values file.",
+    )
+
+    GIT_AUTHOR_EMAIL: str = Field(
+        default="vault-api@noreply.invalid",
+        description="Author/committer email on the commit that removes a values file.",
+    )
+
+    GIT_TIMEOUT_SECONDS: float = Field(
+        default=120.0,
+        description="Budget for a single git invocation (fetch, commit, push). Bounds one "
+        "command, not the whole delete — the CI_* settings still bound the waiting.",
+    )
+
     # --- CI gates ---
     # Read from Bitbucket's build-status store (the pull request's Builds tab), not from
     # the CI server, so there is no CI repo id or token to configure. The names still say

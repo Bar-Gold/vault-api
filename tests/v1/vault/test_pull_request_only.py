@@ -17,13 +17,12 @@ from app.v1.vault.operations import (
 from app.v1.vault.schemas import VaultKVCreate
 
 KV = "myapp"
-FILE = "payments"
-VALUES_PATH = "kv/payments.yaml"
+FILE = KV  # a store names its own file now
+VALUES_PATH = f"kv/{KV}.yaml"
 ROLES = {"read": ["app01.corp.example.com"]}
 PR_URL = f"{config.API_PREFIX}/pull-request"
 
 CREATE_BODY = {
-    "file": FILE,
     "kv_name": KV,
     "kv_description": "payments secrets",
     "roles": ROLES,
@@ -117,16 +116,20 @@ async def test_appends_to_an_existing_file(payload, bitbucket):
     assert bitbucket.source_commit_ids == ["file-commit-sha"]
 
 
-async def test_branch_carries_both_coordinates(bitbucket):
-    payload = VaultKVCreate(
-        file="infra", kv_name="secrets-store", kv_description="x", roles=ROLES
-    )
+async def test_branch_names_the_store_once(bitbucket):
+    """The store names its own file, so the branch carries one coordinate, not two.
+
+    `build_branch_name` still takes both and still emits both when they differ — a store
+    an older revision grouped into another file — but a create can no longer produce that,
+    and `vault-kv/secrets-store-secrets-store-abc123` would be the alternative here.
+    """
+    payload = VaultKVCreate(kv_name="secrets-store", kv_description="x", roles=ROLES)
 
     result = await _open(bitbucket, payload)
 
     stored = bitbucket.pull_requests[result.pull_request.id]
-    assert stored.from_branch == "vault-kv/infra-secrets-store-abc123"
-    assert "kv/infra.yaml" in bitbucket.committed
+    assert stored.from_branch == "vault-kv/secrets-store-abc123"
+    assert "kv/secrets-store.yaml" in bitbucket.committed
 
 
 # --------------------------------------------------------------------------- #

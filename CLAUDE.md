@@ -62,10 +62,16 @@ that a no-op `roles` update still compares equal so the short circuit survives.
 > `description`, the `access` mapping and the whole `_assert_no_referrers` 409 have no
 > counterpart in the real format.
 
-**One file, many stores.** A create *appends* to `{VAULT_VALUES_DIR}/{file}.yaml`, creating
-the file only if it is the first store in it. Nothing else in that file is touched, and a
-key this service does not recognise survives every transform — pinned by the `SIBLING_KEY`
-tests in `tests/test_helpers.py`.
+**One file, one store.** A create writes `{VAULT_VALUES_DIR}/{kv_name}.yaml`, and a delete
+removes that file. The document is still a *list* under `kvStores` — the format has not
+changed and the helpers still append, edit and remove entries — but nothing this service
+does can put a second store in a file any more.
+
+Files an older revision grouped are still handled everywhere, and the handling is worth
+knowing because it is the only place two behaviours diverge: a delete that would leave other
+stores behind **edits the file instead of removing it**. A store is never deleted along with
+somebody else's. A key this service does not recognise survives every transform either —
+pinned by the `SIBLING_KEY` tests in `tests/test_helpers.py`.
 
 Mounts, KV engine versions, policies, HCL — none of it is modelled here. That is the deploy
 pipeline's business. A binding names a workload and nothing else; **it carries no
@@ -90,7 +96,7 @@ uv-managed (Python 3.12). Package indexes come from `uv.toml` (internal Artifact
 ```bash
 uv sync --group dev                 # install deps into .venv — ON-PREM ONLY, see below
 uv run --no-sync python -m app.main # serves on 0.0.0.0:5000 (--host/--port override)
-uv run --no-sync pytest             # everything under tests/ (488 tests, ~13s)
+uv run --no-sync pytest             # everything under tests/ (508 tests, ~20s)
 uv run --no-sync pytest tests/v1/vault                                        # one suite
 uv run --no-sync pytest tests/v1/vault/test_operations.py::test_happy_path_call_order  # one test
 docker build -t vault-api . && docker run -p 5000:5000 --env-file .env vault-api
@@ -136,12 +142,12 @@ segments in the builds endpoint. Keep all three if you extend it.
 
 | Route | Body | Notes |
 |-------|------|-------|
-| `POST /api/vault/v1/kv/` | `{file, kv_name, kv_description, roles}` | the chain below; blocks until the deploy build ends |
+| `POST /api/vault/v1/kv/` | `{kv_name, kv_description, roles}` | the chain below; blocks until the deploy build ends |
 | `POST /api/vault/v1/kv/pull-request` | same body | steps 1-3 only: opens the PR and returns. No CI wait, no merge |
 | `GET /api/vault/v1/kv/files/{file}` | — | the whole values file, parsed YAML returned as-is (not a schema). **The only route that names a file** |
 | `GET /api/vault/v1/kv/{kv_name}` | — | one store, found wherever it lives |
 | `PATCH /api/vault/v1/kv/{kv_name}` | `{kv_description?, roles?}` | edits one store; its siblings are untouched |
-| `DELETE /api/vault/v1/kv/{kv_name}` | — | removes one store **and its bindings**, same chain as a create; 200. No referential check exists |
+| `DELETE /api/vault/v1/kv/{kv_name}` | — | **deletes the store's file** (and its bindings with it), same chain as a create; 200. No referential check exists |
 | `DELETE /api/vault/v1/kv/{kv_name}/pull-request` | — | steps 1-3 only: opens the removal PR and returns; 201 |
 | `POST /api/vault/v1/kv/{kv_name}/k8s-service-accounts` | `{service_account, namespace, cluster}` | appends one binding to that store; same chain; 201 |
 | `POST /api/vault/v1/kv/{kv_name}/k8s-service-accounts/pull-request` | same body | steps 1-3 only; 201 |
@@ -155,7 +161,7 @@ whole values directory — the create enforces exactly that — so the name *is*
 `_resolve_store` in `operations.py` turns a name into `(file, path, document, store)` in
 two steps, so the common case does not pay for the general one:
 
-1. read `<values dir>/<kv_name>.yaml` — the file a create with no `file` writes — and use
+1. read `<values dir>/<kv_name>.yaml` — the file every create writes — and use
    it *if the store is actually in there*. One call, and it answers for every store made
    the normal way. A file named after one store while holding another falls through.
 2. otherwise walk the directory, which is what finds a store grouped under another name.
@@ -210,26 +216,30 @@ added for service accounts is **defaulted**, so `tests/conftest.py` needed no ch
 *required* setting would break every test at collection, because the config singletons are
 built at import time.
 
-**The create request is three required fields plus one optional**, and
-`test_create_takes_exactly_four_fields` pins the set: `kv_name`, `kv_description`, `roles`,
-and `file`. There is no environment and no infra-coordinates `metadata` block.
+**The create request is exactly three required fields**, and
+`test_create_takes_exactly_three_fields` pins the set: `kv_name`, `kv_description` and
+`roles`. There is no environment and no infra-coordinates `metadata` block.
 
-**`file` is optional, and omitting it is the normal case.** A `model_validator(mode="after")`
-on `VaultKVCreate` fills it with `kv_name`, so nothing downstream knows it could be absent —
-and the substitution needs no validation of its own, because `KV_NAME_PATTERN` and
-`FILE_PATTERN` are the same single-segment shape. Give it explicitly only to group several
-stores into one file, which the format is built for. This is the **only** request that
-mentions a file.
+**No request mentions a file at all.** One file holds exactly one store and is named after
+it, so `kv/<kv_name>.yaml` is the path and there is nothing for a caller to choose.
+`VaultKVCreate` has no `file` field; `_prepare_create` passes `kv_name` where a file used to
+go. That invariant is what lets a delete remove the file outright rather than emptying it.
 
-**Every request model sets `extra: "forbid"`**, and `file` being optional is what makes that
-load-bearing rather than tidy. Pydantic's default is to ignore an unrecognised field, so a
-mistyped `fil` used to fail on the missing required `file` and now would silently fall back
-to naming the file after the store — a 201 for a store in the wrong place. Same reasoning
-for the field that is *not* there: sending `environment` is a 422, not a quiet drop.
+> An earlier revision took an optional `file`, defaulted to `kv_name` by a
+> `model_validator`, so several stores could be grouped into one file. Files written that
+> way still exist and are still readable, editable and deletable — `_resolve_store`'s walk
+> and `build_branch_name`'s two-coordinate form are both still there for them — but nothing
+> can create one any more. Do not reintroduce the field.
 
-**`file` is the path-traversal guard now, not `kv_name`.** That inverted when the format
-changed — `kv_name` became a value inside the document while `file` became the thing that
-lands in `{VAULT_VALUES_DIR}/{file}.yaml`:
+**Every request model sets `extra: "forbid"`**, which is what makes the removal safe rather
+than silent. Pydantic's default is to ignore an unrecognised field, so a caller still
+sending `file` would otherwise get a 201 for a request whose file was quietly dropped. It is
+a 422 instead. Same reasoning for the field that was never there: sending `environment` is a
+422, not a quiet drop.
+
+**`kv_name` is the path-traversal guard again**, because it is once more the thing that
+lands in `{VAULT_VALUES_DIR}/{kv_name}.yaml`. `FILE_PATTERN` still exists and still guards
+`GET /files/{file}`, which is the one place a caller names a file:
 
 - `FILE_PATTERN` and `KV_NAME_PATTERN` are both a **single segment** of `[a-z0-9]`/dashes. No
   slash, so no directory can be escaped or created, and `..` cannot match.
@@ -274,6 +284,7 @@ The binding shape is the pipeline's, so each decision has exactly one home:
 | sequence indentation and block-scalar style of the committed text | `_BlockStyleDumper` in `helpers.py` |
 | the k8s name patterns and limits | the `K8S_*_PATTERN` / `K8S_*_MAX_LENGTH` constants in `schemas.py` |
 | the branch prefix | `K8S_SA_BRANCH_PREFIX` in `conf.py` |
+| how a file is deleted, and the git invocation | `GitFileRemover` in `clients/git.py` |
 
 **Nothing outside `helpers.py`/`schemas.py` knows a single document key name of this format** —
 `operations.py` reaches a binding's identity through `k8s_service_account_identity` rather
@@ -294,7 +305,9 @@ connectors).
   deliberately no CI-server settings anywhere: `WOODPECKER_URL`/`_TOKEN`/`_REPO_ID` are gone,
   and the `CI_*` knobs below now bound the **build-status polling**. Their names still say
   PIPELINE because a pipeline is still what is being waited on; only the place we ask changed.
-- `app/v1/vault/conf.py` — `API_PREFIX`, `API_TAGS`, values-repo layout, PR shaping, `CI_*` timeouts.
+- `app/v1/vault/conf.py` — `API_PREFIX`, `API_TAGS`, values-repo layout, PR shaping, `CI_*` timeouts,
+  and `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/`GIT_TIMEOUT_SECONDS` for the delete commit. All
+  defaulted, so `tests/conftest.py` needed no change.
 - `AUTH_*` / `AUTH_SSO_*` are **not** declared here — the library reads them from the environment.
 
 Both are singletons built at **import time**, so a missing required setting is an import error,
@@ -336,6 +349,33 @@ load-bearing: `routes.py` keys off `external_error.status_code == 504` to answer
 of 502. The client passes its own `detail_from_response` (digging through
 `{"errors": [{"message": ...}]}`); `default_detail` is the fallback.
 
+**`app/clients/git.py` is the one operation that is not REST.** Bitbucket Server has **no
+endpoint that deletes a file** — `browse/{path}` is `GET` and `PUT` only, Atlassian have said
+outright it is unsupported, and the `-F files=<path>` workaround every search result offers
+is the **Bitbucket Cloud** `src` resource, which does not exist on Server. So `delete_file`
+on `BitbucketClient` delegates to `GitFileRemover`, which pushes a deleting commit over
+**HTTPS** using the same `BITBUCKET_TOKEN` as a bearer header. No SSH key, no second secret.
+Four things about it are deliberate:
+
+- **The token goes in through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n` environment variables**,
+  not `-c http.extraHeader=...`, because argv is readable through `ps`. `_scrub` also strips
+  it from any stderr that reaches an error body, and `GIT_TERMINAL_PROMPT=0` stops a
+  credential prompt hanging the request.
+- **It runs in `asyncio.to_thread`.** A subprocess plus two network round-trips on the event
+  loop would stall every other in-flight request.
+- **It produces one commit on one topic branch and stops.** It never pushes to the base
+  branch, so the pull request, both gates, the merge and every rollback are unchanged — the
+  branch is deleted over REST exactly as if `put_file` had made it.
+- **Every failure leaves as `ExternalServiceError`**, matching `http.py`, so the routes map
+  it without knowing a subprocess was involved. A git timeout is a **504** for the same
+  reason a read timeout is.
+
+It needs the **git binary in the image**. The Dockerfile asserts `git --version` at build
+time rather than letting a missing binary surface as a 502 on the first delete. `tests/clients/test_git.py`
+runs real git against a real bare repo in a temp dir — no mocks, deliberately: a fake here
+would only prove the fake agrees with itself, which is exactly how the build-status bug below
+survived a full suite.
+
 **The build-status half of the client is the CI gate.** `get_build_statuses(commit_id)` reads
 `GET /rest/build-status/1.0/commits/{commitId}` — the **only** endpoint here that is not
 repo-scoped, and deliberately the deprecated one. **Do not "modernise" it.** The repo-scoped
@@ -375,6 +415,11 @@ check is the backstop if that matters for a given repo.
 `k8s_service_account_identities`, `find_k8s_service_account`, `add_k8s_service_account`,
 `remove_k8s_service_account`. Shared: `slugify_mount_path`, `build_branch_name`,
 `values_file_path`, `render_values_yaml`, `yaml_data_equals`.
+
+**`build_branch_name` collapses its two coordinates when they match**, which is now the
+normal case: a store names its own file, so carrying both would render
+`vault-kv/myapp-myapp-abc123`. It still emits `vault-kv/payments-myapp-abc123` when the file
+differs — a store an older revision grouped — so a reviewer of one of those still sees both.
 
 **Note which argument each family takes.** The `kvStores` helpers take the parsed
 **document**; `k8s_service_accounts`, `k8s_service_account_identity(ies)` and
@@ -477,11 +522,22 @@ Delete applies `remove_kv_store` and takes the same chain, with **no scan of any
 uniqueness is a create-only concern, and there is nothing referential to check because a
 store's bindings are inside it — removing the store removes them in the same diff, with
 nothing left dangling. There is no `yaml_data_equals` short circuit either — if
-`remove_kv_store` did not raise, the document changed, so a removal is never a no-op. It
-always passes a `source_commit_id`; the file exists by definition. It is a **content edit,
-not a file removal**: the last store out leaves `kvStores: []` and the file in place, which
-keeps `GET /files/{file}` answering 200, lets a later create append normally, and needs no
-`delete_file` on the Bitbucket client (there isn't one).
+`remove_kv_store` did not raise, the document changed, so a removal is never a no-op.
+
+**It is a file removal, not a content edit** — the inverse of what this section used to say.
+A store names its own file and is alone in it, so the file goes; leaving `kvStores: []`
+behind would accumulate one dead file per store ever deleted, in a shape no create ever
+writes. `_prepare_delete` signals this by returning `content=None`, and
+`_open_pull_request` turns that into `remove=True`.
+
+**The exception, and the only branch in the whole delete path:** if removing the store would
+leave *other* stores in the file, the file is edited and survives — with a
+`source_commit_id`, since that is an ordinary `put_file`. Only a file an older revision
+grouped can hit this, and it is the difference between deleting one store and deleting
+somebody else's alongside it.
+
+`remove=True` is a separate flag rather than `content=None` meaning "delete", because a
+`None` arriving by accident would then silently remove a file instead of raising.
 
 ### The service-account chain
 
@@ -655,9 +711,10 @@ Two details that are easy to break:
 - The committed entries are the contract with the deploy pipeline — change `build_kv_store` /
   `build_k8s_service_account` and the pipeline together. Both are the *sole* writers of their
   own key names.
-- Tests: 488 of them. `tests/test_helpers.py` (pure, no library import), `tests/clients/` (the
+- Tests: 508 of them. `tests/test_helpers.py` (pure, no library import), `tests/clients/` (the
   Bitbucket client — repo operations *and* build statuses — plus `http.py`'s error mapping,
   against the real REST shapes via respx),
+  `tests/clients/test_git.py` (real git against a real bare repo — no mocks),
   `tests/v1/vault/` (schemas, the chain + rollbacks with duck-typed fakes from `tests/fakes.py`,
   and routes end-to-end through `TestClient`; `test_k8s_service_account_*.py` mirror the KV
   files one-for-one). Two conftest details to respect:
@@ -685,15 +742,22 @@ Two details that are easy to break:
     instead of returned, which is how a timeout or a red build is staged. Running dry is an
     `AssertionError`, so an unexpected extra gate fails loudly. Both gates default to green,
     and `passing()` / `failing()` are the shorthands. `bitbucket.awaited_commits` and
+    `bitbucket.deleted` records paths removed outright, which is what tells "the file was
+    deleted" apart from "the file was rewritten without that store" — very different diffs.
+    Note it does **not** drop the path from `existing_files`: that is the base branch, and
+    only a merge would land the removal there, so a test that wants the merged state says so.
+    `bitbucket.awaited_commits` and
     `bitbucket.excluded_keys` record what each gate was opened on — that is what pins gate 1
     to the PR's commit and gate 2 to the merge commit.
-- **Delete is a content edit, not a file removal**, and it ships in two variants
+- **Delete removes the file**, and it ships in two variants
   (`delete_kv_store_operation`, `delete_kv_store_pull_request_operation`) that reuse
-  `_commit_via_pull_request` / `_open_pull_request` unchanged. Removing the last store leaves
-  `kvStores: []` and the file on the base branch; a repeat delete is a 404, which is how
-  `GET`/`PATCH` already answer for a store that is not there. **This depends on the deploy
-  pipeline reading an empty list as "prune everything this file declared"** — if it cannot,
-  the Bitbucket client needs a `delete_file` it does not have today.
+  `_commit_via_pull_request` / `_open_pull_request` — now with `remove=True`, which swaps the
+  `put_file` for a `delete_file`. A repeat delete is a 404, which is how `GET`/`PATCH`
+  already answer for a store that is not there. **This depends on the deploy pipeline
+  treating a vanished file as "prune what it declared"** — the same class of assumption the
+  empty-list version rested on, moved rather than removed. If the pipeline only iterates
+  files that exist, a deleted file is unmanaged rather than pruned, and the Vault mount is
+  orphaned instead of removed. Worth confirming with whoever owns the pipeline.
 - **Two earlier Kubernetes shapes are gone; neither is a source to copy from.** The first
   edited a `policies` list a create never writes, so it 422'd against every file this service
   produces. The second modelled bindings as a top-level `kubernetesAuth` list of named roles

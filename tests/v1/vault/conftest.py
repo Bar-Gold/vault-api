@@ -7,9 +7,11 @@ from tests.fakes import FakeBitbucket
 
 @pytest.fixture
 def payload():
-    """The whole create request: which file, the store's name, why, and who reaches it."""
+    """The whole create request: the store's name, why it exists, and who reaches it.
+
+    No file: the store names its own, so `myapp` lands in `kv/myapp.yaml`.
+    """
     return VaultKVCreate(
-        file="payments",
         kv_name="myapp",
         kv_description="payments secrets",
         roles={"read": ["app01.corp.example.com"]},

@@ -57,6 +57,7 @@ from ...helpers import (
     k8s_service_account_identity,
     k8s_service_accounts,
     kv_store_names,
+    read_kv_stores,
     remove_k8s_service_account,
     remove_kv_store,
     render_values_yaml,
@@ -331,10 +332,11 @@ async def _open_pull_request(
     bitbucket: Any,
     *,
     path: str,
-    content: str,
     branch: str,
     summary: str,
     description: str,
+    content: Optional[str] = None,
+    remove: bool = False,
     kv_name: str = "",
     source_commit_id: Optional[str] = None,
 ) -> PullRequest:
@@ -347,18 +349,39 @@ async def _open_pull_request(
     PR-only operations (which stop here). One implementation means they cannot drift apart
     in what they roll back. `kv_name` only names the subject in the log line; a binding
     operation passes the store it edits, since that is what the diff touches.
+
+    **`remove=True` commits a deletion of `path` instead of new content**, which is the
+    only step in the chain that is not a REST call — Bitbucket Server cannot delete a file
+    over REST, so `delete_file` pushes the commit over git instead (`app/clients/git.py`).
+    Everything either side of it is identical, rollback included: the branch is deleted the
+    same way whichever produced it. `remove` and `content` are mutually exclusive rather
+    than `content=None` meaning "delete", because a `None` that slipped through by accident
+    would then silently remove a file instead of failing.
     """
+    if remove and content is not None:
+        raise ValueError("a removal commits no content")
+    if not remove and content is None:
+        raise ValueError("content is required unless the commit removes the file")
+
     base_branch = config.VAULT_VALUES_REPO_BASE_BRANCH
 
     await bitbucket.create_branch(branch, base_branch)
     try:
-        await bitbucket.put_file(
-            path=path,
-            branch=branch,
-            content=content,
-            message=summary,
-            source_commit_id=source_commit_id,
-        )
+        if remove:
+            await bitbucket.delete_file(
+                path=path,
+                branch=branch,
+                base_branch=base_branch,
+                message=summary,
+            )
+        else:
+            await bitbucket.put_file(
+                path=path,
+                branch=branch,
+                content=content,
+                message=summary,
+                source_commit_id=source_commit_id,
+            )
     except Exception:
         await _delete_branch_quietly(bitbucket, branch)
         raise
@@ -383,17 +406,19 @@ async def _commit_via_pull_request(
     bitbucket: Any,
     *,
     path: str,
-    content: str,
     branch: str,
     summary: str,
     description: str,
+    content: Optional[str] = None,
+    remove: bool = False,
     kv_name: str = "",
     source_commit_id: Optional[str] = None,
 ) -> Tuple[PullRequest, List[BuildStatus], List[BuildStatus]]:
     """branch -> commit -> PR -> gate 1 -> merge -> gate 2, with every rollback.
 
     Shared by every mutating flow — stores and bindings alike: the only thing that differs
-    between them is what gets written and whether an optimistic-lock token is needed.
+    between them is what gets written (or, for a delete, removed) and whether an
+    optimistic-lock token is needed.
     Keeping one implementation means the rollback asymmetry cannot drift between
     operations. `kv_name` is carried only so a failure names its subject.
 
@@ -412,6 +437,7 @@ async def _commit_via_pull_request(
         bitbucket,
         path=path,
         content=content,
+        remove=remove,
         branch=branch,
         summary=summary,
         description=description,
@@ -527,7 +553,7 @@ def _create_description(payload: VaultKVCreate) -> str:
     )
     return (
         f"Automated by vault-api.\n\n"
-        f"- file: {config.VAULT_VALUES_DIR}/{payload.file}.yaml\n"
+        f"- file: {config.VAULT_VALUES_DIR}/{payload.kv_name}.yaml\n"
         f"- store: {payload.kv_name}\n"
         f"- description: {payload.kv_description}\n"
         f"- roles:\n{roles}\n"
@@ -542,13 +568,19 @@ async def _prepare_create(
     Returns the file path, the rendered document with the new store appended, and the
     optimistic-lock token — `None` when the file does not exist yet, which is what tells
     Bitbucket to treat the write as a create rather than an edit.
+
+    The store names its own file, so `kv_name` is passed where a file used to be. The
+    duplicate scan still walks the whole values directory rather than just testing whether
+    `<kv_name>.yaml` exists: a store grouped into another file by an older revision of this
+    service would otherwise be invisible to it, and the name has to stay unique against
+    those too.
     """
-    path = values_file_path(config.VAULT_VALUES_DIR, payload.file)
+    path = values_file_path(config.VAULT_VALUES_DIR, payload.kv_name)
 
     # Names are global to Vault, so this scans every file, not just the target one.
-    await _assert_name_is_free(bitbucket, payload.kv_name, payload.file)
+    await _assert_name_is_free(bitbucket, payload.kv_name, payload.kv_name)
 
-    current = await _read_document(bitbucket, path, payload.kv_name, payload.file)
+    current = await _read_document(bitbucket, path, payload.kv_name, payload.kv_name)
     updated = add_kv_store(
         current,
         build_kv_store(payload.kv_name, payload.kv_description, payload.roles),
@@ -575,8 +607,8 @@ async def create_kv_mount_operation(
         bitbucket,
         path=path,
         content=content,
-        branch=_branch_for(payload.file, payload.kv_name, branch_suffix),
-        summary=f"Create KV store {payload.kv_name} in {payload.file}",
+        branch=_branch_for(payload.kv_name, payload.kv_name, branch_suffix),
+        summary=f"Create KV store {payload.kv_name}",
         description=_create_description(payload),
         kv_name=payload.kv_name,
         source_commit_id=source_commit_id,
@@ -586,7 +618,7 @@ async def create_kv_mount_operation(
         status=OperationStatus.SUCCEEDED,
         message=f"Successful creation of {payload.kv_name}",
         kv_name=payload.kv_name,
-        file=payload.file,
+        file=payload.kv_name,
         pull_request=_pull_request_info(merged),
         validation_builds=_build_infos(validation),
         deploy_builds=_build_infos(deploy),
@@ -613,8 +645,8 @@ async def create_kv_pull_request_operation(
         bitbucket,
         path=path,
         content=content,
-        branch=_branch_for(payload.file, payload.kv_name, branch_suffix),
-        summary=f"Create KV store {payload.kv_name} in {payload.file}",
+        branch=_branch_for(payload.kv_name, payload.kv_name, branch_suffix),
+        summary=f"Create KV store {payload.kv_name}",
         description=_create_description(payload),
         kv_name=payload.kv_name,
         source_commit_id=source_commit_id,
@@ -627,7 +659,7 @@ async def create_kv_pull_request_operation(
             f"It is not merged — review, CI and merge are up to you."
         ),
         kv_name=payload.kv_name,
-        file=payload.file,
+        file=payload.kv_name,
         pull_request=_pull_request_info(pull_request),
     )
 
@@ -732,7 +764,7 @@ async def update_kv_mount_operation(
 # --------------------------------------------------------------------------- #
 async def _prepare_delete(
     bitbucket: Any, kv_name: str
-) -> Tuple[str, str, str, Optional[str]]:
+) -> Tuple[str, str, Optional[str], Optional[str]]:
     """Everything a delete needs before it touches a branch, the file included.
 
     The counterpart of `_prepare_create`, and shared by both delete paths for the same
@@ -744,9 +776,29 @@ async def _prepare_delete(
     nested inside it, so removing the store removes its bindings in the same diff and no
     reference is left dangling. There is no `yaml_data_equals` short circuit either — if
     `remove_kv_store` did not raise, the document changed. A removal is never a no-op.
+
+    **Returns `content=None` when the file is to be deleted outright**, which is the normal
+    case: a store names its own file and is the only thing in it, so emptying the file to
+    `kvStores: []` would leave a dead file behind for every store ever deleted.
+
+    A file that still holds *other* stores after this one is removed is edited instead, and
+    survives. That only happens for a file an older revision of this service grouped
+    several stores into — a create cannot produce one any more. It is two lines and it is
+    the difference between deleting a store and deleting somebody else's alongside it.
     """
     file, path, current, _ = await _resolve_store(bitbucket, kv_name)
     updated = remove_kv_store(current, kv_name)
+
+    if not read_kv_stores(updated):
+        # Nothing left to keep the file alive. No `source_commit_id`: git resolves the
+        # path from the branch it fetched, so Bitbucket's optimistic-lock token has no
+        # part in a removal.
+        return file, path, None, None
+
+    logger.info(
+        f"{path} still holds {len(read_kv_stores(updated))} store(s) after removing "
+        f"{kv_name}; editing the file rather than deleting it"
+    )
 
     # The file exists by definition here, so the write is an edit and Bitbucket wants the
     # optimistic-lock token for that path.
@@ -757,12 +809,18 @@ async def _prepare_delete(
     return file, path, render_values_yaml(updated), source_commit_id
 
 
-def _delete_description(path: str, kv_name: str) -> str:
+def _delete_description(path: str, kv_name: str, removed_file: bool) -> str:
+    """The reviewer needs to see which of the two diffs this is before opening it."""
+    change = (
+        "file deleted"
+        if removed_file
+        else "removed from kvStores (file kept — it still holds other stores)"
+    )
     return (
         f"Automated by vault-api.\n\n"
         f"- file: {path}\n"
         f"- store: {kv_name}\n"
-        f"- change: removed from kvStores\n"
+        f"- change: {change}\n"
     )
 
 
@@ -773,13 +831,16 @@ async def delete_kv_store_operation(
 ) -> VaultOperationResponse:
     """Remove one store from its file, then block until both pipelines have finished.
 
-    A content edit of the file, not a file removal: the last store out leaves `kvStores: []`
-    behind. That keeps `GET /{file}` answering 200, keeps a later create appending
-    normally, and needs no Bitbucket call this service does not already make.
+    **A file removal, not a content edit.** A store names its own file and is the only
+    thing in it, so deleting the store deletes the file — leaving `kvStores: []` behind
+    would accumulate a dead file per store ever deleted. The exception is a file an older
+    revision grouped several stores into: that one is edited so its other stores survive.
 
     The chain and every rollback come from `_commit_via_pull_request` unchanged, so the
     merge is the point of no return here too — a deploy pipeline that fails after a delete
-    is reported, and the message says the removal already needs a revert.
+    is reported, and the message says the removal already needs a revert. Only the commit
+    step differs, and only when the whole file goes: Bitbucket Server has no REST endpoint
+    that deletes a file, so that one call is git (`app/clients/git.py`).
     """
     file, path, content, source_commit_id = await _prepare_delete(bitbucket, kv_name)
 
@@ -787,9 +848,10 @@ async def delete_kv_store_operation(
         bitbucket,
         path=path,
         content=content,
+        remove=content is None,
         branch=_branch_for(file, kv_name, branch_suffix),
         summary=f"Delete KV store {kv_name} from {file}",
-        description=_delete_description(path, kv_name),
+        description=_delete_description(path, kv_name, removed_file=content is None),
         kv_name=kv_name,
         source_commit_id=source_commit_id,
     )
@@ -826,9 +888,10 @@ async def delete_kv_store_pull_request_operation(
         bitbucket,
         path=path,
         content=content,
+        remove=content is None,
         branch=_branch_for(file, kv_name, branch_suffix),
         summary=f"Delete KV store {kv_name} from {file}",
-        description=_delete_description(path, kv_name),
+        description=_delete_description(path, kv_name, removed_file=content is None),
         kv_name=kv_name,
         source_commit_id=source_commit_id,
     )

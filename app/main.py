@@ -8,6 +8,7 @@ from tashtiot_apis_library.fastapi_template._internal.utils import settings as l
 from tashtiot_apis_library.fastapi_template.utils import BaseAPI
 
 from .clients.bitbucket import BitbucketClient
+from .clients.git import GitFileRemover
 from .global_conf import global_config
 from .v1.vault.conf import config as vault_config
 from .v1.vault.routes import get_v1_vault_router
@@ -72,6 +73,18 @@ def create_app() -> FastAPI:
         timeout=global_config.HTTP_TIMEOUT_SECONDS,
         verify=global_config.VERIFY_SSL,
     ).client
+    # Deleting a file has no REST equivalent on Bitbucket Server, so the client carries a
+    # git collaborator for that one call. Same host, same token — see clients/git.py.
+    bitbucket_git = GitFileRemover(
+        base_url=global_config.BITBUCKET_URL,
+        token=global_config.BITBUCKET_TOKEN,
+        project_key=vault_config.VAULT_VALUES_REPO_PROJECT_KEY,
+        repo_slug=vault_config.VAULT_VALUES_REPO_SLUG,
+        verify_ssl=global_config.VERIFY_SSL,
+        author_name=vault_config.GIT_AUTHOR_NAME,
+        author_email=vault_config.GIT_AUTHOR_EMAIL,
+        timeout=vault_config.GIT_TIMEOUT_SECONDS,
+    )
     bitbucket = BitbucketClient(
         bitbucket_http,
         project_key=vault_config.VAULT_VALUES_REPO_PROJECT_KEY,
@@ -79,6 +92,7 @@ def create_app() -> FastAPI:
         poll_interval=vault_config.CI_POLL_INTERVAL_SECONDS,
         start_timeout=vault_config.CI_PIPELINE_START_TIMEOUT_SECONDS,
         completion_timeout=vault_config.CI_PIPELINE_TIMEOUT_SECONDS,
+        git=bitbucket_git,
     )
 
     # Add routes to app. One router: Kubernetes service accounts are a sub-resource of a KV

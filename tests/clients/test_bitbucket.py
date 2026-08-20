@@ -646,3 +646,67 @@ async def test_get_branch_head_is_none_on_an_empty_branch(bitbucket):
     respx.get(f"{API}/commits").mock(return_value=httpx.Response(200, json={"values": []}))
 
     assert await bitbucket.get_branch_head("master") is None
+
+
+# --------------------------------------------------------------------------- #
+# delete_file — the one operation that is not REST
+#
+# Bitbucket Server has no endpoint that deletes a file, so this delegates to the git
+# collaborator. The mechanics are covered against a real repository in test_git.py; what
+# matters here is that the client hands off the right arguments and fails legibly when
+# nothing was injected. No respx: a correct delegation makes no HTTP call at all.
+# --------------------------------------------------------------------------- #
+class _RecordingGit:
+    def __init__(self):
+        self.calls = []
+
+    async def remove_file(self, path, branch, base_branch, message):
+        self.calls.append(
+            {
+                "path": path,
+                "branch": branch,
+                "base_branch": base_branch,
+                "message": message,
+            }
+        )
+        return "deleted-sha"
+
+
+async def test_delete_file_delegates_to_the_git_client():
+    git = _RecordingGit()
+    client = BitbucketClient(
+        httpx.AsyncClient(base_url=BASE), "INFRA", "vault-values", git=git
+    )
+
+    result = await client.delete_file(
+        path="kv/myapp.yaml",
+        branch="vault-kv/myapp-abc123",
+        base_branch="master",
+        message="Delete KV store myapp",
+    )
+
+    assert result == "deleted-sha"
+    assert git.calls == [
+        {
+            "path": "kv/myapp.yaml",
+            "branch": "vault-kv/myapp-abc123",
+            "base_branch": "master",
+            "message": "Delete KV store myapp",
+        }
+    ]
+
+
+async def test_delete_file_without_a_git_client_is_a_502_not_an_attribute_error():
+    """The client is constructible without git — every other operation still works."""
+    client = BitbucketClient(httpx.AsyncClient(base_url=BASE), "INFRA", "vault-values")
+
+    with pytest.raises(ExternalServiceError) as error:
+        await client.delete_file(
+            path="kv/myapp.yaml",
+            branch="b",
+            base_branch="master",
+            message="m",
+        )
+
+    assert error.value.status_code == 502
+    assert "not configured" in str(error.value.detail)

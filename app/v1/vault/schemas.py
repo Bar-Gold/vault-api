@@ -127,25 +127,22 @@ class OperationStatus(str, Enum):
 # `file` being optional is what makes that sharp — a typo no longer fails on a missing
 # required field, it silently falls back to naming the file after the store.
 class VaultKVCreate(BaseModel):
-    """A create request: the store's name, what it is for, who reaches it — and optionally
-    which file to group it into.
+    """A create request: the store's name, what it is for, and who reaches it.
 
     This service appends an entry to a values file and reports what the pipelines did with
     it. What the KV *means* — mounts, engine version, policies — is the deploy pipeline's
     business, so none of it is modelled here.
 
-    **`file` is the only optional field, and omitting it is the normal case.** A caller
-    should not have to remember which file their store lives in, so leaving it out names
-    the file after the store (`kv/<kv_name>.yaml`). It is still accepted for grouping
-    several stores into one file, which the format is built for. Either way this is the
-    *only* request that mentions a file at all: every other route addresses a store by name
-    alone, because store names are unique across the whole values directory.
+    **Every field is required, and none of them names a file.** One file holds exactly one
+    store, and the file is always named after the store (`kv/<kv_name>.yaml`), so there is
+    nothing for a caller to choose. That is what lets a delete remove the file outright
+    rather than emptying it, and it is why no request in this API mentions a file: a store
+    name is unique across the values directory, so the name is the address everywhere.
     """
 
     # Without an explicit example, Swagger UI synthesises one from `pattern` and renders an
     # unreadable regex-derived string in the "Example Value" box. These give it something a
-    # human can edit. `file` is left out of the example on purpose — it shows the normal,
-    # three-field request.
+    # human can edit.
     model_config = {
         # A field this model does not know is a 422, never a silent drop.
         "extra": "forbid",
@@ -160,19 +157,6 @@ class VaultKVCreate(BaseModel):
         }
     }
 
-    file: Optional[str] = Field(
-        default=None,
-        max_length=128,
-        pattern=FILE_PATTERN,
-        examples=["athena"],
-        description=(
-            "Optional. Values file the store is added to, committed as "
-            "'<values dir>/<file>.yaml'. Defaults to the store's own name. The file may "
-            "already hold other stores; this one is appended to its kvStores list, and "
-            "nothing already in the file is touched. Created if it does not exist yet."
-        ),
-    )
-
     kv_name: str = Field(
         ...,
         max_length=128,
@@ -180,7 +164,8 @@ class VaultKVCreate(BaseModel):
         examples=["myapp"],
         description=(
             "Name of the KV store. Must be unique across every file in the values "
-            "directory, and may not contain a slash."
+            "directory, and may not contain a slash. It also names the file the store is "
+            "committed to, '<values dir>/<kv_name>.yaml'."
         ),
     )
 
@@ -213,18 +198,6 @@ class VaultKVCreate(BaseModel):
     @classmethod
     def valid_roles(cls, v: Dict[str, List[str]]) -> Dict[str, List[str]]:
         return _validate_roles(v)
-
-    @model_validator(mode="after")
-    def default_file_to_the_store_name(self) -> "VaultKVCreate":
-        """Fill `file` in here, so nothing downstream has to know it was optional.
-
-        `kv_name` and `file` carry the same shape — a single lowercase segment — so the
-        store's name is always a valid file name, and the substitution needs no validation
-        of its own.
-        """
-        if self.file is None:
-            self.file = self.kv_name
-        return self
 
 
 class VaultKVUpdate(BaseModel):

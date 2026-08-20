@@ -37,9 +37,15 @@ def build_branch_name(file: str, kv_name: str, suffix: str, prefix: str) -> str:
     """Short-lived branch the change is committed to before the PR is opened.
 
     Carries both coordinates so a reviewer can tell from the branch name alone which file
-    and which store a pull request touches.
+    and which store a pull request touches — **unless they are the same**, which is now the
+    normal case: a store names its own file, so carrying both would render
+    `vault-kv/myapp-myapp-abc123`. The file segment is kept only when it differs, which
+    happens for a store an older revision of this service grouped into another file.
     """
-    return f"{prefix}/{slugify_mount_path(file)}-{slugify_mount_path(kv_name)}-{suffix}"
+    store = slugify_mount_path(kv_name)
+    group = slugify_mount_path(file)
+    coordinates = store if group == store else f"{group}-{store}"
+    return f"{prefix}/{coordinates}-{suffix}"
 
 
 def values_file_path(values_dir: str, file: str) -> str:

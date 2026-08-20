@@ -16,7 +16,6 @@ ROLES = {"read": ["app01.corp.example.com"]}
 
 def _create(**overrides):
     values = {
-        "file": "payments",
         "kv_name": "myapp",
         "kv_description": "payments secrets",
         "roles": ROLES,
@@ -26,11 +25,16 @@ def _create(**overrides):
 
 
 # --------------------------------------------------------------------------- #
-# file — the only request field that reaches a filesystem path
+# FILE_PATTERN — no longer a request field, still a route path parameter
+#
+# A create does not take a file any more: a store names its own. The pattern survives
+# because `GET /files/{file}` still accepts one, and that segment lands in the committed
+# path, so traversal must not pass. These exercise the pattern directly rather than
+# through a request model that no longer has the field.
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("file", ["payments", "infra", "team-a", "a1"])
 def test_valid_files(file):
-    assert _create(file=file).file == file
+    assert re.fullmatch(FILE_PATTERN, file)
 
 
 @pytest.mark.parametrize(
@@ -53,8 +57,7 @@ def test_valid_files(file):
     ],
 )
 def test_rejected_files(file):
-    with pytest.raises(ValidationError):
-        _create(file=file)
+    assert not re.fullmatch(FILE_PATTERN, file)
 
 
 # --------------------------------------------------------------------------- #
@@ -172,9 +175,9 @@ def test_the_allowed_role_set_is_the_single_place_to_change():
     assert ALLOWED_ROLE_KEYS == frozenset({"read", "write"})
 
 
-def test_create_takes_exactly_four_fields():
+def test_create_takes_exactly_three_fields():
+    """No `file`: the store names its own, so there is nothing to choose."""
     assert set(VaultKVCreate.model_fields) == {
-        "file",
         "kv_name",
         "kv_description",
         "roles",
@@ -182,47 +185,29 @@ def test_create_takes_exactly_four_fields():
 
 
 # --------------------------------------------------------------------------- #
-# `file` is optional, and defaults to the store's own name
+# There is no `file` field at all
 #
-# A caller should not have to remember which file their store lives in, so the normal
-# request is three fields. That makes an unrecognised field sharper than it used to be: a
-# mistyped `file` no longer fails on a missing required field, so every request model
-# forbids extras rather than dropping them.
+# One file holds one store and is named after it, so a create has nothing to say about a
+# file. `extra: forbid` is what turns that from a silent drop into a 422 — which matters
+# more here than it looks: a caller migrating from the old three-plus-one shape would
+# otherwise get a 201 for a request whose `file` was quietly ignored.
 # --------------------------------------------------------------------------- #
-def test_file_defaults_to_the_store_name():
-    payload = VaultKVCreate(
-        kv_name="athena-passwords", kv_description="d", roles=ROLES
-    )
-
-    assert payload.file == "athena-passwords"
+def test_file_is_not_a_create_field():
+    assert "file" not in VaultKVCreate.model_fields
 
 
-def test_an_explicit_file_is_kept():
-    payload = VaultKVCreate(
-        file="athena", kv_name="athena-passwords", kv_description="d", roles=ROLES
-    )
-
-    assert payload.file == "athena"
-
-
-def test_the_defaulted_file_is_still_a_legal_file_name():
-    """`kv_name` and `file` carry the same single-segment shape, so this always holds."""
-    payload = VaultKVCreate(kv_name="a-b-c9", kv_description="d", roles=ROLES)
-
-    assert re.fullmatch(FILE_PATTERN, payload.file)
-
-
-def test_an_explicit_null_file_also_defaults():
-    payload = VaultKVCreate(
-        file=None, kv_name="athena-passwords", kv_description="d", roles=ROLES
-    )
-
-    assert payload.file == "athena-passwords"
-
-
-def test_a_malformed_explicit_file_is_still_rejected():
+def test_passing_a_file_is_rejected_rather_than_ignored():
+    """The migration case: the old shape must fail loudly, not land somewhere else."""
     with pytest.raises(ValidationError):
-        VaultKVCreate(file="Bad_File", kv_name="ok", kv_description="d", roles=ROLES)
+        VaultKVCreate(
+            file="athena", kv_name="athena-passwords", kv_description="d", roles=ROLES
+        )
+
+
+def test_the_store_name_is_always_a_legal_file_name():
+    """`kv_name` and `file` carry the same single-segment shape, which is what lets the
+    store name the file without any validation of its own."""
+    assert re.fullmatch(FILE_PATTERN, _create(kv_name="a-b-c9").kv_name)
 
 
 def test_an_unknown_create_field_is_rejected():
@@ -232,12 +217,6 @@ def test_an_unknown_create_field_is_rejected():
             kv_name="ok", kv_description="d", roles=ROLES, environment="prod"
         )
 
-
-def test_a_mistyped_file_is_rejected_rather_than_silently_defaulted():
-    """The reason `extra: forbid` matters more now than it did: `fil` would otherwise be
-    dropped and the store would land in kv/ok.yaml instead of kv/athena.yaml."""
-    with pytest.raises(ValidationError):
-        VaultKVCreate(fil="athena", kv_name="ok", kv_description="d", roles=ROLES)
 
 
 def test_an_unknown_update_field_is_rejected():

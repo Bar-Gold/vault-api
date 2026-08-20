@@ -15,14 +15,20 @@ from app.helpers import (
 )
 from app.v1.vault.operations import (
     VaultOperationError,
+    _open_pull_request,
     delete_kv_store_operation,
     delete_kv_store_pull_request_operation,
 )
 from tests.fakes import failing, passing
 
 KV = "myapp"
-FILE = "payments"
-VALUES_PATH = "kv/payments.yaml"
+# A store names its own file now, so the conventional layout is the default here and the
+# grouped one — a file holding several stores, which only an older revision could produce —
+# is set up explicitly by the tests that still exercise it.
+FILE = KV
+VALUES_PATH = f"kv/{KV}.yaml"
+GROUPED_FILE = "payments"
+GROUPED_PATH = f"kv/{GROUPED_FILE}.yaml"
 ROLES = {"read": ["app01.corp.example.com"]}
 ACCOUNT = build_k8s_service_account("vault", "payments", "dev")
 
@@ -76,30 +82,53 @@ async def test_delete_reports_the_merge_and_both_pipelines(bitbucket):
 
 
 async def test_delete_removes_only_the_named_store(bitbucket):
-    """The whole point of many stores per file."""
-    _seed(bitbucket, "sibling", KV, "another")
+    """A grouped file is edited, never deleted — its other stores are not ours to remove.
+
+    Only an older revision of this service could have produced a file like this, but one
+    that exists must not lose two stores because somebody deleted one.
+    """
+    _seed(bitbucket, "sibling", KV, "another", path=GROUPED_PATH)
 
     await _delete(bitbucket)
 
-    assert [s["name"] for s in _committed(bitbucket)["kvStores"]] == [
+    assert bitbucket.deleted == []
+    assert [s["name"] for s in yaml.safe_load(bitbucket.committed[GROUPED_PATH])["kvStores"]] == [
         "sibling",
         "another",
     ]
 
 
-async def test_deleting_the_last_store_leaves_an_empty_file(bitbucket):
-    """The file stays behind so `GET /{file}` keeps answering and a create can append."""
+async def test_deleting_the_only_store_deletes_the_file(bitbucket):
+    """A store names its own file, so removing it removes the file.
+
+    Emptying it to an empty list instead would leave a dead file behind for every store
+    ever deleted, and no create would ever produce that shape.
+    """
     _seed(bitbucket, KV)
 
     await _delete(bitbucket)
 
-    assert bitbucket.committed[VALUES_PATH] == "kvStores: []\n"
-    assert _committed(bitbucket) == {"kvStores": []}
+    assert bitbucket.deleted == [VALUES_PATH]
+    assert VALUES_PATH not in bitbucket.committed
 
 
-async def test_delete_sends_the_optimistic_lock_token(bitbucket):
-    """The file always exists here, so the write is an edit and Bitbucket demands it."""
+async def test_a_file_removal_needs_no_optimistic_lock_token(bitbucket):
+    """Git resolves the path from the branch it fetched, so there is no token to send.
+
+    The token is Bitbucket's, and only the `browse` PUT wants one. A delete that goes
+    through git never calls `get_last_commit` at all.
+    """
     _seed(bitbucket, KV)
+
+    await _delete(bitbucket)
+
+    assert bitbucket.source_commit_ids == []
+    assert "get_last_commit" not in bitbucket.calls
+
+
+async def test_editing_a_grouped_file_still_sends_the_token(bitbucket):
+    """The other branch: the file survives, so the write is an ordinary edit."""
+    _seed(bitbucket, "sibling", KV, path=GROUPED_PATH)
 
     await _delete(bitbucket)
 
@@ -113,12 +142,9 @@ async def test_delete_call_order(bitbucket):
     await _delete(bitbucket)
 
     assert bitbucket.calls == [
-        "get_file_content",  # kv/myapp.yaml — the conventional path, not there
-        "list_files",        # so walk the dir to find which file holds the store
-        "get_file_content",
-        "get_last_commit",
+        "get_file_content",  # kv/myapp.yaml — the conventional path, and the store is there
         "create_branch",
-        "put_file",
+        "delete_file",  # git, not REST: Bitbucket cannot delete a file over REST
         "create_pull_request",
         "await_builds",  # gate 1, on the pull request's commit
         "get_pull_request",  # re-read for the current version
@@ -134,17 +160,18 @@ async def test_delete_names_both_coordinates_in_the_commit(bitbucket):
 
     assert bitbucket.commit_messages == [f"Delete KV store {KV} from {FILE}"]
     stored = bitbucket.pull_requests[result.pull_request.id]
-    assert stored.from_branch == "vault-kv/payments-myapp-abc123"
+    assert stored.from_branch == f"vault-kv/{KV}-abc123"
 
 
 async def test_delete_leaves_another_file_alone(bitbucket):
-    """Only the addressed file is read and written."""
+    """Only the addressed file is touched."""
     _seed(bitbucket, KV)
     _seed(bitbucket, "elsewhere", path="kv/other-team.yaml")
 
     await _delete(bitbucket)
 
-    assert list(bitbucket.committed) == [VALUES_PATH]
+    assert bitbucket.deleted == [VALUES_PATH]
+    assert bitbucket.committed == {}
 
 
 # --------------------------------------------------------------------------- #
@@ -175,8 +202,8 @@ async def test_a_repeat_delete_is_404(bitbucket):
     """The state is idempotent; the status code says which call did the work."""
     _seed(bitbucket, KV)
     await _delete(bitbucket)
-    # The merge lands the emptied file on the base branch.
-    bitbucket.existing_files[VALUES_PATH] = bitbucket.committed[VALUES_PATH]
+    # Simulate the merge landing the removal on the base branch.
+    del bitbucket.existing_files[VALUES_PATH]
 
     with pytest.raises(VaultOperationError) as error:
         await _delete(bitbucket)
@@ -214,12 +241,13 @@ async def test_deleting_a_bound_store_succeeds(bitbucket):
 
 
 async def test_deleting_a_bound_store_removes_its_bindings(bitbucket):
+    """Nothing to unpick: the bindings are inside the store, and the file is gone."""
     _seed_bound(bitbucket, KV)
 
     await _delete(bitbucket)
 
-    assert _committed(bitbucket) == {"kvStores": []}
-    assert "serviceAccount" not in bitbucket.committed[VALUES_PATH]
+    assert bitbucket.deleted == [VALUES_PATH]
+    assert bitbucket.committed == {}
 
 
 async def test_deleting_one_store_leaves_a_siblings_bindings_alone(bitbucket):
@@ -238,13 +266,15 @@ async def test_delete_of_a_grouped_store_walks_to_find_its_file(bitbucket):
     The walk is *resolution*, not a referential scan — there is still nothing pointing at
     this store to check, and only its own file is committed.
     """
-    _seed_bound(bitbucket, KV)
+    _seed_bound(bitbucket, "sibling", KV, path=GROUPED_PATH)
     _seed_bound(bitbucket, "elsewhere", path="kv/platform.yaml")
 
     await _delete(bitbucket)
 
     assert "list_files" in bitbucket.calls
-    assert list(bitbucket.committed) == [VALUES_PATH]
+    # The file survives: it still holds `sibling`, so this is an edit, not a removal.
+    assert list(bitbucket.committed) == [GROUPED_PATH]
+    assert bitbucket.deleted == []
 
 
 async def test_a_store_in_its_own_file_costs_one_read_and_no_walk(bitbucket):
@@ -256,19 +286,19 @@ async def test_a_store_in_its_own_file_costs_one_read_and_no_walk(bitbucket):
 
     assert "list_files" not in bitbucket.calls
     assert bitbucket.calls[0] == "get_file_content"
-    assert list(bitbucket.committed) == ["kv/solo.yaml"]
+    assert bitbucket.deleted == ["kv/solo.yaml"]
 
 
 async def test_pull_request_only_delete_resolves_the_same_way(bitbucket):
     """Both delete paths share `_prepare_delete`, so they cannot resolve differently."""
-    _seed_bound(bitbucket, KV)
+    _seed_bound(bitbucket, "sibling", KV, path=GROUPED_PATH)
     _seed_bound(bitbucket, "elsewhere", path="kv/platform.yaml")
 
     result = await _delete_pr_only(bitbucket)
 
     assert result.status.value == "Succeeded"
-    assert result.file == FILE
-    assert list(bitbucket.committed) == [VALUES_PATH]
+    assert result.file == GROUPED_FILE
+    assert list(bitbucket.committed) == [GROUPED_PATH]
 
 
 async def test_a_binding_on_another_store_never_blocks(bitbucket):
@@ -284,14 +314,16 @@ async def test_delete_of_a_corrupt_grouped_file_names_it(bitbucket):
     Without this the answer is a bare "not defined in any file", which sends an operator
     looking for a deleted store rather than a broken file.
     """
-    bitbucket.existing_files[VALUES_PATH] = "kvStores: [unclosed\n  ::: bad"
+    # Corrupt a *different* file, so the store's own path 404s and the walk is what hits
+    # the bad one. A corrupt file at the conventional path reports its own YAML error.
+    bitbucket.existing_files[GROUPED_PATH] = "kvStores: [unclosed\n  ::: bad"
 
     with pytest.raises(VaultOperationError) as error:
         await _delete(bitbucket)
 
     assert error.value.status_code == 404
     assert "unparseable" in error.value.message
-    assert VALUES_PATH in error.value.message
+    assert GROUPED_PATH in error.value.message
 
 
 async def test_delete_of_a_corrupt_conventional_file_is_reported(bitbucket):
@@ -335,8 +367,9 @@ async def test_failed_validation_declines_and_cleans_up(bitbucket):
 
 async def test_failed_commit_deletes_the_branch(bitbucket):
     _seed(bitbucket, KV)
-    bitbucket.fail_on["put_file"] = ExternalServiceError(
-        service_name="bitbucket", detail="commit rejected", status_code=400
+    # A whole-file delete commits through git, so that is the call that fails here.
+    bitbucket.fail_on["delete_file"] = ExternalServiceError(
+        service_name="bitbucket", detail="git push rejected", status_code=400
     )
 
     with pytest.raises(ExternalServiceError):
@@ -381,12 +414,9 @@ async def test_pull_request_only_stops_at_the_pull_request(bitbucket):
     await _delete_pr_only(bitbucket)
 
     assert bitbucket.calls == [
-        "get_file_content",  # kv/myapp.yaml — the conventional path, not there
-        "list_files",        # so walk the dir to find which file holds the store
-        "get_file_content",
-        "get_last_commit",
+        "get_file_content",  # kv/myapp.yaml — the conventional path, and the store is there
         "create_branch",
-        "put_file",
+        "delete_file",  # git, not REST: Bitbucket cannot delete a file over REST
         "create_pull_request",
     ]
     assert "merge_pull_request" not in bitbucket.calls
@@ -447,3 +477,40 @@ async def test_a_second_pull_request_only_call_opens_a_second_pull_request(bitbu
 
     assert first.pull_request.id != second.pull_request.id
     assert {pr.state for pr in bitbucket.pull_requests.values()} == {"OPEN"}
+
+
+# --------------------------------------------------------------------------- #
+# the remove/content guard
+#
+# `remove=True` is a separate flag rather than `content=None` meaning "delete", because a
+# None arriving by accident would otherwise remove a file instead of raising. These pin
+# that both halves of the guard actually fire — a guard nobody tests is a comment.
+# --------------------------------------------------------------------------- #
+async def test_a_removal_with_content_is_a_programming_error(bitbucket):
+    with pytest.raises(ValueError, match="commits no content"):
+        await _open_pull_request(
+            bitbucket,
+            path=VALUES_PATH,
+            content="kvStores: []\n",
+            remove=True,
+            branch="b",
+            summary="s",
+            description="d",
+        )
+
+    assert bitbucket.calls == []
+
+
+async def test_a_write_without_content_is_a_programming_error(bitbucket):
+    """The dangerous direction: this must raise, never fall through to a delete."""
+    with pytest.raises(ValueError, match="content is required"):
+        await _open_pull_request(
+            bitbucket,
+            path=VALUES_PATH,
+            branch="b",
+            summary="s",
+            description="d",
+        )
+
+    assert bitbucket.calls == []
+    assert bitbucket.deleted == []

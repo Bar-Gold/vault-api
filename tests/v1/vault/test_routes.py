@@ -13,8 +13,8 @@ from tests.fakes import failing, passing
 
 CREATE_URL = f"{config.API_PREFIX}/"
 KV = "myapp"
-FILE = "payments"
-VALUES_PATH = "kv/payments.yaml"
+FILE = KV  # a store names its own file now
+VALUES_PATH = f"kv/{KV}.yaml"
 ROLES = {"read": ["app01.corp.example.com"]}
 
 

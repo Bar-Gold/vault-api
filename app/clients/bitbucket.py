@@ -22,6 +22,10 @@ Endpoints used (Bitbucket Server / Data Center):
   GET    /rest/api/1.0/projects/{k}/repos/{s}/pull-requests/{id}
   POST   /rest/api/1.0/projects/{k}/repos/{s}/pull-requests/{id}/merge?version={v}
   POST   /rest/api/1.0/projects/{k}/repos/{s}/pull-requests/{id}/decline?version={v}
+
+One operation here is **not** REST at all: deleting a file. Bitbucket Server has no
+endpoint for it, so `delete_file` delegates to `app/clients/git.py`, which pushes a
+deleting commit over HTTPS with the same token. See that module for why.
 """
 
 import asyncio
@@ -155,6 +159,7 @@ class BitbucketClient:
         poll_interval: float = 5.0,
         start_timeout: float = 120.0,
         completion_timeout: float = 900.0,
+        git: Optional[Any] = None,
     ) -> None:
         self._client = http_client
         self._project_key = project_key
@@ -163,6 +168,8 @@ class BitbucketClient:
         self.poll_interval = poll_interval
         self.start_timeout = start_timeout
         self.completion_timeout = completion_timeout
+        # The one operation that is not REST. See `delete_file` and `app/clients/git.py`.
+        self._git = git
 
     # ------------------------------------------------------------------ #
     # internals
@@ -245,6 +252,35 @@ class BitbucketClient:
             data=data,
         )
         return response.json()
+
+    async def delete_file(
+        self, path: str, branch: str, base_branch: str, message: str
+    ) -> str:
+        """Commit the removal of `path` on `branch`, and return the new commit's sha.
+
+        **The only operation here that is not REST.** Bitbucket Server has no endpoint that
+        deletes a file: `browse/{path}` is `GET` and `PUT` only, and the `src` resource
+        every search result suggests is Bitbucket *Cloud*. So this delegates to
+        `GitFileRemover`, which pushes a deleting commit over HTTPS using the same access
+        token the REST calls carry. Everything either side of it — the branch, the pull
+        request, both gates, the merge, the rollback — is unchanged.
+
+        Kept on this class rather than handed to `operations.py` separately so the chain
+        still talks to one upstream object, which is also what lets `FakeBitbucket`
+        duck-type it like any other call.
+        """
+        if self._git is None:
+            raise ExternalServiceError(
+                SERVICE_NAME,
+                502,
+                detail=(
+                    "file deletion needs the git client, which is not configured; "
+                    "check BITBUCKET_URL and BITBUCKET_TOKEN"
+                ),
+            )
+        return await self._git.remove_file(
+            path=path, branch=branch, base_branch=base_branch, message=message
+        )
 
     async def _newest_commit_id(self, params: Dict[str, Any]) -> Optional[str]:
         response = await self._request("GET", f"{self._api}/commits", params=params)

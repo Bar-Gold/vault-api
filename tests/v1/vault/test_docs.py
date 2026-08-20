@@ -80,7 +80,7 @@ def test_create_schema_carries_a_readable_example(client):
         },
     }
     assert create["properties"]["kv_name"]["examples"] == ["myapp"]
-    assert "file" not in create["required"]
+    assert "file" not in create["properties"]
 
 
 def test_the_role_example_is_a_distinguished_name(client):
@@ -125,10 +125,10 @@ def test_docs_needs_no_auth(client):
     assert client.get("/openapi.json").status_code == 200
 
 
-def test_the_create_example_omitting_file_still_lands_somewhere(client):
-    """`file` defaults to the store's own name, so the three-field example is complete."""
+def test_the_create_example_is_a_complete_request(client):
+    """The documented example is the whole request — there is no field left to add."""
     from app.v1.vault.schemas import VaultKVCreate
 
     example = client.get("/openapi.json").json()["components"]["schemas"]["VaultKVCreate"]["example"]
 
-    assert VaultKVCreate(**example).file == "athena-passwords"
+    assert VaultKVCreate(**example).kv_name == "athena-passwords"
