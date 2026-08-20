@@ -90,7 +90,7 @@ uv-managed (Python 3.12). Package indexes come from `uv.toml` (internal Artifact
 ```bash
 uv sync --group dev                 # install deps into .venv — ON-PREM ONLY, see below
 uv run --no-sync python -m app.main # serves on 0.0.0.0:5000 (--host/--port override)
-uv run --no-sync pytest             # everything under tests/ (486 tests, ~7s)
+uv run --no-sync pytest             # everything under tests/ (488 tests, ~13s)
 uv run --no-sync pytest tests/v1/vault                                        # one suite
 uv run --no-sync pytest tests/v1/vault/test_operations.py::test_happy_path_call_order  # one test
 docker build -t vault-api . && docker run -p 5000:5000 --env-file .env vault-api
@@ -271,6 +271,7 @@ The binding shape is the pipeline's, so each decision has exactly one home:
 | any entry field name, and camelCase vs snake_case | `_K8S_SA_ENTRY_KEYS` + `build_k8s_service_account` in `helpers.py` |
 | which fields identify a binding | `k8s_service_account_identity` in `helpers.py` |
 | whether an emptied list is dropped or kept as `[]` | `remove_k8s_service_account` in `helpers.py` |
+| sequence indentation and block-scalar style of the committed text | `_BlockStyleDumper` in `helpers.py` |
 | the k8s name patterns and limits | the `K8S_*_PATTERN` / `K8S_*_MAX_LENGTH` constants in `schemas.py` |
 | the branch prefix | `K8S_SA_BRANCH_PREFIX` in `conf.py` |
 
@@ -336,9 +337,20 @@ of 502. The client passes its own `detail_from_response` (digging through
 `{"errors": [{"message": ...}]}`); `default_detail` is the fallback.
 
 **The build-status half of the client is the CI gate.** `get_build_statuses(commit_id)` reads
-`GET {api}/commits/{commitId}/builds` (Bitbucket **7.4+**; the older, non-repo-scoped
-`/rest/build-status/1.0/commits/{commitId}` is the one-line fallback if the instance predates
-it). `await_builds` is two-phase, and the split is not cosmetic:
+`GET /rest/build-status/1.0/commits/{commitId}` — the **only** endpoint here that is not
+repo-scoped, and deliberately the deprecated one. **Do not "modernise" it.** The repo-scoped
+7.4+ replacement, `GET {api}/commits/{commitId}/builds`, takes a **required `key` query
+parameter** and returns the single build carrying that key. A bare call is rejected with
+*"Please specify a non-blank key smaller than 255 characters"*, which surfaces as a 502 on
+every gate; a keyed call cannot enumerate. Enumeration is the whole requirement — the gate
+asks "which builds exist on this sha" before any key is known. This client called the
+repo-scoped resource for a while and no test caught it, because the fakes, the respx mocks
+*and* `tools/stub_upstreams.py` all implemented the invented contract. `test_get_build_statuses_asks_the_unscoped_resource_and_sends_no_key`
+now pins the path and the absence of `key`. If the old resource is ever withdrawn, the
+replacement is to make the expected build keys configuration and fetch each by key — which
+would silently pass a gate for any workflow nobody listed, so it is not the default.
+
+`await_builds` is two-phase, and the split is not cosmetic:
 
 - **phase 1, `find_builds`** — wait for *at least one* build. The forge webhook is
   asynchronous, so a freshly pushed commit has no builds for a few seconds; an empty list can
@@ -411,10 +423,21 @@ deliberate differences:
   identity scans skip non-dict entries, so a hand-edited list cannot wedge an unrelated
   removal.
 
-`render_values_yaml` uses a `SafeDumper` subclass that writes multi-line strings as `|`
-blocks — the default representer emits one escaped, width-wrapped scalar, which is
-unreadable in the pull request diff a human is supposed to review. Only a multi-line
-`description` can trigger it today.
+`render_values_yaml` uses a `SafeDumper` subclass, `_BlockStyleDumper`, that does **two**
+things PyYAML does not do by default, both about the committed text rather than its meaning:
+
+- **`increase_indent` forces block sequences to indent under their key** — `  - name:` and
+  not the flush `- name:` PyYAML emits. Both parse identically, but the indented form is the
+  pipeline's format. `test_rendered_yaml_has_the_expected_shape` pins the exact bytes.
+- **multi-line strings become `|` blocks** — the default representer emits one escaped,
+  width-wrapped scalar, unreadable in the pull request diff a human is supposed to review.
+  Only a multi-line `description` can trigger it today.
+
+Note the consequence of the indent rule landing after files were already committed: the
+first mutation of an old file re-renders it whole, so that one pull request shows a
+reindent of every line alongside the real change. It is cosmetic and happens once per file.
+The no-op short circuit is unaffected — `yaml_data_equals` compares parsed documents, not
+text, so an update that changes nothing still declines to open a pull request.
 
 ## The create chain — read this before editing `operations.py`
 
@@ -437,10 +460,11 @@ are the per-operation shared pieces: each blocking path and its PR-only twin cal
 which is why they cannot diverge on what is a 409 or a 404.
 
 `_walk_values_files(bitbucket)` is the single "read and parse every yaml under
-`VAULT_VALUES_DIR`, skipping unparseable ones with a warning" async generator. **One caller
-today** — the create's store-name scan, since store names are the only thing with a
-values-dir-wide namespace. It stays a separate generator so a second dir-wide question has
-somewhere to go.
+`VAULT_VALUES_DIR`, skipping unparseable ones with a warning" async generator. **Two
+callers**, both because a store name is the one thing with a values-dir-wide namespace:
+`_assert_name_is_free` (the create's duplicate scan) and `_resolve_store`'s step 2, which is
+how every non-create route finds a store without the caller naming a file. Only the latter
+passes `skipped=`, which is what lets its 404 name the unparseable files it walked past.
 
 Update reads the file, applies `update_kv_store`, and **short-circuits when nothing changed**
 — returning success with `pull_request: null` rather than opening an empty PR. It always
@@ -631,7 +655,7 @@ Two details that are easy to break:
 - The committed entries are the contract with the deploy pipeline — change `build_kv_store` /
   `build_k8s_service_account` and the pipeline together. Both are the *sole* writers of their
   own key names.
-- Tests: 486 of them. `tests/test_helpers.py` (pure, no library import), `tests/clients/` (the
+- Tests: 488 of them. `tests/test_helpers.py` (pure, no library import), `tests/clients/` (the
   Bitbucket client — repo operations *and* build statuses — plus `http.py`'s error mapping,
   against the real REST shapes via respx),
   `tests/v1/vault/` (schemas, the chain + rollbacks with duck-typed fakes from `tests/fakes.py`,

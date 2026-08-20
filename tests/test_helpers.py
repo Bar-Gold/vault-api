@@ -125,16 +125,35 @@ def test_rendered_yaml_round_trips():
 
 
 def test_rendered_yaml_has_the_expected_shape():
+    """Byte-for-byte, because this text is the contract with the deploy pipeline.
+
+    Note the sequence indentation: list items sit **under** their key, not flush with it.
+    PyYAML's default is the flush ("indentless") form, which parses identically but is not
+    the format the pipeline's chart expects — so `_BlockStyleDumper.increase_indent` forces
+    this shape and this assertion is what stops it regressing.
+    """
     rendered = render_values_yaml(_document("myapp"))
 
     assert rendered == (
         "kvStores:\n"
-        "- name: myapp\n"
-        "  description: payments secrets\n"
-        "  roles:\n"
-        "    read:\n"
-        "    - app01.corp.example.com\n"
+        "  - name: myapp\n"
+        "    description: payments secrets\n"
+        "    roles:\n"
+        "      read:\n"
+        "        - app01.corp.example.com\n"
     )
+
+
+def test_nested_sequences_are_indented_too():
+    """The indent rule is not special-cased to kvStores — every sequence gets it."""
+    document = build_kv_stores_document([_store()])
+    document = add_k8s_service_account(
+        document, "myapp", build_k8s_service_account("vault", "payments", "dev")
+    )
+
+    rendered = render_values_yaml(document)
+
+    assert "      k8sServiceAccounts:\n        - serviceAccount: vault\n" in rendered
 
 
 def test_multi_line_strings_render_as_block_scalars():

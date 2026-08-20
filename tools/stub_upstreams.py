@@ -330,12 +330,18 @@ async def get_raw(key: str, slug: str, path: str, at: Optional[str] = None):
 # --------------------------------------------------------------------------- #
 # Bitbucket — build statuses
 # --------------------------------------------------------------------------- #
-@app.get("/rest/api/1.0/projects/{key}/repos/{slug}/commits/{commit_id}/builds")
-async def get_builds(key: str, slug: str, commit_id: str, start: int = 0, limit: int = 100):
+@app.get("/rest/build-status/1.0/commits/{commit_id}")
+async def get_builds(commit_id: str, start: int = 0, limit: int = 100):
     """A commit's Builds tab, settling one poll at a time.
 
     Reading is what advances a build here — the same trick the pipeline poller used —
     so `polls` controls how many reads it stays INPROGRESS.
+
+    Note the path: this resource is **not repo-scoped**, which is the whole reason the
+    client uses it. The repo-scoped 7.4+ replacement requires a `key` query parameter and
+    returns one build, so it cannot answer "which builds exist on this sha". An earlier
+    version of this stub served that path and accepted a bare request, which is what let
+    the client's bug survive every test — do not "modernise" it back.
     """
     builds = state.builds.get(commit_id, [])
     for build in builds:

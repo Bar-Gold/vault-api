@@ -207,7 +207,28 @@ def add_kv_store(
 
 
 class _BlockStyleDumper(yaml.SafeDumper):
-    """SafeDumper that writes multi-line strings as block scalars."""
+    """SafeDumper that indents block sequences and writes multi-line strings as blocks."""
+
+    def increase_indent(self, flow: bool = False, indentless: bool = False) -> Any:
+        """Indent list items under their parent key, instead of flush with it.
+
+        PyYAML defaults to the "indentless" form, which is valid YAML and parses
+        identically::
+
+            kvStores:
+            - name: athena-passwords
+
+        but the deploy pipeline's format (and every hand-written values file) puts the
+        dash under the key::
+
+            kvStores:
+              - name: athena-passwords
+
+        Passing `indentless=False` unconditionally is the documented way to get that. It
+        applies to every sequence, so `roles` entries and `k8sServiceAccounts` indent the
+        same way — the committed file has one style throughout.
+        """
+        return super().increase_indent(flow=flow, indentless=False)
 
 
 def _represent_str(dumper: yaml.Dumper, data: str) -> Any:

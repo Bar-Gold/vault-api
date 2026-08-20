@@ -111,8 +111,10 @@ alternative — but it has two consequences:
   is merged, a failing deploy build is *reported*, not undone — un-merging needs a revert PR,
   which is a human decision. The error message says so explicitly.
 
-**What a gate actually reads.** `GET /rest/api/1.0/projects/{k}/repos/{s}/commits/{sha}/builds`
-(Bitbucket 7.4+), polled until every build on that commit has left `INPROGRESS`. `SUCCESSFUL`
+**What a gate actually reads.** `GET /rest/build-status/1.0/commits/{sha}`, polled until every
+build on that commit has left `INPROGRESS`. That resource is deprecated but is the only one
+that *lists* a commit's builds: the repo-scoped 7.4+ replacement requires a `key` parameter and
+answers with one build, which cannot serve a gate that does not know the keys yet. `SUCCESSFUL`
 is the only pass — `CANCELLED` and `UNKNOWN` are terminal *and* failures. A commit can carry
 several builds (Bitbucket keeps one per key, so one per workflow), and **all** of them must be
 green. An empty list is never "finished": the forge webhook is asynchronous, so the gate first

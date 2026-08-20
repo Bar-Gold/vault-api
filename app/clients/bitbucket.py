@@ -11,13 +11,13 @@ It is also the **only** upstream: the CI gates are read from Bitbucket's own bui
 store — the thing behind a pull request's *Builds* tab — rather than from the CI server's
 API. See the build-status section at the bottom of this module.
 
-Endpoints used (Bitbucket Server 7.4+/Data Center):
+Endpoints used (Bitbucket Server / Data Center):
   POST   /rest/branch-utils/1.0/projects/{k}/repos/{s}/branches
   DELETE /rest/branch-utils/1.0/projects/{k}/repos/{s}/branches
   PUT    /rest/api/1.0/projects/{k}/repos/{s}/browse/{path}
   GET    /rest/api/1.0/projects/{k}/repos/{s}/files/{dir}?at={ref}
   GET    /rest/api/1.0/projects/{k}/repos/{s}/commits?path={p}&until={ref}
-  GET    /rest/api/1.0/projects/{k}/repos/{s}/commits/{commitId}/builds
+  GET    /rest/build-status/1.0/commits/{commitId}          <- NOT repo-scoped, see below
   POST   /rest/api/1.0/projects/{k}/repos/{s}/pull-requests
   GET    /rest/api/1.0/projects/{k}/repos/{s}/pull-requests/{id}
   POST   /rest/api/1.0/projects/{k}/repos/{s}/pull-requests/{id}/merge?version={v}
@@ -35,6 +35,15 @@ from tashtiot_apis_library.connectors import ExternalServiceError
 from . import http
 
 SERVICE_NAME = "bitbucket"
+
+# The build-status store, and the one endpoint here that is **not** repo-scoped.
+#
+# Read the note above `get_build_statuses` before changing this. The short version: the
+# repo-scoped 7.4+ resource
+# (`/rest/api/1.0/projects/{k}/repos/{s}/commits/{commitId}/builds`) *requires* a `key`
+# query parameter and returns that one build — it cannot enumerate. This service does not
+# know the keys in advance, so it uses the older resource, which lists them all.
+BUILD_STATUS_API = "/rest/build-status/1.0"
 
 # Bitbucket's own vocabulary for a build result. `INPROGRESS` is the only state that is not
 # final — `CANCELLED` and `UNKNOWN` are terminal *and* not success, so a gate that keyed off
@@ -379,6 +388,25 @@ class BitbucketClient:
     # per-forge branch/ref/refspec guessing, and no "ignore anything that existed before we
     # started" watermark — the commit we are asking about was created seconds ago by
     # `put_file`, so every build on it is ours by construction.
+    #
+    # **Why the old, non-repo-scoped resource.** Bitbucket 7.4 added a repo-scoped
+    # `/rest/api/1.0/projects/{k}/repos/{s}/commits/{commitId}/builds`, and this client used
+    # to call it — incorrectly. That resource takes a **required `key` query parameter** and
+    # answers with the single build carrying that key; calling it bare is rejected with
+    # "Please specify a non-blank key smaller than 255 characters", which surfaced here as a
+    # 502 on every gate. It cannot enumerate, and enumeration is the entire requirement: the
+    # gate's question is "which builds exist on this sha", asked before we know their keys.
+    #
+    # `/rest/build-status/1.0/commits/{commitId}` still answers exactly that, as a normal
+    # page of results. It is deprecated (superseded in 7.14, and it does not carry Rich
+    # Build Status), so it is worth re-checking on a major Bitbucket upgrade. The alternative
+    # if it is ever withdrawn is to make the expected build keys configuration and fetch each
+    # one by key — more config, and it would silently pass a gate for a workflow nobody
+    # remembered to list, which is why it is not the default.
+    #
+    # The trade-off of the older resource: it is **not repo-scoped**, so it answers for a
+    # commit id wherever that commit lives. Harmless here — the sha was produced by this
+    # service moments earlier, so there is nothing to confuse it with.
     # ------------------------------------------------------------------ #
     async def get_build_statuses(
         self, commit_id: str, page_size: int = 100
@@ -394,7 +422,7 @@ class BitbucketClient:
         while True:
             response = await self._request(
                 "GET",
-                f"{self._api}/commits/{commit_id}/builds",
+                f"{BUILD_STATUS_API}/commits/{commit_id}",
                 params={"limit": page_size, "start": start},
             )
             body = response.json()

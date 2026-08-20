@@ -15,6 +15,10 @@ from app.clients.bitbucket import BitbucketClient, BuildTimeoutError, PullReques
 BASE = "https://bitbucket.test"
 API = f"{BASE}/rest/api/1.0/projects/INFRA/repos/vault-values"
 BRANCH_API = f"{BASE}/rest/branch-utils/1.0/projects/INFRA/repos/vault-values"
+# Deliberately *not* under API: the build-status resource is not repo-scoped, and the
+# repo-scoped one that replaced it cannot list a commit's builds without already knowing
+# their keys. See the note above `get_build_statuses`.
+BUILD_STATUS_API = f"{BASE}/rest/build-status/1.0"
 
 
 @pytest.fixture
@@ -432,8 +436,8 @@ def _build(key="ci/woodpecker/pr/build", state="SUCCESSFUL", **extra):
 
 
 @respx.mock
-async def test_get_build_statuses_hits_the_commit_builds_endpoint(bitbucket):
-    route = respx.get(f"{API}/commits/deadbeef/builds").mock(
+async def test_get_build_statuses_hits_the_build_status_resource(bitbucket):
+    route = respx.get(f"{BUILD_STATUS_API}/commits/deadbeef").mock(
         return_value=httpx.Response(200, json=_builds_page(_build()))
     )
 
@@ -447,8 +451,32 @@ async def test_get_build_statuses_hits_the_commit_builds_endpoint(bitbucket):
 
 
 @respx.mock
+async def test_get_build_statuses_asks_the_unscoped_resource_and_sends_no_key(bitbucket):
+    """Regression: the gate must not use the repo-scoped 7.4+ builds resource.
+
+    That one requires a `key` query parameter and answers with the single build carrying
+    it, so a bare call is rejected ("Please specify a non-blank key smaller than 255
+    characters") and a keyed call cannot enumerate. The gate's question is "which builds
+    exist on this sha", asked before any key is known — only the unscoped resource answers
+    it. Pinning the path *and* the absence of `key` keeps a well-meaning "use the modern
+    endpoint" change from reintroducing a 502 on every create.
+    """
+    route = respx.get(f"{BUILD_STATUS_API}/commits/deadbeef").mock(
+        return_value=httpx.Response(200, json=_builds_page(_build()))
+    )
+
+    await bitbucket.get_build_statuses("deadbeef")
+
+    request_url = route.calls[0].request.url
+    assert request_url.path == "/rest/build-status/1.0/commits/deadbeef"
+    assert "key" not in request_url.params
+    # Nothing about the gate may depend on the project or repo — this resource has neither.
+    assert "projects" not in request_url.path
+
+
+@respx.mock
 async def test_get_build_statuses_follows_pagination(bitbucket):
-    respx.get(f"{API}/commits/deadbeef/builds").mock(
+    respx.get(f"{BUILD_STATUS_API}/commits/deadbeef").mock(
         side_effect=[
             httpx.Response(
                 200, json=_builds_page(_build(key="a"), is_last=False, next_start=1)
@@ -465,7 +493,7 @@ async def test_get_build_statuses_follows_pagination(bitbucket):
 @respx.mock
 async def test_a_commit_with_no_builds_is_an_empty_list_not_an_error(bitbucket):
     """The webhook is asynchronous, so 'nothing yet' is the normal first answer."""
-    respx.get(f"{API}/commits/deadbeef/builds").mock(
+    respx.get(f"{BUILD_STATUS_API}/commits/deadbeef").mock(
         return_value=httpx.Response(200, json=_builds_page())
     )
 
@@ -485,7 +513,7 @@ async def test_a_commit_with_no_builds_is_an_empty_list_not_an_error(bitbucket):
 @respx.mock
 async def test_every_bitbucket_state_is_classified(bitbucket, state, terminal, succeeded):
     """CANCELLED and UNKNOWN are the ones a 'not FAILED' gate would wave through."""
-    respx.get(f"{API}/commits/deadbeef/builds").mock(
+    respx.get(f"{BUILD_STATUS_API}/commits/deadbeef").mock(
         return_value=httpx.Response(200, json=_builds_page(_build(state=state)))
     )
 
@@ -497,7 +525,7 @@ async def test_every_bitbucket_state_is_classified(bitbucket, state, terminal, s
 
 @respx.mock
 async def test_await_builds_returns_once_everything_is_terminal(bitbucket):
-    respx.get(f"{API}/commits/deadbeef/builds").mock(
+    respx.get(f"{BUILD_STATUS_API}/commits/deadbeef").mock(
         side_effect=[
             httpx.Response(200, json=_builds_page(_build(state="INPROGRESS"))),
             httpx.Response(200, json=_builds_page(_build(state="SUCCESSFUL"))),
@@ -512,7 +540,7 @@ async def test_await_builds_returns_once_everything_is_terminal(bitbucket):
 @respx.mock
 async def test_await_builds_waits_for_the_slowest_workflow(bitbucket):
     """One result per key, so a green build alongside a running one is not a pass yet."""
-    respx.get(f"{API}/commits/deadbeef/builds").mock(
+    respx.get(f"{BUILD_STATUS_API}/commits/deadbeef").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -539,7 +567,7 @@ async def test_await_builds_waits_for_the_slowest_workflow(bitbucket):
 @respx.mock
 async def test_await_builds_times_out_when_nothing_is_ever_reported(bitbucket):
     """An empty list can never mean 'finished' — that is the whole first phase."""
-    respx.get(f"{API}/commits/deadbeef/builds").mock(
+    respx.get(f"{BUILD_STATUS_API}/commits/deadbeef").mock(
         return_value=httpx.Response(200, json=_builds_page())
     )
 
@@ -552,7 +580,7 @@ async def test_await_builds_times_out_when_nothing_is_ever_reported(bitbucket):
 
 @respx.mock
 async def test_await_builds_times_out_and_reports_what_it_saw(bitbucket):
-    respx.get(f"{API}/commits/deadbeef/builds").mock(
+    respx.get(f"{BUILD_STATUS_API}/commits/deadbeef").mock(
         return_value=httpx.Response(200, json=_builds_page(_build(state="INPROGRESS")))
     )
 
@@ -566,7 +594,7 @@ async def test_await_builds_times_out_and_reports_what_it_saw(bitbucket):
 @respx.mock
 async def test_excluded_keys_are_invisible_to_both_phases(bitbucket):
     """The fast-forward case: gate 1's results sit on the very commit gate 2 asks about."""
-    respx.get(f"{API}/commits/deadbeef/builds").mock(
+    respx.get(f"{BUILD_STATUS_API}/commits/deadbeef").mock(
         return_value=httpx.Response(
             200, json=_builds_page(_build(key="ci/woodpecker/pr/build"))
         )
@@ -584,7 +612,7 @@ async def test_excluded_keys_are_invisible_to_both_phases(bitbucket):
 @respx.mock
 async def test_a_build_read_failure_is_mapped_not_swallowed(bitbucket):
     """An unknown sha 404s, and that must surface rather than look like 'no builds yet'."""
-    respx.get(f"{API}/commits/nosuch/builds").mock(
+    respx.get(f"{BUILD_STATUS_API}/commits/nosuch").mock(
         return_value=httpx.Response(404, json={"errors": [{"message": "Commit not found"}]})
     )
 

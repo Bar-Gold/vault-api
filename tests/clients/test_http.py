@@ -101,8 +101,7 @@ async def test_bitbucket_unreachable_is_a_bad_gateway_not_a_crash():
 async def test_an_unreachable_build_status_read_is_a_bad_gateway_too():
     """The gates go through the same funnel, so a dead Bitbucket is a 502 mid-chain."""
     respx.get(
-        "https://bitbucket.test/rest/api/1.0/projects/INFRA/repos/vault-values"
-        "/commits/deadbeef/builds"
+        "https://bitbucket.test/rest/build-status/1.0/commits/deadbeef"
     ).mock(side_effect=httpx.ReadTimeout("read timed out"))
     bitbucket = BitbucketClient(
         httpx.AsyncClient(base_url="https://bitbucket.test"),
