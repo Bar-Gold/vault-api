@@ -228,18 +228,30 @@ async def _delete_branch_quietly(bitbucket: Any, branch: str) -> None:
         logger.exception(f"Failed deleting branch {branch}: {cleanup_error}")
 
 
-async def _decline_and_cleanup(bitbucket: Any, pull_request: PullRequest, branch: str) -> None:
-    """Close the PR and remove the branch after a failed validation pipeline."""
+async def _decline_and_cleanup(
+    bitbucket: Any, pull_request: PullRequest, branch: str
+) -> PullRequest:
+    """Close the PR and remove the branch after a failed validation pipeline.
+
+    **Returns the pull request as it now stands**, which is what the caller reports. The
+    argument still says `OPEN` — it was read before the decline — so reporting it would
+    tell a caller to go review a pull request that is closed and whose branch is gone.
+    On a decline that itself failed the original is handed back unchanged, because the
+    pull request really is still open then and claiming otherwise is the same lie
+    inverted.
+    """
+    declined = pull_request
     try:
         # Re-read the PR: CI status updates and reviewer activity bump Bitbucket's
         # optimistic-locking `version`, and declining with a stale one is rejected.
         current = await bitbucket.get_pull_request(pull_request.id)
-        await bitbucket.decline_pull_request(current.id, current.version)
+        declined = await bitbucket.decline_pull_request(current.id, current.version)
     except Exception as cleanup_error:
         logger.exception(
             f"Failed declining pull request {pull_request.id}: {cleanup_error}"
         )
     await _delete_branch_quietly(bitbucket, branch)
+    return declined
 
 
 # --------------------------------------------------------------------------- #
@@ -502,32 +514,32 @@ async def _open_and_validate(
         # Without the source commit there is no sha to ask about, and reporting an
         # unvalidated pull request as validated is not the fallback — roll all the way
         # back rather than degrade the gate.
-        await _decline_and_cleanup(bitbucket, pull_request, branch)
+        declined = await _decline_and_cleanup(bitbucket, pull_request, branch)
         raise VaultOperationError(
             f"Bitbucket did not report a source commit for pull request "
             f"{pull_request.id}, so its builds cannot be watched",
             kv_name=kv_name,
-            pull_request=pull_request,
+            pull_request=declined,
         )
 
     try:
         validation = await bitbucket.await_builds(pull_request.from_commit)
     except BuildTimeoutError as timeout_error:
-        await _decline_and_cleanup(bitbucket, pull_request, branch)
+        declined = await _decline_and_cleanup(bitbucket, pull_request, branch)
         raise VaultOperationError(
             f"Validation build did not complete: {timeout_error.message}",
             kv_name=kv_name,
             status_code=504,
-            pull_request=pull_request,
+            pull_request=declined,
             validation_builds=timeout_error.builds,
         ) from timeout_error
 
     if not all(build.succeeded for build in validation):
-        await _decline_and_cleanup(bitbucket, pull_request, branch)
+        declined = await _decline_and_cleanup(bitbucket, pull_request, branch)
         raise VaultOperationError(
             _build_failure("Validation", validation),
             kv_name=kv_name,
-            pull_request=pull_request,
+            pull_request=declined,
             validation_builds=validation,
         )
 
@@ -1013,7 +1025,11 @@ async def upsert_tashtiot_access_operation(
         removes=[],
     )
 
+    # Two tenses, because the same word cannot serve both positions: the summary and
+    # description read as a completed act ("Created Tashtiot access"), the message as an
+    # intent ("to create"). One shared verb gave "to created".
     verb = "updated" if current is not None else "created"
+    infinitive = "update" if current is not None else "create"
     pull_request, validation = await _open_and_validate(
         bitbucket,
         change=change,
@@ -1026,7 +1042,7 @@ async def upsert_tashtiot_access_operation(
     return VaultOperationResponse(
         status=OperationStatus.SUCCEEDED,
         message=(
-            f"Opened pull request {pull_request.id} to {verb} "
+            f"Opened pull request {pull_request.id} to {infinitive} "
             f"{config.TASHTIOT_DIR} access for {team}. "
             f"It passed validation and is waiting for review."
         ),

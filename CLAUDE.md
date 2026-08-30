@@ -96,7 +96,7 @@ uv-managed (Python 3.12). Package indexes come from `uv.toml` (internal Artifact
 ```bash
 uv sync --group dev                 # install deps into .venv — ON-PREM ONLY, see below
 uv run --no-sync python -m app.main # serves on 0.0.0.0:5000 (--host/--port override)
-uv run --no-sync pytest             # everything under tests/ (305 tests, ~18s)
+uv run --no-sync pytest             # everything under tests/ (316 tests, ~22s)
 uv run --no-sync pytest tests/v1/vault                                        # one suite
 uv run --no-sync pytest tests/v1/vault/test_operations.py::test_create_call_order      # one test
 docker build -t vault-api . && docker run -p 5000:5000 --env-file .env vault-api
@@ -484,7 +484,14 @@ There is **no transaction**; each step hand-rolls its own rollback:
 
 Rollback failures are logged and never raised over the original error.
 
-Two details that are easy to break:
+Three details that are easy to break:
+- **A rolled-back failure reports the pull request as `DECLINED`, not `OPEN`.**
+  `_decline_and_cleanup` **returns** the declined pull request and the three raise sites in
+  `_open_and_validate` report *that*, not the pre-decline object they were holding. Reporting
+  the stale one sends a caller to review a pull request that is closed and whose branch is
+  gone. The inverse matters too: a decline that itself failed hands back the original, because
+  the pull request really is still open then — `test_a_failed_decline_still_reports_the_pull_request_as_open`
+  pins that direction so the fix cannot become "always say DECLINED".
 - **The version re-read before declining.** Bitbucket's `version` is an optimistic lock that
   CI status updates bump, so `_decline_and_cleanup` re-reads the pull request rather than
   declining with the stale version `create_pull_request` returned.
@@ -601,7 +608,7 @@ merged its pull request. It is also why a repeat create opens a second pull requ
   the failure path silently omits it unless `to_response()` is updated too.
 - The committed entries are the contract with the deploy pipeline — change
   `build_oidc_access_entry` / `build_k8s_access_entry` and the pipeline together.
-- Tests: 305 of them. `tests/test_helpers.py` (pure, no library import — the document model
+- Tests: 316 of them. `tests/test_helpers.py` (pure, no library import — the document model
   and the exact committed bytes), `tests/clients/` (the Bitbucket client and `http.py`'s error
   mapping against the real REST shapes via respx, plus `test_git.py` running **real git
   against a real bare repo** in a temp dir), `tests/v1/vault/` (schemas, the chain + rollbacks
@@ -631,6 +638,14 @@ merged its pull request. It is also why a repeat create opens a second pull requ
     only a merge would remove it there, so a test wanting the merged state says so.
   - `FakeBitbucket.get_pull_request` bumps `version` on every call, reproducing the real
     optimistic-lock trap.
+  - **Every pull-request method returns a `replace()` copy, never the stored object.** The
+    real client parses a fresh `PullRequest` out of each response, so an object a caller
+    already holds cannot be edited later by the server. Returning the stored instance made
+    the fake *structurally unable* to catch a caller reporting a stale pull request: a
+    decline mutated the very object the caller was holding, so the wrong answer corrected
+    itself. That is the same shape of fake that let the build-status bug through a green
+    suite — a fake that agrees with itself. If you add a method returning a `PullRequest`,
+    return a copy.
   - `FakeBitbucket(builds=[...])` is a **queue** popped once per `await_builds`, so element 0
     is the validation gate and element 1 the deploy gate; an `Exception` in the list is raised
     instead of returned. Running dry is an `AssertionError`, so a test running two full chains

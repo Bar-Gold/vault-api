@@ -349,6 +349,39 @@ def test_tashtiot_upsert_writes_one_flat_file(client, auth_headers, bitbucket):
     assert list(bitbucket.committed) == [TASHTIOT_PATH]
 
 
+def test_the_tashtiot_message_reads_as_an_intent_not_a_past_act(
+    client, auth_headers, bitbucket
+):
+    """"to create", never "to created".
+
+    The summary and the message need different tenses off the same create/update
+    decision, and sharing one verb between them produced "to created".
+    """
+    created = client.put(TASHTIOT_URL, json=TASHTIOT_BODY, headers=auth_headers)
+    assert "to create " in created.json()["message"]
+    assert "to created" not in created.json()["message"]
+
+    # ...and the update branch of the same decision.
+    bitbucket.existing_files[TASHTIOT_PATH] = bitbucket.committed[TASHTIOT_PATH]
+    bitbucket.builds = [passing()]
+    updated = client.put(
+        TASHTIOT_URL,
+        json={"access": [
+            {"path": "*", "auth_type": "oidc", "dn": DN, "capabilities": ["read"]}
+        ]},
+        headers=auth_headers,
+    )
+    assert "to update " in updated.json()["message"]
+    assert "to updated" not in updated.json()["message"]
+
+
+def test_the_tashtiot_pull_request_title_stays_past_tense(client, auth_headers, bitbucket):
+    """The summary is the other half of that split — it must not follow the message."""
+    client.put(TASHTIOT_URL, json=TASHTIOT_BODY, headers=auth_headers)
+
+    assert bitbucket.pull_requests[101].title.startswith("Created ")
+
+
 def test_tashtiot_mixes_both_kinds_in_one_list(client, auth_headers, bitbucket):
     """The whole difference from a store: no split by authType."""
     client.put(TASHTIOT_URL, json=TASHTIOT_BODY, headers=auth_headers)

@@ -63,6 +63,39 @@ async def test_a_store_with_no_k8s_grants_writes_no_k8s_file(bitbucket, oidc_onl
     assert list(bitbucket.committed) == [OIDC_PATH]
 
 
+async def test_a_store_with_no_oidc_grants_writes_no_oidc_file(bitbucket, k8s_only_payload):
+    """The mirror of the above, and the direction that had no test.
+
+    Either kind on its own is a valid store; only an *empty* access list is refused. A
+    create carrying k8s grants alone must therefore commit exactly one file, and it must
+    be the k8s one.
+    """
+    await _create(bitbucket, k8s_only_payload)
+
+    assert list(bitbucket.committed) == [K8S_PATH]
+    assert _committed(bitbucket, K8S_PATH)["access"][0]["authType"] == "k8s"
+
+
+async def test_each_kind_lands_in_the_file_named_for_it(bitbucket, payload):
+    """oidc grants to oidc-access.yaml, k8s grants to k8s-access.yaml — never crossed."""
+    await _create(bitbucket, payload)
+
+    assert OIDC_PATH.endswith("/oidc-access.yaml")
+    assert K8S_PATH.endswith("/k8s-access.yaml")
+    for path, expected in ((OIDC_PATH, "oidc"), (K8S_PATH, "k8s")):
+        kinds = {entry["authType"] for entry in _committed(bitbucket, path)["access"]}
+        assert kinds == {expected}
+
+
+async def test_both_files_sit_in_the_team_and_store_directory(bitbucket, payload):
+    """The committed paths are '<values>/<team>/<kv_name>/<file>' and nothing else."""
+    await _create(bitbucket, payload)
+
+    for path in bitbucket.committed:
+        assert path.startswith(f"{STORE_DIR}/")
+        assert path.split("/")[-3:-1] == [TEAM, KV]
+
+
 async def test_create_returns_the_success_message(bitbucket, payload):
     result = await _create(bitbucket, payload)
 
@@ -205,6 +238,53 @@ async def test_a_build_timeout_declines_and_deletes(bitbucket, payload):
 
     assert error.value.status_code == 504
     assert bitbucket.calls[-2:] == ["decline_pull_request", "delete_branch"]
+
+
+# --------------------------------------------------------------------------- #
+# what a rolled-back failure *reports*
+#
+# The call order above proves the rollback ran. These prove the response describes the
+# world it left behind: the pull request the caller is told about was declined, and its
+# branch is gone, so a caller keying off `state` is not sent to review a closed PR.
+# --------------------------------------------------------------------------- #
+async def test_a_red_build_reports_the_pull_request_as_declined(bitbucket, payload):
+    bitbucket.builds = [failing()]
+
+    with pytest.raises(VaultOperationError) as error:
+        await _create(bitbucket, payload)
+
+    assert error.value.pull_request is not None
+    assert error.value.pull_request.state == "DECLINED"
+    assert error.value.to_response().pull_request.state == "DECLINED"
+
+
+async def test_a_build_timeout_reports_the_pull_request_as_declined(bitbucket, payload):
+    from app.clients.bitbucket import BuildTimeoutError
+
+    bitbucket.builds = [BuildTimeoutError("nothing reported", [])]
+
+    with pytest.raises(VaultOperationError) as error:
+        await _create(bitbucket, payload)
+
+    assert error.value.pull_request.state == "DECLINED"
+
+
+async def test_a_failed_decline_still_reports_the_pull_request_as_open(bitbucket, payload):
+    """The inverse lie is just as bad: if the decline failed, the PR really is still open.
+
+    `_decline_and_cleanup` swallows its own failure by design — a rollback error must not
+    replace the original one — so the state it reports has to come from what actually
+    happened, not from having attempted it.
+    """
+    bitbucket.builds = [failing()]
+    bitbucket.fail_on["decline_pull_request"] = RuntimeError("bitbucket said no")
+
+    with pytest.raises(VaultOperationError) as error:
+        await _create(bitbucket, payload)
+
+    assert error.value.pull_request.state == "OPEN"
+    # The original failure survives; the rollback's own failure is logged, not raised.
+    assert "Validation did not pass" in error.value.message
 
 
 

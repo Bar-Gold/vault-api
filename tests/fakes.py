@@ -9,6 +9,7 @@ There is only one fake now: Bitbucket is the only upstream, because the CI gates
 build statuses the pipelines post into Bitbucket rather than asking a CI server.
 """
 
+from dataclasses import replace
 from typing import Any, Dict, FrozenSet, List, Optional
 
 from tashtiot_apis_library.connectors import ExternalServiceError
@@ -166,7 +167,10 @@ class FakeBitbucket:
         )
         self.pull_requests[pull_request.id] = pull_request
         self._next_id += 1
-        return pull_request
+        # A copy, so the caller's object is a *snapshot* — the real client parses a fresh
+        # object out of each response, so a later server-side change (a decline, a version
+        # bump) cannot reach backwards and edit a reference the caller already holds.
+        return replace(pull_request)
 
     async def get_pull_request(self, pull_request_id: int) -> PullRequest:
         self._record("get_pull_request")
@@ -174,7 +178,7 @@ class FakeBitbucket:
         # CI status updates bump Bitbucket's optimistic-locking version; simulate that so
         # the operation is forced to re-read it before merging/declining.
         stored.version += 1
-        return stored
+        return replace(stored)
 
     async def merge_pull_request(self, pull_request_id: int, version: int) -> PullRequest:
         self._record("merge_pull_request")
@@ -187,7 +191,12 @@ class FakeBitbucket:
         self._record("decline_pull_request")
         stored = self.pull_requests[pull_request_id]
         stored.state = "DECLINED"
-        return stored
+        # Hand back a *separate* object, as the real client does — it builds a fresh
+        # `PullRequest.from_api(response.json())`. Returning `stored` itself would make
+        # the caller's pre-decline reference and this result the same object, so a caller
+        # that wrongly reported the stale one would still look correct here. That is the
+        # shape of fake that let the build-status bug through a full green suite.
+        return replace(stored)
 
     async def await_builds(
         self, commit_id: str, exclude_keys: FrozenSet[str] = frozenset(), **kwargs

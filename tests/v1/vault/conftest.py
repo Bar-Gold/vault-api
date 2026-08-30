@@ -91,6 +91,30 @@ def oidc_only_payload():
 
 
 @pytest.fixture
+def k8s_only_payload():
+    """The mirror: a create with no OIDC grants, which must write no oidc-access.yaml.
+
+    Neither kind is individually required — the format's own wording is "k8s-access.yaml
+    ... if applicable" — so both single-kind directions have to hold, not just the common
+    one.
+    """
+    return VaultKVCreate(
+        team=TEAM,
+        kv_name=KV,
+        access=[
+            {
+                "path": "*",
+                "auth_type": "k8s",
+                "name": "cloudops-external-secrets",
+                "namespace": "cloudops",
+                "cluster": "dev",
+                "capabilities": ["read"],
+            }
+        ],
+    )
+
+
+@pytest.fixture
 def grant_payload():
     """One grant to append to an existing store."""
     return OidcAccessEntry(
