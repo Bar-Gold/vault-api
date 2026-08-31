@@ -90,6 +90,16 @@ def test_the_example_shows_both_kinds_of_grant(client):
     assert [entry["auth_type"] for entry in example["access"]] == ["oidc", "k8s"]
 
 
+def test_the_tashtiot_example_shows_both_kinds_of_grant(client):
+    """The flat file mixes both kinds in one list, so an oidc-only example reads as if
+    a Kubernetes grant belonged somewhere else."""
+    example = client.get("/openapi.json").json()["components"]["schemas"][
+        "TashtiotAccessUpsert"
+    ]["example"]
+
+    assert [entry["auth_type"] for entry in example["access"]] == ["oidc", "k8s"]
+
+
 def test_the_dn_example_is_a_distinguished_name(client):
     """The files carry LDAP DNs, not hostnames — the example has to show the real thing."""
     example = client.get("/openapi.json").json()["components"]["schemas"][

@@ -381,7 +381,15 @@ class TashtiotAccessUpsert(BaseModel):
                         "auth_type": "oidc",
                         "dn": "CN=cloudops,OU=Groups,DC=corp,DC=example,DC=com",
                         "capabilities": ["read"],
-                    }
+                    },
+                    {
+                        "path": "services/+/redis/*",
+                        "auth_type": "k8s",
+                        "name": "cloudops-external-secrets",
+                        "namespace": "cloudops",
+                        "cluster": "dev",
+                        "capabilities": ["read"],
+                    },
                 ]
             }
         },
