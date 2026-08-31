@@ -28,6 +28,7 @@ from .conf import config
 from .operations import (
     VaultOperationError,
     add_access_entry_operation,
+    add_tashtiot_access_entry_operation,
     create_kv_mount_operation,
     delete_kv_store_operation,
     delete_tashtiot_access_operation,
@@ -35,6 +36,7 @@ from .operations import (
     get_tashtiot_access_operation,
     list_kv_stores_operation,
     remove_access_entry_operation,
+    remove_tashtiot_access_entry_operation,
     update_kv_mount_operation,
     upsert_tashtiot_access_operation,
 )
@@ -265,13 +267,17 @@ async def _read(operation: Any) -> Any:
 
 def get_v1_vault_router(bitbucket: Any) -> APIRouter:
     """Create the APIRouter for Vault KV operations."""
-    router = APIRouter(prefix=config.API_PREFIX, tags=config.API_TAGS)
+    # No `tags=` on the router. FastAPI concatenates a router's tags with a route's, so a
+    # default here would put the Tashtiot routes in both documentation sections. Each route
+    # declares its own; registration order is unchanged, and still the collision guard.
+    router = APIRouter(prefix=config.API_PREFIX)
 
     # ---------------------------------------------------------------- #
     # creating a store
     # ---------------------------------------------------------------- #
     @router.post(
         "/",
+        tags=config.API_TAGS,
         response_model=VaultOperationResponse,
         status_code=201,
         summary="Open a validated pull request that creates a KV store",
@@ -299,6 +305,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
     # ---------------------------------------------------------------- #
     @router.put(
         "/tashtiot/{team}",
+        tags=config.API_TASHTIOT_TAGS,
         response_model=VaultOperationResponse,
         status_code=201,
         summary="Open a validated pull request setting a team's shared-services grants",
@@ -318,6 +325,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
 
     @router.get(
         "/tashtiot/{team}",
+        tags=config.API_TASHTIOT_TAGS,
         summary="One team's shared-services grants",
         description="The parsed file, returned as-is. 404 when the team has none.",
     )
@@ -326,6 +334,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
 
     @router.delete(
         "/tashtiot/{team}",
+        tags=config.API_TASHTIOT_TAGS,
         response_model=VaultOperationResponse,
         status_code=201,
         summary="Open a validated pull request removing a team's shared-services grants",
@@ -338,11 +347,69 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         logger.info(f"Deleting {config.TASHTIOT_DIR} access for {team}")
         return await _execute(delete_tashtiot_access_operation(bitbucket, team))
 
+    # One grant at a time, the same pair the store sub-resource has. `PUT /tashtiot/{team}`
+    # replaces the whole list, which is the wrong tool for adding one principal to a file
+    # that already has ten: a caller would have to read, edit and send the lot back, and
+    # race anyone doing the same. Three segments, so neither collides with `/{kv_name}`
+    # or `/{kv_name}/access`.
+    @router.post(
+        "/tashtiot/{team}/access",
+        tags=config.API_TASHTIOT_TAGS,
+        response_model=VaultOperationResponse,
+        status_code=201,
+        summary="Open a validated pull request adding one shared-services grant",
+        description=(
+            "Appends one entry to the team's flat file, either auth type - the file "
+            "mixes both. 409 when the identity is already granted, 404 when the team has "
+            "no file yet (use PUT to create it). "
+            "The grant is not in effect when this returns; the pull request that adds it "
+            "is open for review."
+        ),
+    )
+    async def add_tashtiot_access(team: TeamParam, payload: AccessEntry):
+        logger.info(f"Adding a {config.TASHTIOT_DIR} grant for {team}")
+        return await _execute(
+            add_tashtiot_access_entry_operation(bitbucket, team, payload)
+        )
+
+    @router.delete(
+        "/tashtiot/{team}/access",
+        tags=config.API_TASHTIOT_TAGS,
+        response_model=VaultOperationResponse,
+        status_code=201,
+        summary="Open a validated pull request revoking one shared-services grant",
+        description=(
+            "The grant's identity travels as query parameters, exactly as it does for a "
+            "store: oidc needs path and dn; k8s needs path, name, namespace and cluster. "
+            "A mismatched set is a 422. Revoking the team's last grant removes the file. "
+            "The grant is still in effect when this returns; the pull request that "
+            "revokes it is open for review."
+        ),
+    )
+    async def delete_tashtiot_access(
+        team: TeamParam,
+        auth_type: AuthTypeQuery,
+        path: PathQuery,
+        dn: DnQuery = None,
+        name: ServiceAccountQuery = None,
+        namespace: NamespaceQuery = None,
+        cluster: ClusterQuery = None,
+    ):
+        try:
+            entry = _revoked_entry(auth_type, path, dn, name, namespace, cluster)
+        except VaultOperationError as invalid:
+            return _json(invalid.to_response(), invalid.status_code)
+        logger.info(f"Revoking a {config.TASHTIOT_DIR} grant from {team}")
+        return await _execute(
+            remove_tashtiot_access_entry_operation(bitbucket, team, entry)
+        )
+
     # ---------------------------------------------------------------- #
     # listing
     # ---------------------------------------------------------------- #
     @router.get(
         "/stores",
+        tags=config.API_TAGS,
         summary="Every KV store in the values directory",
         description=(
             "Team, name and directory for each. The cheap half of the walk: it lists "
@@ -359,6 +426,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
     # ---------------------------------------------------------------- #
     @router.post(
         "/{kv_name}/access",
+        tags=config.API_TAGS,
         response_model=VaultOperationResponse,
         status_code=201,
         summary="Open a validated pull request granting one principal access",
@@ -378,6 +446,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
     # store read already gives. Read the store; the grants are the `access` key.
     @router.delete(
         "/{kv_name}/access",
+        tags=config.API_TAGS,
         response_model=VaultOperationResponse,
         status_code=201,
         summary="Open a validated pull request revoking one grant",
@@ -415,6 +484,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
 
     @router.get(
         "/{kv_name}",
+        tags=config.API_TAGS,
         summary="One KV store",
         description=(
             "Where it lives and every grant on it. Found by name alone, wherever team "
@@ -426,6 +496,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
 
     @router.patch(
         "/{kv_name}",
+        tags=config.API_TAGS,
         response_model=VaultOperationResponse,
         status_code=201,
         summary="Open a validated pull request replacing a store's grants",
@@ -443,6 +514,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
 
     @router.delete(
         "/{kv_name}",
+        tags=config.API_TAGS,
         response_model=VaultOperationResponse,
         status_code=201,
         summary="Open a validated pull request that deletes a KV store",

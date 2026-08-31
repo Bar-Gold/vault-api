@@ -382,11 +382,60 @@ async def _resolve_store(bitbucket: Any, kv_name: str) -> ResolvedStore:
     )
 
 
+def _store_name_in(paths: List[str], kv_name: str) -> Optional[str]:
+    """The directory in `paths` that would create `kv_name`, or None.
+
+    Same rule as `_walk_store_dirs`: exactly three segments under the values dir whose last
+    is one of the two access files. Stated once here against absolute paths because a pull
+    request reports them that way, while the walk reads them relative to the values dir.
+    """
+    values_dir = config.VAULT_VALUES_DIR.strip("/")
+    for path in paths:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4 or parts[0] != values_dir:
+            continue
+        if parts[3] not in (OIDC_ACCESS_FILE, K8S_ACCESS_FILE):
+            continue
+        if parts[2] == kv_name:
+            return kv_store_dir(values_dir, parts[1], parts[2])
+    return None
+
+
+async def _name_claimed_by_open_pull_request(
+    bitbucket: Any, kv_name: str
+) -> Optional[Tuple[int, str]]:
+    """The open pull request already creating this store, if there is one.
+
+    **This is the common case, not an edge one.** Nothing here merges, so a store lives on
+    an unmerged branch until a human takes it — and every scan reads the base branch, where
+    it is not yet. Without this a repeat create just opens a second pull request for the
+    same name, and the two only conflict once someone tries to merge both.
+
+    Two calls' worth of care rather than one: the branch prefix filters the list without an
+    extra request, and only a pull request that survives that is asked for its changes. The
+    branch *name* cannot be trusted for the answer itself — `build_branch_name` joins team
+    and store with a dash and both may contain dashes, so `vault-kv/cloudops-my-passwords-…`
+    parses two ways. The changed paths are unambiguous.
+    """
+    prefix = f"{config.BRANCH_PREFIX.strip('/')}/"
+    for pull_request in await bitbucket.list_pull_requests(state="OPEN"):
+        if not pull_request.from_branch.startswith(prefix):
+            continue
+        directory = _store_name_in(
+            await bitbucket.get_pull_request_changes(pull_request.id), kv_name
+        )
+        if directory:
+            return pull_request.id, directory
+    return None
+
+
 async def _assert_name_is_free(bitbucket: Any, kv_name: str) -> None:
     """A store name is global to Vault, so this scans every team, not just the target one.
 
-    A check, not a lock: two creates in flight both pass and the second pull request
-    conflicts at merge, the same as any other GitOps race.
+    Two places a name can already be taken, and both are checked: the base branch, and an
+    **open pull request** that would create it. A check, not a lock — two creates racing
+    inside the same second both pass and the second pull request conflicts at merge, the
+    same as any other GitOps race.
     """
     async for team, name, directory in _walk_store_dirs(bitbucket):
         if name == kv_name:
@@ -396,6 +445,17 @@ async def _assert_name_is_free(bitbucket: Any, kv_name: str) -> None:
                 file=directory,
                 status_code=409,
             )
+
+    claimed = await _name_claimed_by_open_pull_request(bitbucket, kv_name)
+    if claimed:
+        pull_request_id, directory = claimed
+        raise VaultOperationError(
+            f"{kv_name} is already being created by open pull request "
+            f"{pull_request_id} ({directory}). Merge or decline it first.",
+            kv_name=kv_name,
+            file=directory,
+            status_code=409,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1077,6 +1137,143 @@ async def delete_tashtiot_access_operation(
         message=(
             f"Opened pull request {pull_request.id} to delete "
             f"{config.TASHTIOT_DIR} access for {team}. "
+            f"It passed validation and is waiting for review."
+        ),
+        kv_name=team,
+        file=path,
+        pull_request=_pull_request_info(pull_request),
+        validation_builds=_build_infos(validation),
+    )
+
+
+async def _prepare_tashtiot_access_change(
+    bitbucket: Any,
+    team: str,
+    entry: Dict[str, Any],
+    removing: bool,
+) -> Tuple[str, Change]:
+    """Add or remove one grant in a team's flat file.
+
+    The store version of this picks a file from the entry's `auth_type`; here there is only
+    one file and it holds both kinds, so the kind selects nothing. Everything else — the
+    duplicate 409, the missing-grant 404, and dropping the file when its last grant goes —
+    matches, because those rules are the document's rather than the layout's.
+
+    A missing file is a **404**, not an empty document to append to: the upsert is what
+    creates a team's file, and it requires the whole list. Appending to a file that does
+    not exist would create one behind a route that reads as an edit.
+    """
+    path, document = await _require_tashtiot(bitbucket, team)
+
+    if removing:
+        try:
+            updated = remove_access_entry(document, access_entry_identity(entry))
+        except AccessEntryNotFound as missing:
+            raise VaultOperationError(
+                f"{_entry_text(entry)} is not granted to {team}",
+                kv_name=team,
+                file=path,
+                status_code=404,
+            ) from missing
+    else:
+        try:
+            updated = add_access_entry(document, entry)
+        except DuplicateAccessEntry as duplicate:
+            raise VaultOperationError(
+                f"{_entry_text(entry)} is already granted to {team}",
+                kv_name=team,
+                file=path,
+                status_code=409,
+            ) from duplicate
+
+    source_commit_id = await bitbucket.get_last_commit(
+        path, at=config.VAULT_VALUES_REPO_BASE_BRANCH
+    )
+
+    remaining = read_access_entries(updated)
+    if remaining:
+        change = Change(
+            writes=[
+                FileWrite(
+                    path=path,
+                    content=render_values_yaml(build_access_document(remaining)),
+                    source_commit_id=source_commit_id,
+                )
+            ],
+            removes=[],
+        )
+    else:
+        # The team's last grant is gone, so the file goes with it. The upsert refuses an
+        # empty `access` list, so a file saying nothing is a shape nothing else can write.
+        change = Change(writes=[], removes=[path])
+
+    return path, change
+
+
+async def add_tashtiot_access_entry_operation(
+    bitbucket: Any,
+    team: str,
+    payload: Any,
+    branch_suffix: Optional[str] = None,
+) -> VaultOperationResponse:
+    """Open a validated pull request adding one grant to a team's Tashtiot file."""
+    entry = to_document_entry(payload)
+    path, change = await _prepare_tashtiot_access_change(
+        bitbucket, team, entry, removing=False
+    )
+
+    pull_request, validation = await _open_and_validate(
+        bitbucket,
+        change=change,
+        branch=_branch_for(config.TASHTIOT_DIR.lower(), team, branch_suffix),
+        summary=f"Grant {_entry_text(entry)} to {team} in {config.TASHTIOT_DIR}",
+        description=_describe(
+            team, path, [entry], f"{config.TASHTIOT_DIR} grant added"
+        ),
+        kv_name=team,
+    )
+
+    return VaultOperationResponse(
+        status=OperationStatus.SUCCEEDED,
+        message=(
+            f"Opened pull request {pull_request.id} to grant "
+            f"{_entry_text(entry)} to {team}. "
+            f"It passed validation and is waiting for review."
+        ),
+        kv_name=team,
+        file=path,
+        pull_request=_pull_request_info(pull_request),
+        validation_builds=_build_infos(validation),
+    )
+
+
+async def remove_tashtiot_access_entry_operation(
+    bitbucket: Any,
+    team: str,
+    entry: Dict[str, Any],
+    branch_suffix: Optional[str] = None,
+) -> VaultOperationResponse:
+    """Open a validated pull request revoking one grant from a team's Tashtiot file."""
+    path, change = await _prepare_tashtiot_access_change(
+        bitbucket, team, entry, removing=True
+    )
+
+    pull_request, validation = await _open_and_validate(
+        bitbucket,
+        change=change,
+        branch=_branch_for(config.TASHTIOT_DIR.lower(), team, branch_suffix),
+        summary=f"Revoke {_entry_text(entry)} from {team} in {config.TASHTIOT_DIR}",
+        description=_describe(
+            team, path, [entry], f"{config.TASHTIOT_DIR} grant removed"
+        ),
+        kv_name=team,
+    )
+
+    return VaultOperationResponse(
+        status=OperationStatus.SUCCEEDED,
+        message=(
+            f"Opened pull request {pull_request.id} to revoke "
+            f"{_entry_text(entry)} from {team}. "
             f"It passed validation and is waiting for review."
         ),
         kv_name=team,

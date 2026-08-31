@@ -461,6 +461,149 @@ def test_deleting_a_missing_tashtiot_file_is_404(client, auth_headers):
     assert client.delete(TASHTIOT_URL, headers=auth_headers).status_code == 404
 
 
+# --------------------------------------------------------------------------- #
+# one Tashtiot grant at a time
+#
+# The same pair the store sub-resource has, on a three-segment path. The rules are the
+# document's, so they match the store's: duplicate identity 409, unknown identity 404,
+# and the file goes when its last grant does.
+# --------------------------------------------------------------------------- #
+TASHTIOT_ACCESS_URL = f"{TASHTIOT_URL}/access"
+
+
+def _seed_tashtiot(bitbucket, entries):
+    from app.helpers import build_access_document, render_values_yaml
+
+    bitbucket.existing_files[TASHTIOT_PATH] = render_values_yaml(
+        build_access_document(list(entries))
+    )
+
+
+def test_adding_a_tashtiot_grant_appends_to_the_flat_file(client, auth_headers, bitbucket):
+    _seed_tashtiot(bitbucket, [oidc_entry(path="+/cloudops/*")])
+
+    response = client.post(
+        TASHTIOT_ACCESS_URL,
+        json={"path": "services/+/redis/*", "auth_type": "oidc", "dn": OTHER_DN,
+              "capabilities": ["read"]},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 201
+    assert len(yaml.safe_load(bitbucket.committed[TASHTIOT_PATH])["access"]) == 2
+
+
+def test_a_tashtiot_grant_can_be_either_kind(client, auth_headers, bitbucket):
+    """The flat file mixes both, so a k8s grant goes in the same list as the oidc one."""
+    _seed_tashtiot(bitbucket, [oidc_entry(path="+/cloudops/*")])
+
+    response = client.post(
+        TASHTIOT_ACCESS_URL,
+        json={"path": "services/+/redis/*", "auth_type": "k8s", "name": "argocd",
+              "namespace": "perimeter", "cluster": "dev", "capabilities": ["read"]},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 201
+    kinds = [e["authType"] for e in yaml.safe_load(bitbucket.committed[TASHTIOT_PATH])["access"]]
+    assert kinds == ["oidc", "k8s"]
+
+
+def test_adding_a_duplicate_tashtiot_grant_is_409(client, auth_headers, bitbucket):
+    _seed_tashtiot(bitbucket, [oidc_entry(path="+/cloudops/*")])
+
+    response = client.post(
+        TASHTIOT_ACCESS_URL,
+        json={"path": "+/cloudops/*", "auth_type": "oidc", "dn": DN,
+              "capabilities": ["read"]},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 409
+
+
+def test_adding_a_grant_to_a_team_with_no_file_is_404(client, auth_headers, bitbucket):
+    """PUT creates a team's file; this route edits one. Appending to nothing would create
+    a file behind a route that reads as an edit."""
+    response = client.post(
+        TASHTIOT_ACCESS_URL,
+        json={"path": "*", "auth_type": "oidc", "dn": DN, "capabilities": ["read"]},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 404
+    assert bitbucket.committed == {}
+
+
+def test_revoking_a_tashtiot_grant_leaves_the_others(client, auth_headers, bitbucket):
+    _seed_tashtiot(
+        bitbucket,
+        [oidc_entry(path="+/cloudops/*"), oidc_entry(path="+/cloudops/*", dn=OTHER_DN)],
+    )
+
+    response = client.delete(
+        f"{TASHTIOT_ACCESS_URL}?auth_type=oidc&path=%2B/cloudops/*&dn={OTHER_DN}",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 201
+    remaining = yaml.safe_load(bitbucket.committed[TASHTIOT_PATH])["access"]
+    assert [entry["dn"] for entry in remaining] == [DN]
+
+
+def test_revoking_the_last_tashtiot_grant_removes_the_file(client, auth_headers, bitbucket):
+    """The upsert refuses an empty list, so a file saying nothing is a shape nothing can
+    write — the same rule the store's access files follow."""
+    _seed_tashtiot(bitbucket, [oidc_entry(path="+/cloudops/*")])
+
+    response = client.delete(
+        f"{TASHTIOT_ACCESS_URL}?auth_type=oidc&path=%2B/cloudops/*&dn={DN}",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 201
+    assert bitbucket.deleted == [TASHTIOT_PATH]
+    assert bitbucket.committed == {}
+
+
+def test_revoking_a_tashtiot_grant_that_is_not_there_is_404(client, auth_headers, bitbucket):
+    _seed_tashtiot(bitbucket, [oidc_entry(path="+/cloudops/*")])
+
+    response = client.delete(
+        f"{TASHTIOT_ACCESS_URL}?auth_type=oidc&path=%2B/cloudops/*&dn={OTHER_DN}",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 404
+
+
+def test_a_mismatched_tashtiot_revoke_identity_is_422(client, auth_headers, bitbucket):
+    """`_revoked_entry` is shared with the store route, so the rule cannot drift apart."""
+    _seed_tashtiot(bitbucket, [oidc_entry(path="+/cloudops/*")])
+
+    response = client.delete(
+        f"{TASHTIOT_ACCESS_URL}?auth_type=k8s&path=*&name=argocd", headers=auth_headers
+    )
+
+    assert response.status_code == 422
+    assert bitbucket.calls == []
+
+
+def test_the_tashtiot_grant_routes_do_not_shadow_a_store(client, auth_headers, bitbucket):
+    """Three segments against two — a store named `tashtiot` is a different address, and
+    `/{kv_name}/access` is unaffected."""
+    seed_store(bitbucket, oidc=[oidc_entry()])
+
+    response = client.post(
+        ACCESS_URL,
+        json={"path": "*", "auth_type": "oidc", "dn": OTHER_DN, "capabilities": ["read"]},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 201
+    assert list(bitbucket.committed) == [OIDC_PATH]
+
+
 def test_the_tashtiot_file_is_not_a_store(client, auth_headers, bitbucket):
     """Two segments, not three — the store walk must not pick it up."""
     bitbucket.existing_files[TASHTIOT_PATH] = "access: []\n"

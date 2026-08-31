@@ -289,6 +289,117 @@ async def test_decline_sends_version(bitbucket):
 
 
 @respx.mock
+async def test_list_pull_requests_asks_for_a_state_and_parses_each(bitbucket):
+    """The duplicate-name scan's first call: which pull requests are open right now."""
+    route = respx.get(f"{API}/pull-requests").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "values": [_pr_payload(pr_id=101), _pr_payload(pr_id=102)],
+                "isLastPage": True,
+            },
+        )
+    )
+
+    pull_requests = await bitbucket.list_pull_requests()
+
+    assert [pr.id for pr in pull_requests] == [101, 102]
+    assert route.calls[0].request.url.params["state"] == "OPEN"
+    assert pull_requests[0].from_branch == "vault-kv/prod-myapp-abc"
+
+
+@respx.mock
+async def test_list_pull_requests_follows_pagination(bitbucket):
+    pages = [
+        httpx.Response(
+            200,
+            json={
+                "values": [_pr_payload(pr_id=101)],
+                "isLastPage": False,
+                "nextPageStart": 1,
+            },
+        ),
+        httpx.Response(
+            200, json={"values": [_pr_payload(pr_id=102)], "isLastPage": True}
+        ),
+    ]
+    route = respx.get(f"{API}/pull-requests").mock(side_effect=pages)
+
+    pull_requests = await bitbucket.list_pull_requests()
+
+    assert [pr.id for pr in pull_requests] == [101, 102]
+    assert route.calls[1].request.url.params["start"] == "1"
+
+
+@respx.mock
+async def test_get_pull_request_changes_reads_the_post_change_paths(bitbucket):
+    """`path.toString` is the path *after* the change, which is what a create's new files
+    are. Bitbucket also reports `srcPath` on a rename; this wants the destination."""
+    respx.get(f"{API}/pull-requests/101/changes").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "values": [
+                    {"path": {"toString": "KVs/cloudops/my-passwords/oidc-access.yaml"}},
+                    {"path": {"toString": "KVs/cloudops/my-passwords/k8s-access.yaml"}},
+                ],
+                "isLastPage": True,
+            },
+        )
+    )
+
+    paths = await bitbucket.get_pull_request_changes(101)
+
+    assert paths == [
+        "KVs/cloudops/my-passwords/oidc-access.yaml",
+        "KVs/cloudops/my-passwords/k8s-access.yaml",
+    ]
+
+
+@respx.mock
+async def test_get_pull_request_changes_skips_an_entry_with_no_path(bitbucket):
+    """A malformed row must not become a `None` in a list of paths the caller matches on."""
+    respx.get(f"{API}/pull-requests/101/changes").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "values": [{"path": {}}, {}, {"path": {"toString": "KVs/a/b/oidc-access.yaml"}}],
+                "isLastPage": True,
+            },
+        )
+    )
+
+    assert await bitbucket.get_pull_request_changes(101) == ["KVs/a/b/oidc-access.yaml"]
+
+
+@respx.mock
+async def test_get_pull_request_changes_follows_pagination(bitbucket):
+    pages = [
+        httpx.Response(
+            200,
+            json={
+                "values": [{"path": {"toString": "KVs/a/b/oidc-access.yaml"}}],
+                "isLastPage": False,
+                "nextPageStart": 1,
+            },
+        ),
+        httpx.Response(
+            200,
+            json={
+                "values": [{"path": {"toString": "KVs/a/b/k8s-access.yaml"}}],
+                "isLastPage": True,
+            },
+        ),
+    ]
+    route = respx.get(f"{API}/pull-requests/101/changes").mock(side_effect=pages)
+
+    paths = await bitbucket.get_pull_request_changes(101)
+
+    assert len(paths) == 2
+    assert route.call_count == 2
+
+
+@respx.mock
 async def test_get_pull_request_reads_current_version(bitbucket):
     respx.get(f"{API}/pull-requests/101").mock(
         return_value=httpx.Response(200, json=_pr_payload(version=7))

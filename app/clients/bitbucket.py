@@ -389,6 +389,59 @@ class BitbucketClient:
         response = await self._request("POST", f"{self._api}/pull-requests", json=body)
         return PullRequest.from_api(response.json())
 
+    async def list_pull_requests(
+        self, state: str = "OPEN", page_size: int = 100
+    ) -> List[PullRequest]:
+        """Every pull request in the given state, following pagination.
+
+        `state` is Bitbucket's own vocabulary — OPEN, MERGED, DECLINED or ALL.
+        """
+        pull_requests: List[PullRequest] = []
+        start = 0
+        while True:
+            response = await self._request(
+                "GET",
+                f"{self._api}/pull-requests",
+                params={"state": state, "limit": page_size, "start": start},
+            )
+            body = response.json()
+            pull_requests.extend(
+                PullRequest.from_api(item) for item in (body.get("values") or [])
+            )
+            if body.get("isLastPage", True):
+                return pull_requests
+            start = body.get("nextPageStart")
+            if start is None:
+                return pull_requests
+
+    async def get_pull_request_changes(
+        self, pull_request_id: int, page_size: int = 1000
+    ) -> List[str]:
+        """Repo-relative paths a pull request touches.
+
+        The path is read from `path.toString`, which is the post-change path — a create's
+        two new files are exactly what we want to see. Bitbucket paginates this like every
+        other collection.
+        """
+        paths: List[str] = []
+        start = 0
+        while True:
+            response = await self._request(
+                "GET",
+                f"{self._api}/pull-requests/{pull_request_id}/changes",
+                params={"limit": page_size, "start": start},
+            )
+            body = response.json()
+            for change in body.get("values") or []:
+                path = (change.get("path") or {}).get("toString")
+                if path:
+                    paths.append(path)
+            if body.get("isLastPage", True):
+                return paths
+            start = body.get("nextPageStart")
+            if start is None:
+                return paths
+
     async def get_pull_request(self, pull_request_id: int) -> PullRequest:
         response = await self._request("GET", f"{self._api}/pull-requests/{pull_request_id}")
         return PullRequest.from_api(response.json())

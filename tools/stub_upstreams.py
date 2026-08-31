@@ -59,7 +59,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 BASE_BRANCH = "master"
@@ -464,6 +464,71 @@ async def get_pull_request(key: str, slug: str, pull_id: int):
     if pull is None:
         return _error(404, f"Pull request {pull_id} not found")
     return pull.as_api()
+
+
+@app.get("/rest/api/1.0/projects/{key}/repos/{slug}/pull-requests")
+async def list_pull_requests(
+    key: str,
+    slug: str,
+    state_filter: str = Query("OPEN", alias="state"),
+    limit: int = 100,
+    start: int = 0,
+) -> Dict[str, Any]:
+    """The duplicate-name scan's first call.
+
+    Bitbucket names this query parameter `state`, which shadows the module-level `state`
+    here — hence the alias. ALL means every state, as it does upstream.
+    """
+    matching = [
+        pull
+        for pull in state.pulls.values()
+        if state_filter == "ALL" or pull.state == state_filter
+    ]
+    page = matching[start : start + limit]
+    next_start = start + limit
+    is_last = next_start >= len(matching)
+    body: Dict[str, Any] = {
+        "values": [pull.as_api() for pull in page],
+        "size": len(page),
+        "isLastPage": is_last,
+    }
+    if not is_last:
+        body["nextPageStart"] = next_start
+    return body
+
+
+@app.get("/rest/api/1.0/projects/{key}/repos/{slug}/pull-requests/{pull_id}/changes")
+async def pull_request_changes(
+    key: str, slug: str, pull_id: int, limit: int = 1000, start: int = 0
+):
+    """Paths the pull request's branch changes against its target.
+
+    Derived from the two branches' file maps rather than recorded per commit, which is
+    what a real forge computes too — and it means a create's two `put_file`s show up
+    without the stub having to track them separately.
+    """
+    pull = state.pulls.get(pull_id)
+    if pull is None:
+        return _error(404, f"Pull request {pull_id} not found")
+
+    source = state.files.get(pull.from_branch, {})
+    target = state.files.get(pull.to_branch, {})
+    changed = sorted(
+        {path for path, text in source.items() if target.get(path) != text}
+        | {path for path in target if path not in source}
+    )
+
+    page = changed[start : start + limit]
+    next_start = start + limit
+    is_last = next_start >= len(changed)
+    body: Dict[str, Any] = {
+        "values": [{"path": {"toString": path}} for path in page],
+        "size": len(page),
+        "isLastPage": is_last,
+    }
+    if not is_last:
+        body["nextPageStart"] = next_start
+    return body
 
 
 @app.post("/rest/api/1.0/projects/{key}/repos/{slug}/pull-requests/{pull_id}/merge")

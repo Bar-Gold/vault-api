@@ -12,6 +12,8 @@ import re
 
 import pytest
 
+from app.v1.vault.conf import config
+
 DOCS = "/docs"
 
 
@@ -130,6 +132,74 @@ def test_every_documented_example_survives_its_own_validators(client):
         ("TashtiotAccessUpsert", TashtiotAccessUpsert),
     ):
         assert model(**schemas[name]["example"]), name
+
+
+def test_the_grant_body_carries_an_example_per_branch(client):
+    """`POST /{kv_name}/access` takes one entry as the whole body. Without a model-level
+    example Swagger builds the box from the field schemas and fills every string with
+    "string" — the field-level `examples` do not reach it."""
+    schemas = client.get("/openapi.json").json()["components"]["schemas"]
+
+    assert schemas["OidcAccessEntry"]["example"]["auth_type"] == "oidc"
+    assert schemas["K8sAccessEntry"]["example"]["auth_type"] == "k8s"
+
+
+def test_both_grant_examples_default_the_path_to_the_whole_store(client):
+    schemas = client.get("/openapi.json").json()["components"]["schemas"]
+
+    for name in ("OidcAccessEntry", "K8sAccessEntry"):
+        assert schemas[name]["example"]["path"] == "*", name
+
+
+def test_the_grant_examples_are_actually_valid(client):
+    """An example the schema would reject is worse than none — and these are two branches
+    of a discriminated union, so each has to validate as its own kind."""
+    from app.v1.vault.schemas import K8sAccessEntry, OidcAccessEntry
+
+    schemas = client.get("/openapi.json").json()["components"]["schemas"]
+
+    assert OidcAccessEntry(**schemas["OidcAccessEntry"]["example"])
+    assert K8sAccessEntry(**schemas["K8sAccessEntry"]["example"])
+
+
+def test_the_entry_models_still_forbid_extra_fields(client):
+    """The examples arrive via `model_config`, which is where `extra: forbid` lives too —
+    replacing rather than merging it would silently reopen the models."""
+    schemas = client.get("/openapi.json").json()["components"]["schemas"]
+
+    for name in ("OidcAccessEntry", "K8sAccessEntry"):
+        assert schemas[name]["additionalProperties"] is False, name
+
+
+# --------------------------------------------------------------------------- #
+# documentation sections
+# --------------------------------------------------------------------------- #
+def test_tashtiot_has_its_own_section(client):
+    """A different resource — per-team, one flat file, no directory — so it reads as one."""
+    paths = client.get("/openapi.json").json()["paths"]
+    tashtiot = f"{config.API_PREFIX}/tashtiot/{{team}}"
+
+    for method in ("get", "put", "delete"):
+        assert paths[tashtiot][method]["tags"] == config.API_TASHTIOT_TAGS, method
+
+
+def test_no_route_appears_in_both_sections(client):
+    """FastAPI concatenates a router's tags with a route's, so a router-level default puts
+    every Tashtiot route in both lists. That is why the router carries none."""
+    paths = client.get("/openapi.json").json()["paths"]
+
+    for path, operations in paths.items():
+        if config.API_PREFIX not in path:
+            continue
+        for method, operation in operations.items():
+            assert len(operation["tags"]) == 1, f"{method.upper()} {path}"
+
+
+def test_the_store_routes_keep_the_original_section(client):
+    paths = client.get("/openapi.json").json()["paths"]
+
+    assert paths[f"{config.API_PREFIX}/"]["post"]["tags"] == config.API_TAGS
+    assert paths[f"{config.API_PREFIX}/{{kv_name}}"]["get"]["tags"] == config.API_TAGS
 
 
 def test_docs_needs_no_auth(client):

@@ -96,7 +96,7 @@ uv-managed (Python 3.12). Package indexes come from `uv.toml` (internal Artifact
 ```bash
 uv sync --group dev                 # install deps into .venv — ON-PREM ONLY, see below
 uv run --no-sync python -m app.main # serves on 0.0.0.0:5000 (--host/--port override)
-uv run --no-sync pytest             # everything under tests/ (334 tests, ~26s)
+uv run --no-sync pytest             # everything under tests/ (362 tests, ~26s)
 uv run --no-sync pytest tests/v1/vault                                        # one suite
 uv run --no-sync pytest tests/v1/vault/test_operations.py::test_create_call_order      # one test
 docker build -t vault-api . && docker run -p 5000:5000 --env-file .env vault-api
@@ -152,6 +152,8 @@ segments in the builds endpoint. Keep all three if you extend it.
 | `PUT /api/vault/v1/kv/tashtiot/{team}` | `{access}` | create-or-replace one team's shared-services grants; 201 (200 if unchanged) |
 | `GET /api/vault/v1/kv/tashtiot/{team}` | — | that team's file, parsed and returned as-is |
 | `DELETE /api/vault/v1/kv/tashtiot/{team}` | — | removes the team's file; 201 |
+| `POST /api/vault/v1/kv/tashtiot/{team}/access` | one entry | appends one grant to the team's flat file; 201 |
+| `DELETE /api/vault/v1/kv/tashtiot/{team}/access` | `?auth_type=&path=&…` | revokes one; removes the file if it was the last; 201 |
 
 **A store is addressed by name alone.** A caller should not have to remember which team owns
 their store, and does not have to: a store name is unique across the whole values directory —
@@ -212,6 +214,13 @@ two calls later instead of a 422.
 
 `API_PREFIX` (default `/api/vault/v1/kv`) comes from `app/v1/vault/conf.py`.
 
+**Every route declares its own `tags=`, and the router declares none.** The Tashtiot routes
+sit in their own documentation section (`API_TASHTIOT_TAGS`), the rest in `API_TAGS`. The
+router cannot carry a default: FastAPI **concatenates** a router's tags with a route's, so a
+default would put every Tashtiot route in both sections. `test_no_route_appears_in_both_sections`
+pins that no operation has more than one tag. This is a docs grouping only — one router,
+one prefix, and registration order is untouched and still the collision guard.
+
 ### The request mirrors the document
 
 A caller sends the same `access` entries that land in the file. That is the same boundary the
@@ -229,6 +238,15 @@ caller migrating from the old shape who still sends `file` or `roles` gets a **4
 
 **A single grant is the request body on its own**, with no wrapper object —
 `POST /{kv_name}/access` takes the entry directly, discriminated on `auth_type`.
+
+**Both entry models carry a model-level example**, in `model_config["json_schema_extra"]`,
+because of that: the entry *is* the body, and Swagger builds the editable box from the model
+alone. Field-level `examples=[…]` do not reach it, so without one every string in the box
+reads `"string"`. There are two because the body is a `oneOf` — one example per branch, and
+the picker is how a caller switches. Both set `path` to `"*"`. Note the config is **merged**
+with the base's (`**_AccessEntryBase.model_config`), not replaced: `extra: "forbid"` lives
+there too, and replacing it would silently reopen both models.
+`test_the_entry_models_still_forbid_extra_fields` pins that.
 
 **Validation lives where the rule comes from:**
 
@@ -295,7 +313,7 @@ closure is the injection seam (no FastAPI `Depends` for connectors).
   deliberately no CI-server settings: the `CI_*` knobs below bound the **build-status
   polling**. Their names still say PIPELINE because a pipeline is still what is waited on;
   only the place we ask changed.
-- `app/v1/vault/conf.py` — `API_PREFIX`, `API_TAGS`, values-repo layout (`VAULT_VALUES_DIR`
+- `app/v1/vault/conf.py` — `API_PREFIX`, `API_TAGS`/`API_TASHTIOT_TAGS`, values-repo layout (`VAULT_VALUES_DIR`
   defaults to `KVs`, `TASHTIOT_DIR` to `Tashtiot`), PR shaping, `CI_*` timeouts, and
   `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/`GIT_TIMEOUT_SECONDS` for the delete commit.
 - `AUTH_*` / `AUTH_SSO_*` are **not** declared here — the library reads them from the
@@ -483,10 +501,25 @@ states — adding the first Kubernetes grant edits `oidc-access.yaml` and create
 
 `create_kv_mount_operation` runs, in order:
 
-0. **name scan** — `_assert_name_is_free` walks every store directory; the name appearing
-   under any team is a 409. Store names are global to Vault, so this cannot be scoped to the
-   target team. It is a check, not a lock: two creates in flight both pass and the second PR
-   conflicts at merge, same as any other GitOps race.
+0. **name scan** — `_assert_name_is_free`, in **two halves**. First it walks every store
+   directory on the base branch; the name appearing under any team is a 409. Store names are
+   global to Vault, so this cannot be scoped to the target team. Then, because nothing here
+   merges, it also asks whether an **open pull request** already creates that name —
+   `_name_claimed_by_open_pull_request`, also a 409, naming the pull request to merge or
+   decline. Without the second half a repeat create just opens a second pull request, which
+   is the *common* case now rather than a rare one. Still a check, not a lock: two creates
+   racing inside the same second both pass and the second PR conflicts at merge, same as any
+   other GitOps race.
+
+   The second half costs one `list_pull_requests` on every create, plus one
+   `get_pull_request_changes` per open pull request **whose branch starts with
+   `BRANCH_PREFIX`** — the prefix filter is what keeps a busy repo from costing a request
+   per open PR, and `test_a_pull_request_outside_the_branch_prefix_is_not_even_read` pins it.
+   The branch *name* cannot answer the question itself: `build_branch_name` joins team and
+   store with a dash and both may contain dashes, so `vault-kv/cloudops-my-passwords-…`
+   parses two ways. The changed paths are unambiguous, and `_store_name_in` applies the same
+   three-segments-under-the-values-dir rule the store walk uses. The base-branch half runs
+   first because it is the cheaper answer.
 1. `_store_writes` partitions the grants and renders one file per non-empty kind. Nothing is
    read: the store is new, so neither file exists and no lock token applies.
 2. `create_branch` -> `put_file` per file
@@ -558,11 +591,22 @@ owns exactly one file, and its name is the address), no two-file partition, no d
 upsert is create-or-replace in one call because the file's identity *is* the team, so a 409
 would have nothing to describe; it short-circuits on no change like an update does.
 
+**Tashtiot has the same one-grant-at-a-time pair a store does**, on `/tashtiot/{team}/access`
+— `POST` to add one entry, `DELETE` to revoke one, the identity travelling as query
+parameters through the very same `_revoked_entry`. `_prepare_tashtiot_access_change` is the
+store version minus the file choice: there is one file and it holds both kinds, so
+`auth_type` selects nothing. The rules match because they are the document's rather than the
+layout's — duplicate identity 409, unknown identity 404, and the file is **removed** when its
+last grant goes, since the upsert refuses an empty list and so no other route could write
+one. A team with no file yet is a **404**, not an implicit create: `PUT` is what creates a
+team's file, and appending to nothing behind a route that reads as an edit would hide that.
+
 **Ordering consequence worth knowing** (documented, not worked around): a caller who creates a
 store and then immediately adds a grant to it gets a 404 — the store is on an unmerged
 branch and every scan reads the base branch. **This is the normal case now**, not an edge
 one: since nothing merges, a store is only visible to the next request once a human has
-merged its pull request. It is also why a repeat create opens a second pull request.
+merged its pull request. A repeat *create* is the one case no longer left to the merge
+conflict: the name scan reads open pull requests as well as the base branch, so it 409s.
 
 ## Auth & config provider
 
@@ -641,7 +685,7 @@ merged its pull request. It is also why a repeat create opens a second pull requ
   the failure path silently omits it unless `to_response()` is updated too.
 - The committed entries are the contract with the deploy pipeline — change
   `build_oidc_access_entry` / `build_k8s_access_entry` and the pipeline together.
-- Tests: 334 of them. `tests/test_helpers.py` (pure, no library import — the document model
+- Tests: 362 of them. `tests/test_helpers.py` (pure, no library import — the document model
   and the exact committed bytes), `tests/clients/` (the Bitbucket client and `http.py`'s error
   mapping against the real REST shapes via respx, plus `test_git.py` running **real git
   against a real bare repo** in a temp dir), `tests/v1/vault/` (schemas, the chain + rollbacks
@@ -683,6 +727,10 @@ merged its pull request. It is also why a repeat create opens a second pull requ
     is the validation gate and element 1 the deploy gate; an `Exception` in the list is raised
     instead of returned. Running dry is an `AssertionError`, so a test running two full chains
     must script four entries.
+- **The stub serves the duplicate-name scan too.** It grew `GET /pull-requests` and
+  `GET /pull-requests/{id}/changes` when the name scan started reading open pull requests;
+  the changes are derived by diffing the branch's file map against its target, which is what
+  a real forge computes. Without them every create against the stub would fail on the scan.
 - **`tools/stub_upstreams.py` needs `POST /__merge/{id}` to get past one create.** Since the
   service never merges, nothing it does reaches the base branch — and every read, edit and
   delete resolves against the base branch. Without playing the reviewer the local loop

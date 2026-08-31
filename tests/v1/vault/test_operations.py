@@ -20,6 +20,7 @@ from app.v1.vault.operations import (
     update_kv_mount_operation,
 )
 from app.v1.vault.schemas import K8sAccessEntry, OidcAccessEntry, VaultKVUpdate
+from app.clients.bitbucket import PullRequest
 from tests.fakes import failing, passing
 from tests.v1.vault.conftest import (
     DN,
@@ -119,6 +120,7 @@ async def test_create_call_order(bitbucket, payload):
 
     assert bitbucket.calls == [
         "list_files",  # the duplicate-name scan, dir-wide
+        "list_pull_requests",  # ...and the half of it that reads unmerged branches
         "create_branch",
         "put_file",  # oidc-access.yaml
         "put_file",  # k8s-access.yaml, same branch
@@ -180,6 +182,101 @@ async def test_a_different_name_under_another_team_does_not_collide(bitbucket, p
     seed_store(bitbucket, team="platform", kv_name="other", oidc=[oidc_entry()])
 
     assert (await _create(bitbucket, payload)).status.value == "Succeeded"
+
+
+# --------------------------------------------------------------------------- #
+# uniqueness against unmerged pull requests
+#
+# The base-branch scan above cannot see a store that is still only proposed, and since
+# nothing here merges that is where every new store lives until a human takes it. Without
+# this half, a repeat create just opens a second pull request for the same name.
+# --------------------------------------------------------------------------- #
+def _open_create_pr(bitbucket, pull_request_id=900, team=TEAM, kv_name=KV,
+                    branch=None, files=("oidc-access.yaml",)):
+    """Stage somebody else's open pull request that creates a store."""
+    bitbucket.open_pull_requests.append(
+        PullRequest(
+            id=pull_request_id,
+            version=0,
+            title=f"Create KV store {kv_name} for {team}",
+            from_branch=branch or f"vault-kv/{team}-{kv_name}-deadbeef",
+            to_branch="master",
+            state="OPEN",
+        )
+    )
+    bitbucket.pull_request_changes[pull_request_id] = [
+        f"KVs/{team}/{kv_name}/{name}" for name in files
+    ]
+
+
+async def test_a_name_claimed_by_an_open_pull_request_is_409(bitbucket, payload):
+    _open_create_pr(bitbucket)
+
+    with pytest.raises(VaultOperationError) as error:
+        await _create(bitbucket, payload)
+
+    assert error.value.status_code == 409
+    assert "900" in error.value.message
+    assert "create_branch" not in bitbucket.calls
+
+
+async def test_the_claim_is_found_under_any_team(bitbucket, payload):
+    """Names are global, so an open pull request creating it for someone else still wins."""
+    _open_create_pr(bitbucket, team="platform")
+
+    with pytest.raises(VaultOperationError) as error:
+        await _create(bitbucket, payload)
+
+    assert error.value.status_code == 409
+
+
+async def test_a_k8s_only_claim_is_found_too(bitbucket, payload):
+    """A create writes one file per non-empty kind, so the claim may be either name."""
+    _open_create_pr(bitbucket, files=("k8s-access.yaml",))
+
+    with pytest.raises(VaultOperationError) as error:
+        await _create(bitbucket, payload)
+
+    assert error.value.status_code == 409
+
+
+async def test_an_open_pull_request_for_another_store_does_not_collide(bitbucket, payload):
+    _open_create_pr(bitbucket, kv_name="other")
+
+    assert (await _create(bitbucket, payload)).status.value == "Succeeded"
+
+
+async def test_a_pull_request_outside_the_branch_prefix_is_not_even_read(bitbucket, payload):
+    """The prefix filter is what keeps this from costing a request per open pull request
+    in a busy repo — somebody else's unrelated branch is skipped without asking."""
+    _open_create_pr(bitbucket, branch="feature/unrelated")
+
+    assert (await _create(bitbucket, payload)).status.value == "Succeeded"
+    assert "get_pull_request_changes" not in bitbucket.calls
+
+
+async def test_a_pull_request_touching_no_store_file_does_not_collide(bitbucket, payload):
+    """Same rule as the store walk: three segments under the values dir, ending in one of
+    the two access files. A Tashtiot file is two, and a README is neither."""
+    _open_create_pr(bitbucket, pull_request_id=901)
+    bitbucket.pull_request_changes[901] = [
+        f"KVs/Tashtiot/{KV}.yaml",
+        f"KVs/{TEAM}/{KV}/README.md",
+        f"KVs/{TEAM}/{KV}/nested/oidc-access.yaml",
+        f"other-dir/{TEAM}/{KV}/oidc-access.yaml",
+    ]
+
+    assert (await _create(bitbucket, payload)).status.value == "Succeeded"
+
+
+async def test_the_base_branch_scan_still_runs_first(bitbucket, payload):
+    """An existing store is the cheaper answer — no pull request listing needed."""
+    seed_store(bitbucket, oidc=[oidc_entry()])
+
+    with pytest.raises(VaultOperationError):
+        await _create(bitbucket, payload)
+
+    assert "list_pull_requests" not in bitbucket.calls
 
 
 # --------------------------------------------------------------------------- #

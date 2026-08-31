@@ -25,6 +25,16 @@ class VaultV1StaticSettings(BaseSettings):
         default_factory=lambda: ["v1 - Vault KV Operations"],
     )
 
+    # The Tashtiot file is a different resource — per-team, one flat file, no directory —
+    # so it gets its own section in the docs rather than sitting among the store routes.
+    # Tags are declared per route rather than on the router: FastAPI *concatenates* a
+    # router's tags with a route's, so a router-level default would put every Tashtiot
+    # route in both sections.
+    API_TASHTIOT_TAGS: List[str] = Field(
+        description="Tags grouping the Tashtiot per-team routes in the OpenAPI docs",
+        default_factory=lambda: ["v1 - Tashtiot Shared-Services Access"],
+    )
+
     # --- The GitOps repo holding the Vault values files ---
     VAULT_VALUES_REPO_PROJECT_KEY: str = Field(
         ..., description="Bitbucket project key of the Vault values repo."

@@ -130,6 +130,22 @@ class OidcAccessEntry(_AccessEntryBase):
     and the vocabulary is the directory's, not ours.
     """
 
+    # A **model-level** example, not just per-field ones. This is a request body on its own
+    # at `POST /{kv_name}/access`, and without one Swagger synthesises the body from the
+    # field schemas — which fills every string with `"string"` rather than the field's own
+    # example, so the box a user is meant to edit shows nothing usable.
+    model_config = {
+        **_AccessEntryBase.model_config,
+        "json_schema_extra": {
+            "example": {
+                "path": "*",
+                "auth_type": "oidc",
+                "dn": "CN=cloudops,OU=Groups,DC=corp,DC=example,DC=com",
+                "capabilities": ["read", "write"],
+            }
+        },
+    }
+
     auth_type: Literal[AuthType.OIDC] = Field(
         ...,
         description="oidc — a group or user from the directory.",
@@ -176,6 +192,23 @@ class K8sAccessEntry(_AccessEntryBase):
     `*` is **rejected** in `name` and `namespace`: it would grant every workload in the
     cluster, and that escalation should need a human editing the YAML, not an API call.
     """
+
+    # See `OidcAccessEntry.model_config` — the same reason, and the reason there are two:
+    # the body is a `oneOf` on `auth_type`, so Swagger shows one example per branch and the
+    # picker is how a caller switches between them.
+    model_config = {
+        **_AccessEntryBase.model_config,
+        "json_schema_extra": {
+            "example": {
+                "path": "*",
+                "auth_type": "k8s",
+                "name": "cloudops-external-secrets",
+                "namespace": "cloudops",
+                "cluster": "dev",
+                "capabilities": ["read"],
+            }
+        },
+    }
 
     auth_type: Literal[AuthType.K8S] = Field(
         ...,

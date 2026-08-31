@@ -67,6 +67,11 @@ class FakeBitbucket:
         self.builds: List[Any] = list(
             builds if builds is not None else [passing(), passing("ci/woodpecker/push/deploy")]
         )
+        # Pull requests opened by somebody else, and what each one touches. Only the
+        # duplicate-name scan reads these, so they default to empty and every other test
+        # is unaffected.
+        self.open_pull_requests: List[PullRequest] = []
+        self.pull_request_changes: Dict[int, List[str]] = {}
         # The (commit, exclude_keys) each gate was opened on — this is what pins that the
         # validation gate watches the PR's commit and the deploy gate the merge commit.
         self.awaited_commits: List[str] = []
@@ -171,6 +176,40 @@ class FakeBitbucket:
         # object out of each response, so a later server-side change (a decline, a version
         # bump) cannot reach backwards and edit a reference the caller already holds.
         return replace(pull_request)
+
+    async def list_pull_requests(
+        self, state: str = "OPEN", page_size: int = 100
+    ) -> List[PullRequest]:
+        """Open pull requests this fake knows about, plus any staged in `open_pull_requests`.
+
+        Staged ones are how a test says "somebody else already opened a pull request
+        creating that store" without running a whole chain first. Copies, like every other
+        pull-request method here.
+        """
+        self._record("list_pull_requests")
+        stored = [
+            replace(pull_request)
+            for pull_request in self.pull_requests.values()
+            if state in ("ALL", pull_request.state)
+        ]
+        staged = [
+            replace(pull_request)
+            for pull_request in self.open_pull_requests
+            if state in ("ALL", pull_request.state)
+        ]
+        return stored + staged
+
+    async def get_pull_request_changes(
+        self, pull_request_id: int, page_size: int = 1000
+    ) -> List[str]:
+        """Paths a pull request touches, from `pull_request_changes`.
+
+        Defaults to empty rather than guessing from `committed`: a test that cares about
+        the duplicate-name scan says exactly what the other pull request contains, and one
+        that does not is unaffected.
+        """
+        self._record("get_pull_request_changes")
+        return list(self.pull_request_changes.get(pull_request_id, []))
 
     async def get_pull_request(self, pull_request_id: int) -> PullRequest:
         self._record("get_pull_request")
