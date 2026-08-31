@@ -96,7 +96,7 @@ uv-managed (Python 3.12). Package indexes come from `uv.toml` (internal Artifact
 ```bash
 uv sync --group dev                 # install deps into .venv — ON-PREM ONLY, see below
 uv run --no-sync python -m app.main # serves on 0.0.0.0:5000 (--host/--port override)
-uv run --no-sync pytest             # everything under tests/ (316 tests, ~22s)
+uv run --no-sync pytest             # everything under tests/ (331 tests, ~22s)
 uv run --no-sync pytest tests/v1/vault                                        # one suite
 uv run --no-sync pytest tests/v1/vault/test_operations.py::test_create_call_order      # one test
 docker build -t vault-api . && docker run -p 5000:5000 --env-file .env vault-api
@@ -148,7 +148,6 @@ segments in the builds endpoint. Keep all three if you extend it.
 | `PATCH /api/vault/v1/kv/{kv_name}` | `{access}` | replaces the grant list wholesale; 201 (200 if unchanged) |
 | `DELETE /api/vault/v1/kv/{kv_name}` | — | **removes the store's directory**, both files with it; 201 |
 | `POST /api/vault/v1/kv/{kv_name}/access` | one entry | appends one grant to whichever file its `auth_type` selects; 201 |
-| `GET /api/vault/v1/kv/{kv_name}/access` | — | that store's grants (empty list, not 404, when it grants none) |
 | `DELETE /api/vault/v1/kv/{kv_name}/access` | `?auth_type=&path=&…` | revokes one grant; 201 |
 | `PUT /api/vault/v1/kv/tashtiot/{team}` | `{access}` | create-or-replace one team's shared-services grants; 201 (200 if unchanged) |
 | `GET /api/vault/v1/kv/tashtiot/{team}` | — | that team's file, parsed and returned as-is |
@@ -173,6 +172,13 @@ the 404, so a values directory in an unexpected shape does not read as a deleted
 binding *is* an access entry, so it goes through the same `/{kv_name}/access` pair as an OIDC
 grant and the `auth_type` picks the file. One endpoint, one list, no second route to keep in
 step. There is also no `GET /files/{file}`: a file is not an address, a store is.
+
+**There is no `GET` on `/{kv_name}/access`, only `POST` and `DELETE`.** It used to return
+that store's grants — which is exactly `GET /{kv_name}`'s `access` key, unwrapped and with
+nothing else, for the identical upstream work (both resolve the store: one directory listing
+plus the file reads). Two spellings of one answer is two things to keep in step, so the store
+read is the only one. **The path still exists**, so a `GET` there is a **405**, not a 404;
+`test_reading_the_access_list_alone_is_gone` pins that. The grants are `body["access"]`.
 
 **There is no `PATCH` on a single grant.** An entry's identity is everything but its
 capabilities, so "editing" one is a revoke plus a grant — and `PATCH /{kv_name}` already
@@ -263,7 +269,7 @@ The format is the pipeline's, so each decision has exactly one home:
 | the two filenames, and which kind goes in which | `OIDC_ACCESS_FILE` / `K8S_ACCESS_FILE` / `access_path_for` in `helpers.py` |
 | the directory shape | `kv_store_dir` / `tashtiot_access_path` in `helpers.py` |
 | whether an emptied list is dropped or kept as `[]` | `remove_access_entry` (keeps) and `_store_writes` (drops the file) |
-| sequence indentation and block-scalar style | `_BlockStyleDumper` in `helpers.py` |
+| indentation, quote character and block-scalar style | `_BlockStyleDumper` in `helpers.py` |
 | the allowed capabilities | `Capability` in `schemas.py` |
 | the k8s name patterns and limits | the `K8S_*_PATTERN` / `K8S_*_MAX_LENGTH` constants in `schemas.py` |
 | the branch prefix | `BRANCH_PREFIX` in `conf.py` |
@@ -412,8 +418,8 @@ is the *caller's* decision, made in `_store_writes` and `_prepare_access_change`
 `build_branch_name` collapses its two coordinates when they match, so a store whose name
 equals its team renders `vault-kv/cloudops-abc123` rather than `vault-kv/cloudops-cloudops-…`.
 
-`render_values_yaml` uses a `SafeDumper` subclass, `_BlockStyleDumper`, doing **two** things
-PyYAML does not, both about the committed text rather than its meaning:
+`render_values_yaml` uses a `SafeDumper` subclass, `_BlockStyleDumper`, doing **four** things
+PyYAML does not, all about the committed text rather than its meaning:
 
 - **`increase_indent` forces block sequences to indent under their key** — `  - path:` and
   not the flush `- path:` PyYAML emits. Both parse identically, but the indented form is the
@@ -422,10 +428,25 @@ PyYAML does not, both about the committed text rather than its meaning:
   `test_oidc_file_has_the_expected_shape` pins the exact bytes.
 - **multi-line strings become `|` blocks** — the default representer emits one escaped,
   width-wrapped scalar, unreadable in the pull request diff a human is supposed to review.
+- **`choose_scalar_style` turns every single quote into a double one.** PyYAML prefers `'*'`;
+  the files are written `"*"`. It rewrites only the *quote character* a quoted scalar would
+  have got — a plain-safe value stays bare, so this does not quote the document.
+  `test_nothing_is_single_quoted` pins it.
+- **`represent_mapping` quotes `dn` even though it need not be.** A DN is plain-safe, so
+  PyYAML would emit it bare, and unquoted it reads as structure rather than one value. `dn`
+  is the only key treated this way; `DN_KEY` in `helpers.py` is where that is stated.
 
 `sort_keys=False` is what preserves entry field order; alphabetical would reorder every entry
-away from the spec's shape. Note also that `*` is emitted as `'*'` — a bare `*` is a YAML
+away from the spec's shape. Note also that `*` is emitted as `"*"` — a bare `*` is a YAML
 alias and would not round-trip.
+
+**Reformatting on first touch is expected, not a bug.** Every edit is a full round-trip —
+`safe_load` to data, transform, re-dump the whole document — so a file this service has not
+written before comes back in the dumper's style: comments and blank lines dropped, flow lists
+expanded, quoting normalised. Only the *text* changes; the entries' values and their existing
+key order survive. After that first pull request the file is canonical and later edits diff as
+one added entry. Preserving comments would mean a round-trip loader (`ruamel.yaml`) in place
+of `render_values_yaml` and `safe_load` both.
 
 ## The chain — read this before editing `operations.py`
 
@@ -608,7 +629,7 @@ merged its pull request. It is also why a repeat create opens a second pull requ
   the failure path silently omits it unless `to_response()` is updated too.
 - The committed entries are the contract with the deploy pipeline — change
   `build_oidc_access_entry` / `build_k8s_access_entry` and the pipeline together.
-- Tests: 316 of them. `tests/test_helpers.py` (pure, no library import — the document model
+- Tests: 331 of them. `tests/test_helpers.py` (pure, no library import — the document model
   and the exact committed bytes), `tests/clients/` (the Bitbucket client and `http.py`'s error
   mapping against the real REST shapes via respx, plus `test_git.py` running **real git
   against a real bare repo** in a temp dir), `tests/v1/vault/` (schemas, the chain + rollbacks

@@ -155,12 +155,20 @@ def test_get_an_unknown_store_is_404(client, auth_headers):
     assert response.status_code == 404
 
 
-def test_get_the_access_list_alone(client, auth_headers, bitbucket):
+def test_reading_the_access_list_alone_is_gone(client, auth_headers, bitbucket):
+    """It answered `GET /{kv_name}`'s `access` list unwrapped — the same upstream work for
+    strictly less. POST and DELETE still live on the path, so this is a 405, not a 404."""
     seed_store(bitbucket, oidc=[oidc_entry()])
 
-    body = client.get(ACCESS_URL, headers=auth_headers).json()
+    assert client.get(ACCESS_URL, headers=auth_headers).status_code == 405
 
-    assert [entry["dn"] for entry in body] == [DN]
+
+def test_the_store_read_is_where_the_grants_are_now(client, auth_headers, bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry()])
+
+    body = client.get(STORE_URL, headers=auth_headers).json()
+
+    assert [entry["dn"] for entry in body["access"]] == [DN]
 
 
 def test_listing_stores(client, auth_headers, bitbucket):
@@ -547,3 +555,88 @@ def test_the_sub_resource_pull_request_routes_are_gone(
     assert client.post(url, json={}, headers=auth_headers).status_code == 404
     assert client.delete(url, headers=auth_headers).status_code == 404
     assert bitbucket.calls == []
+
+
+# --------------------------------------------------------------------------- #
+# committed style, every writing route
+#
+# `render_values_yaml` is the only serializer, so the style rules hold everywhere by
+# construction. These pin it end-to-end anyway: the guarantee is about the bytes a route
+# commits, and a second render site added later would satisfy the helper tests while
+# quietly writing a different shape here.
+# --------------------------------------------------------------------------- #
+def _write_via_create(client, auth_headers, bitbucket):
+    client.post(
+        CREATE_URL,
+        json={"team": TEAM, "kv_name": KV, "access": [
+            {"path": "*", "auth_type": "oidc", "dn": DN, "capabilities": ["read"]},
+            {"path": "*", "auth_type": "k8s", "name": "argocd",
+             "namespace": "perimeter", "cluster": "dev", "capabilities": ["read"]},
+        ]},
+        headers=auth_headers,
+    )
+
+
+def _write_via_patch(client, auth_headers, bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry()])
+    client.patch(
+        STORE_URL,
+        json={"access": [
+            {"path": "*", "auth_type": "oidc", "dn": OTHER_DN, "capabilities": ["read"]}
+        ]},
+        headers=auth_headers,
+    )
+
+
+def _write_via_grant(client, auth_headers, bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry()])
+    client.post(
+        ACCESS_URL,
+        json={"path": "*", "auth_type": "oidc", "dn": OTHER_DN, "capabilities": ["read"]},
+        headers=auth_headers,
+    )
+
+
+def _write_via_revoke(client, auth_headers, bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry(), oidc_entry(dn=OTHER_DN)])
+    client.delete(
+        f"{ACCESS_URL}?auth_type=oidc&path=*&dn={OTHER_DN}", headers=auth_headers
+    )
+
+
+def _write_via_tashtiot(client, auth_headers, bitbucket):
+    client.put(TASHTIOT_URL, json=TASHTIOT_BODY, headers=auth_headers)
+
+
+WRITING_ROUTES = [
+    ("POST /", _write_via_create),
+    ("PATCH /{kv_name}", _write_via_patch),
+    ("POST /{kv_name}/access", _write_via_grant),
+    ("DELETE /{kv_name}/access", _write_via_revoke),
+    ("PUT /tashtiot/{team}", _write_via_tashtiot),
+]
+
+
+@pytest.mark.parametrize("route,write", WRITING_ROUTES, ids=[r for r, _ in WRITING_ROUTES])
+def test_every_writing_route_commits_double_quotes_only(
+    client, auth_headers, bitbucket, route, write
+):
+    """PyYAML prefers `'*'`; every route commits `"*"`."""
+    write(client, auth_headers, bitbucket)
+
+    assert bitbucket.committed, route
+    for path, content in bitbucket.committed.items():
+        assert "'" not in content, f"{route} -> {path}"
+
+
+@pytest.mark.parametrize("route,write", WRITING_ROUTES, ids=[r for r, _ in WRITING_ROUTES])
+def test_every_writing_route_quotes_the_dn(
+    client, auth_headers, bitbucket, route, write
+):
+    """A DN is plain-safe, so nothing but the dumper's rule keeps it quoted."""
+    write(client, auth_headers, bitbucket)
+
+    for path, content in bitbucket.committed.items():
+        for entry in yaml.safe_load(content)["access"]:
+            if "dn" in entry:
+                assert f'dn: "{entry["dn"]}"' in content, f"{route} -> {path}"

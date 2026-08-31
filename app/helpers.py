@@ -65,6 +65,10 @@ K8S_AUTH_TYPE = "k8s"
 
 CAPABILITIES_KEY = "capabilities"
 
+# The OIDC entry's principal. Named because the dumper quotes it specially, not only
+# because the entry builder writes it.
+DN_KEY = "dn"
+
 # The two files a KV store directory holds. A store with no grants of one kind simply has
 # no file of that kind.
 OIDC_ACCESS_FILE = "oidc-access.yaml"
@@ -72,7 +76,7 @@ K8S_ACCESS_FILE = "k8s-access.yaml"
 
 # Field order within an entry, which is the committed text's order — `sort_keys=False` in
 # `render_values_yaml` is what preserves it. Kept as tuples so the order is stated once.
-_OIDC_ENTRY_KEYS = ("path", AUTH_TYPE_KEY, "dn", CAPABILITIES_KEY)
+_OIDC_ENTRY_KEYS = ("path", AUTH_TYPE_KEY, DN_KEY, CAPABILITIES_KEY)
 _K8S_ENTRY_KEYS = ("path", AUTH_TYPE_KEY, "name", "namespace", "cluster", CAPABILITIES_KEY)
 
 
@@ -158,7 +162,7 @@ def build_oidc_access_entry(
     return {
         "path": path,
         AUTH_TYPE_KEY: OIDC_AUTH_TYPE,
-        "dn": dn,
+        DN_KEY: dn,
         CAPABILITIES_KEY: list(capabilities),
     }
 
@@ -353,6 +357,34 @@ class _BlockStyleDumper(yaml.SafeDumper):
         file has one style throughout.
         """
         return super().increase_indent(flow=flow, indentless=False)
+
+    def choose_scalar_style(self) -> Any:
+        """Double quotes wherever PyYAML would have reached for single ones.
+
+        PyYAML prefers `'*'`; the pipeline's files are written with `"*"`. The two parse
+        identically — this is about the committed text matching the format's shape, like
+        the sequence indentation above. Only *quoted* scalars are affected: a value that
+        needs no quoting stays plain, so this does not quote the whole document.
+        """
+        style = super().choose_scalar_style()
+        return '"' if style == "'" else style
+
+    def represent_mapping(self, tag: str, mapping: Any, flow_style: Any = None) -> Any:
+        """Quote `dn` even though it needs no quoting.
+
+        A distinguished name is plain-safe, so PyYAML would emit it bare. The format's
+        templates show it quoted, and the quotes are load-bearing for a reader: a DN is
+        full of `=` and `,` and reads as structure otherwise.
+        """
+        node = super().represent_mapping(tag, mapping, flow_style)
+        for key_node, value_node in node.value:
+            if (
+                key_node.value == DN_KEY
+                and isinstance(value_node, yaml.ScalarNode)
+                and value_node.style not in ("|", ">")
+            ):
+                value_node.style = '"'
+        return node
 
 
 def _represent_str(dumper: yaml.Dumper, data: str) -> Any:

@@ -14,7 +14,6 @@ from app.v1.vault.operations import (
     add_access_entry_operation,
     create_kv_mount_operation,
     delete_kv_store_operation,
-    get_kv_access_operation,
     get_kv_store_operation,
     list_kv_stores_operation,
     remove_access_entry_operation,
@@ -304,15 +303,17 @@ async def test_a_store_is_found_by_name_alone(bitbucket):
 async def test_a_read_returns_both_kinds_oidc_first(bitbucket):
     seed_store(bitbucket, oidc=[oidc_entry()], k8s=[k8s_entry()])
 
-    entries = await get_kv_access_operation(bitbucket, KV)
+    store = await get_kv_store_operation(bitbucket, KV)
 
-    assert [entry["authType"] for entry in entries] == ["oidc", "k8s"]
+    assert [entry["authType"] for entry in store["access"]] == ["oidc", "k8s"]
 
 
 async def test_a_store_with_no_k8s_file_reads_as_oidc_only(bitbucket):
     seed_store(bitbucket, oidc=[oidc_entry()])
 
-    assert [e["authType"] for e in await get_kv_access_operation(bitbucket, KV)] == ["oidc"]
+    store = await get_kv_store_operation(bitbucket, KV)
+
+    assert [entry["authType"] for entry in store["access"]] == ["oidc"]
 
 
 async def test_an_unknown_store_is_404(bitbucket):

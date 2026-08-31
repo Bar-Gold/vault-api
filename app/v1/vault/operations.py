@@ -1110,12 +1110,6 @@ async def get_kv_store_operation(bitbucket: Any, kv_name: str) -> Dict[str, Any]
     }
 
 
-async def get_kv_access_operation(bitbucket: Any, kv_name: str) -> List[Dict[str, Any]]:
-    """Just the grants on one store. An empty list is a 200, not a 404."""
-    store = await _resolve_store(bitbucket, kv_name)
-    return store.access
-
-
 async def list_kv_stores_operation(bitbucket: Any) -> List[Dict[str, Any]]:
     """Every store in the values directory: team, name and directory.
 

@@ -31,7 +31,6 @@ from .operations import (
     create_kv_mount_operation,
     delete_kv_store_operation,
     delete_tashtiot_access_operation,
-    get_kv_access_operation,
     get_kv_store_operation,
     get_tashtiot_access_operation,
     list_kv_stores_operation,
@@ -374,17 +373,9 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         return await _execute(add_access_entry_operation(bitbucket, kv_name, payload))
 
 
-    @router.get(
-        "/{kv_name}/access",
-        summary="Every grant on one store",
-        description=(
-            "Both kinds together, oidc first — the order a create writes them. A store "
-            "that grants nothing answers 200 with an empty list, not 404."
-        ),
-    )
-    async def get_access(kv_name: KVNameParam):
-        return await _read(get_kv_access_operation(bitbucket, kv_name))
-
+    # No `GET /{kv_name}/access`. It returned exactly `GET /{kv_name}`'s `access` list,
+    # unwrapped and with nothing else — the same upstream work for strictly less than the
+    # store read already gives. Read the store; the grants are the `access` key.
     @router.delete(
         "/{kv_name}/access",
         response_model=VaultOperationResponse,

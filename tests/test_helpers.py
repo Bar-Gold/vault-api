@@ -133,9 +133,9 @@ def test_oidc_file_has_the_expected_shape():
 
     assert rendered == (
         "access:\n"
-        "  - path: '*'\n"
+        '  - path: "*"\n'
         "    authType: oidc\n"
-        f"    dn: {DN}\n"
+        f'    dn: "{DN}"\n'
         "    capabilities:\n"
         "      - read\n"
         "      - write\n"
@@ -147,7 +147,7 @@ def test_k8s_file_has_the_expected_shape():
 
     assert rendered == (
         "access:\n"
-        "  - path: '*'\n"
+        '  - path: "*"\n'
         "    authType: k8s\n"
         "    name: cloudops-external-secrets\n"
         "    namespace: cloudops\n"
@@ -158,11 +158,42 @@ def test_k8s_file_has_the_expected_shape():
 
 
 def test_the_star_path_is_quoted():
-    """A bare `*` is a YAML alias, so an unquoted one would not round-trip."""
+    """A bare `*` is a YAML alias, so an unquoted one would not round-trip.
+
+    Double quotes, not PyYAML's preferred single ones — see `choose_scalar_style`.
+    """
     rendered = render_values_yaml(build_access_document([_oidc(path="*")]))
 
-    assert "path: '*'" in rendered
+    assert 'path: "*"' in rendered
     assert yaml.safe_load(rendered)["access"][0]["path"] == "*"
+
+
+def test_nothing_is_single_quoted():
+    """PyYAML reaches for `'` first; the committed text uses `"` throughout."""
+    rendered = render_values_yaml(
+        build_access_document([_oidc(path="*"), _k8s(path="*")])
+    )
+
+    assert "'" not in rendered
+
+
+def test_the_dn_is_quoted_even_though_it_need_not_be():
+    """A DN is plain-safe, so PyYAML would emit it bare. It is full of `=` and `,`, which
+    read as structure unquoted — and the format's templates show it quoted."""
+    rendered = render_values_yaml(build_access_document([_oidc()]))
+
+    assert f'dn: "{DN}"' in rendered
+    assert yaml.safe_load(rendered)["access"][0]["dn"] == DN
+
+
+def test_quoting_is_only_where_it_is_needed():
+    """Forcing double quotes must not quote the whole document — a plain-safe value that
+    is not a `dn` stays bare, or every diff would be noise."""
+    rendered = render_values_yaml(build_access_document([_k8s()]))
+
+    assert "namespace: cloudops\n" in rendered
+    assert "authType: k8s\n" in rendered
+    assert "      - read\n" in rendered
 
 
 def test_a_scoped_path_round_trips():
