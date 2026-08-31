@@ -96,7 +96,7 @@ uv-managed (Python 3.12). Package indexes come from `uv.toml` (internal Artifact
 ```bash
 uv sync --group dev                 # install deps into .venv — ON-PREM ONLY, see below
 uv run --no-sync python -m app.main # serves on 0.0.0.0:5000 (--host/--port override)
-uv run --no-sync pytest             # everything under tests/ (331 tests, ~22s)
+uv run --no-sync pytest             # everything under tests/ (334 tests, ~26s)
 uv run --no-sync pytest tests/v1/vault                                        # one suite
 uv run --no-sync pytest tests/v1/vault/test_operations.py::test_create_call_order      # one test
 docker build -t vault-api . && docker run -p 5000:5000 --env-file .env vault-api
@@ -536,6 +536,18 @@ grant lives inside the store it reaches, so the directory takes every grant with
 nothing is left dangling. There is no `yaml_data_equals` short circuit either — a removal is
 never a no-op.
 
+**The team directory goes too when that store was the team's last, and no code decides
+that.** Git stores a tree of blobs and has no concept of an empty directory — one exists
+exactly as long as something is under it — so `git rm -r KVs/<team>/<kv>` takes the store
+directory with the files, and `KVs/<team>` disappears from the commit as well once nothing
+else is under it. A team with another store keeps its directory, for the same reason.
+`tests/clients/test_git.py` pins all three against a real repo, because this is the obvious
+thing to "fix" by hand and a `.gitkeep` or a per-file removal would quietly break it. **There
+is nothing to add here**: git cannot be asked to delete a directory that holds no files,
+because for git it does not exist. If an empty directory ever appears, it is in a *working
+clone* — `git pull` does not prune directories that its merge emptied (`git clean -fd` does,
+and a fresh clone never has them) — not in the repository.
+
 **One grant at a time** (`_prepare_access_change`) reads only the file its `auth_type`
 selects, so a Kubernetes grant never appears in the diff of an OIDC change. An add rejects a
 duplicate identity (409); a remove 404s when the identity is not there. Removing the last
@@ -629,7 +641,7 @@ merged its pull request. It is also why a repeat create opens a second pull requ
   the failure path silently omits it unless `to_response()` is updated too.
 - The committed entries are the contract with the deploy pipeline — change
   `build_oidc_access_entry` / `build_k8s_access_entry` and the pipeline together.
-- Tests: 331 of them. `tests/test_helpers.py` (pure, no library import — the document model
+- Tests: 334 of them. `tests/test_helpers.py` (pure, no library import — the document model
   and the exact committed bytes), `tests/clients/` (the Bitbucket client and `http.py`'s error
   mapping against the real REST shapes via respx, plus `test_git.py` running **real git
   against a real bare repo** in a temp dir), `tests/v1/vault/` (schemas, the chain + rollbacks

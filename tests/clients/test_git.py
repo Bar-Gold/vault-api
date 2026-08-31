@@ -142,6 +142,88 @@ async def test_a_second_branch_can_be_pushed_from_the_same_base(origin, remover)
 
 
 # --------------------------------------------------------------------------- #
+# what a store delete leaves behind
+#
+# Git stores a tree of blobs and has no concept of an empty directory: a directory
+# exists exactly as long as something is under it. So `git rm -r` on a store takes the
+# store directory with the files, and takes the *team* directory too when that store was
+# the team's last — with no code here deciding either. These pin that, because it is the
+# obvious thing to "fix" by hand and because a `.gitkeep` or a per-file removal would
+# quietly break it.
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def stores(tmp_path):
+    """A values repo in the real layout: one team with a single store, one with two."""
+    bare = tmp_path / "scm" / PROJECT / f"{SLUG}.git"
+    bare.parent.mkdir(parents=True)
+    _git("init", "--bare", f"--initial-branch={BASE_BRANCH}", str(bare), cwd=tmp_path)
+
+    work = tmp_path / "stores-seed"
+    work.mkdir()
+    _git("init", f"--initial-branch={BASE_BRANCH}", cwd=work)
+    _git("remote", "add", "origin", bare.as_posix(), cwd=work)
+    for team, kv in (("cloudops", "my-passwords"), ("platform", "a"), ("platform", "b")):
+        directory = work / "KVs" / team / kv
+        directory.mkdir(parents=True)
+        (directory / "oidc-access.yaml").write_text("access: []\n", encoding="utf-8")
+        (directory / "k8s-access.yaml").write_text("access: []\n", encoding="utf-8")
+    _git("add", "-A", cwd=work)
+    _git(
+        "-c", "user.name=seed", "-c", "user.email=seed@test", "commit", "-m", "seed",
+        cwd=work,
+    )
+    _git("push", "origin", BASE_BRANCH, cwd=work)
+    return bare
+
+
+def _dirs_under(bare, ref, prefix):
+    """The directory entries git actually records at `prefix` — not derived from paths."""
+    listing = _git("ls-tree", "--name-only", ref, prefix, cwd=bare)
+    return listing.splitlines() if listing else []
+
+
+async def test_deleting_a_store_removes_its_directory(stores, remover):
+    """Both files and the directory holding them, in one `git rm -r`."""
+    await remover.remove_file(
+        path="KVs/cloudops/my-passwords",
+        branch="drop-store",
+        base_branch=BASE_BRANCH,
+        message="Delete KV store my-passwords",
+    )
+
+    assert not [
+        path
+        for path in _tree(stores, "drop-store")
+        if path.startswith("KVs/cloudops/my-passwords")
+    ]
+
+
+async def test_deleting_a_teams_last_store_removes_the_team_directory(stores, remover):
+    """cloudops owned exactly one store, so nothing is left to keep `KVs/cloudops` alive."""
+    await remover.remove_file(
+        path="KVs/cloudops/my-passwords",
+        branch="drop-store",
+        base_branch=BASE_BRANCH,
+        message="Delete KV store my-passwords",
+    )
+
+    assert _dirs_under(stores, "drop-store", "KVs/") == ["KVs/platform"]
+
+
+async def test_a_team_with_another_store_keeps_its_directory(stores, remover):
+    """The inverse, so the rule above cannot become "always drop the team directory"."""
+    await remover.remove_file(
+        path="KVs/platform/a",
+        branch="drop-one-of-two",
+        base_branch=BASE_BRANCH,
+        message="Delete KV store a",
+    )
+
+    assert "KVs/platform" in _dirs_under(stores, "drop-one-of-two", "KVs/")
+    assert "KVs/platform/b/oidc-access.yaml" in _tree(stores, "drop-one-of-two")
+
+
+# --------------------------------------------------------------------------- #
 # failures — every one has to arrive as ExternalServiceError, like the REST half
 # --------------------------------------------------------------------------- #
 async def test_removing_a_path_that_is_not_there_is_a_502(origin, remover):
