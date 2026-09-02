@@ -11,15 +11,20 @@ from pydantic import ValidationError
 
 from app.v1.vault.schemas import (
     KV_NAME_PATTERN,
+    METADATA_MAX_LENGTH,
     TEAM_PATTERN,
     VAULT_PATH_PATTERN,
     Capability,
     K8sAccessEntry,
+    K8sAccessEntryRequest,
     OidcAccessEntry,
+    OidcAccessEntryRequest,
+    RequestMetadata,
     TashtiotAccessUpsert,
     VaultKVCreate,
     VaultKVUpdate,
 )
+from tests.v1.vault.conftest import METADATA
 
 DN = "CN=cloudops,OU=Groups,DC=corp,DC=example,DC=com"
 
@@ -35,7 +40,12 @@ K8S = {
 
 
 def _create(**overrides):
-    values = {"team": "cloudops", "kv_name": "my-passwords", "access": [OIDC]}
+    values = {
+        "team": "cloudops",
+        "kv_name": "my-passwords",
+        "access": [OIDC],
+        "metadata": METADATA,
+    }
     values.update(overrides)
     return VaultKVCreate(**values)
 
@@ -43,9 +53,12 @@ def _create(**overrides):
 # --------------------------------------------------------------------------- #
 # the request's shape
 # --------------------------------------------------------------------------- #
-def test_create_takes_exactly_three_fields():
-    """No kv_description: the format defines no home for it."""
-    assert set(VaultKVCreate.model_fields) == {"team", "kv_name", "access"}
+def test_create_takes_exactly_four_fields():
+    """No kv_description: the format defines no home for it.
+
+    And `metadata`, which is required but is the one field that never reaches a file.
+    """
+    assert set(VaultKVCreate.model_fields) == {"team", "kv_name", "access", "metadata"}
 
 
 def test_there_is_no_description_field():
@@ -60,7 +73,11 @@ def test_there_is_no_roles_field():
 
 
 def test_an_unknown_field_is_rejected():
-    """Ignoring it would answer 201 for a request nobody meant to send."""
+    """Ignoring it would answer 201 for a request nobody meant to send.
+
+    A *top-level* `environment` is still forbidden. This is not a duplicate of the
+    metadata tests: the block's own `environment` is a different, nested key.
+    """
     with pytest.raises(ValidationError):
         _create(environment="prod")
 
@@ -259,8 +276,9 @@ def test_an_empty_access_list_is_rejected():
 
 
 def test_access_is_required():
+    """`metadata` is passed so the failure is attributable to `access` alone."""
     with pytest.raises(ValidationError):
-        VaultKVCreate(team="cloudops", kv_name="my-passwords")
+        VaultKVCreate(team="cloudops", kv_name="my-passwords", metadata=METADATA)
 
 
 def test_two_grants_with_the_same_identity_are_rejected():
@@ -284,25 +302,164 @@ def test_the_same_account_in_two_namespaces_is_fine():
 @pytest.mark.parametrize("model", [VaultKVUpdate, TashtiotAccessUpsert])
 def test_the_list_models_reject_an_empty_list(model):
     with pytest.raises(ValidationError):
-        model(access=[])
+        model(access=[], metadata=METADATA)
 
 
 @pytest.mark.parametrize("model", [VaultKVUpdate, TashtiotAccessUpsert])
 def test_the_list_models_forbid_extras(model):
     with pytest.raises(ValidationError):
-        model(access=[OIDC], team="cloudops")
+        model(access=[OIDC], metadata=METADATA, team="cloudops")
 
 
 def test_update_does_not_take_a_name():
     """Renaming is a Vault migration, not a field edit — a delete plus a create."""
-    assert set(VaultKVUpdate.model_fields) == {"access"}
+    assert set(VaultKVUpdate.model_fields) == {"access", "metadata"}
 
 
 def test_a_single_grant_is_the_body_on_its_own():
-    """The sub-resource form posts one entry, with no wrapper object around it."""
-    assert K8sAccessEntry(**K8S).name == "cloudops-external-secrets"
+    """The sub-resource form posts one entry, with no wrapper object around it.
+
+    The body is the *Request* entry — the same grant plus the metadata block — because
+    metadata is a property of the request rather than of a grant.
+    """
+    entry = K8sAccessEntryRequest(**K8S, metadata=METADATA)
+
+    assert entry.name == "cloudops-external-secrets"
+    assert entry.metadata.project == "cloudops"
 
 
 def test_a_single_grant_forbids_extras():
     with pytest.raises(ValidationError):
-        OidcAccessEntry(**OIDC, kv_name="my-passwords")
+        OidcAccessEntryRequest(**OIDC, metadata=METADATA, kv_name="my-passwords")
+
+
+# --------------------------------------------------------------------------- #
+# metadata — required on every body, and the one field that never reaches a file
+# --------------------------------------------------------------------------- #
+METADATA_NAMES = ("project", "network", "region", "space", "environment", "island")
+
+
+def _body_without_metadata(model):
+    """The smallest valid body for each of the five models, minus the metadata block."""
+    if model is VaultKVCreate:
+        return {"team": "cloudops", "kv_name": "my-passwords", "access": [OIDC]}
+    if model in (VaultKVUpdate, TashtiotAccessUpsert):
+        return {"access": [OIDC]}
+    if model is OidcAccessEntryRequest:
+        return dict(OIDC)
+    return dict(K8S)
+
+
+@pytest.mark.parametrize("model", [
+    VaultKVCreate,
+    VaultKVUpdate,
+    TashtiotAccessUpsert,
+    OidcAccessEntryRequest,
+    K8sAccessEntryRequest,
+])
+def test_metadata_is_required_on_every_body_model(model):
+    """All five bodies, one rule — an omitted block is a 422, never a default."""
+    with pytest.raises(ValidationError):
+        model(**_body_without_metadata(model))
+
+
+@pytest.mark.parametrize("name", METADATA_NAMES)
+def test_metadata_needs_all_six_fields(name):
+    """An incomplete block is a 422: five coordinates do not locate a deployment."""
+    block = {key: value for key, value in METADATA.items() if key != name}
+
+    with pytest.raises(ValidationError):
+        _create(metadata=block)
+
+
+@pytest.mark.parametrize("name", METADATA_NAMES)
+@pytest.mark.parametrize("value", ["", "   "])
+def test_a_blank_metadata_value_is_rejected(name, value):
+    with pytest.raises(ValidationError):
+        _create(metadata={**METADATA, name: value})
+
+
+@pytest.mark.parametrize("name", METADATA_NAMES)
+def test_metadata_values_are_stripped(name):
+    """The same rule `dn` follows, so the description reads without stray spaces."""
+    payload = _create(metadata={**METADATA, name: " alpha "})
+
+    assert getattr(payload.metadata, name) == "alpha"
+
+
+def test_metadata_is_capped_at_253():
+    """Same number as the service-account limit, deliberately not the same rule."""
+    assert _create(metadata={**METADATA, "project": "a" * METADATA_MAX_LENGTH})
+
+    with pytest.raises(ValidationError):
+        _create(metadata={**METADATA, "project": "a" * (METADATA_MAX_LENGTH + 1)})
+
+
+def test_metadata_forbids_an_unknown_field():
+    """A typo'd seventh key is a 422, not a silently dropped coordinate."""
+    with pytest.raises(ValidationError):
+        _create(metadata={**METADATA, "zone": "il-central-1a"})
+
+
+@pytest.mark.parametrize("value", [
+    "with spaces",
+    "dotted.value",
+    "a/b/c",
+    "UPPERCASE",
+    "מרכז",
+    "island-a_1",
+])
+def test_metadata_values_are_free_form(value):
+    """The vocabulary is the deploying team's, exactly like `dn` — no pattern here.
+
+    Anything tight enough to describe the organisation's names would reject forms this
+    service does not own, so only blank and over-long are refused.
+    """
+    for name in METADATA_NAMES:
+        assert getattr(_create(metadata={**METADATA, name: value}).metadata, name) == value
+
+
+def test_a_grant_inside_a_list_may_not_carry_metadata():
+    """Metadata is a property of the *request*, not of a grant."""
+    with pytest.raises(ValidationError):
+        _create(access=[{**OIDC, "metadata": METADATA}])
+
+
+@pytest.mark.parametrize("request_model,base_model", [
+    (OidcAccessEntryRequest, OidcAccessEntry),
+    (K8sAccessEntryRequest, K8sAccessEntry),
+])
+def test_the_request_entry_is_the_plain_entry_plus_metadata(request_model, base_model):
+    assert set(request_model.model_fields) == set(base_model.model_fields) | {"metadata"}
+
+
+def test_a_request_entry_is_still_the_entry_it_extends():
+    """What keeps `to_document_entry`'s dispatch correct.
+
+    It branches on `isinstance(entry, K8sAccessEntry)`, so a later "let us stop
+    subclassing" refactor would silently route every k8s grant to the OIDC builder.
+    """
+    oidc = OidcAccessEntryRequest(**OIDC, metadata=METADATA)
+    k8s = K8sAccessEntryRequest(**K8S, metadata=METADATA)
+
+    assert isinstance(oidc, OidcAccessEntry)
+    assert isinstance(k8s, K8sAccessEntry)
+    # ...and not the other one, which is the half the dispatch actually reads.
+    assert not isinstance(oidc, K8sAccessEntry)
+
+
+@pytest.mark.parametrize("model,values", [
+    (OidcAccessEntryRequest, OIDC),
+    (K8sAccessEntryRequest, K8S),
+])
+def test_the_request_entries_forbid_extras(model, values):
+    """The config is merged with the parent's, so `extra: forbid` travels along."""
+    with pytest.raises(ValidationError):
+        model(**values, metadata=METADATA, kv_name="x")
+
+
+def test_the_metadata_log_line_keeps_declaration_order():
+    """`routes.py` logs this; two requests must read the same way."""
+    text = RequestMetadata(**METADATA).as_log_text()
+
+    assert text == " ".join(f"{name}={METADATA[name]}" for name in METADATA_NAMES)

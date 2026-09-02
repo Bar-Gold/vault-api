@@ -48,10 +48,12 @@ from .schemas import (
     K8S_SERVICE_ACCOUNT_MAX_LENGTH,
     K8S_SERVICE_ACCOUNT_PATTERN,
     KV_NAME_PATTERN,
+    KV_NAME_READ_PATTERN,
     TEAM_PATTERN,
+    TEAM_READ_PATTERN,
     VAULT_PATH_MAX_LENGTH,
     VAULT_PATH_PATTERN,
-    AccessEntry,
+    AccessEntryRequest,
     AuthType,
     OperationStatus,
     TashtiotAccessUpsert,
@@ -80,6 +82,39 @@ TeamParam = Annotated[
         pattern=TEAM_PATTERN,
         examples=["cloudops"],
         description="Team whose Tashtiot access file this is.",
+    ),
+]
+
+# The same two, as the **read** routes accept them: capitals allowed. A create still writes
+# a lowercase name, but the values directory may already hold a capitalised store or team —
+# the walk finds those and `_resolve_store` matches them exactly, so rejecting the request
+# here made them unreachable rather than malformed. Single segment either way, so the
+# path-traversal guard is unchanged. Only `GET` uses these: an edit or a delete of such a
+# store is still a 422, because writing to a name this service would not itself create is a
+# separate decision.
+KVNameReadParam = Annotated[
+    str,
+    Path(
+        max_length=128,
+        pattern=KV_NAME_READ_PATTERN,
+        examples=["my-passwords"],
+        description=(
+            "Name of the KV store, unique across the whole values directory. Matched "
+            "exactly, so capitals must match the directory's own spelling."
+        ),
+    ),
+]
+
+TeamReadParam = Annotated[
+    str,
+    Path(
+        max_length=128,
+        pattern=TEAM_READ_PATTERN,
+        examples=["cloudops"],
+        description=(
+            "Team whose Tashtiot access file this is. Matched exactly, so capitals must "
+            "match the file's own spelling."
+        ),
     ),
 ]
 
@@ -288,11 +323,16 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
             "**The store is not created when this returns** - the pull request is, and it "
             "is open, green and waiting for a human to merge. This service never merges. "
             "A red or timed-out build declines the pull request and deletes the branch, so "
-            "nothing is left behind."
+            "nothing is left behind. "
+            "The metadata block is recorded in the pull-request description for "
+            "audit and is never written to the access files."
         ),
     )
     async def create_kv(payload: VaultKVCreate):
-        logger.info(f"Creating KV store {payload.kv_name} for {payload.team}")
+        logger.info(
+            f"Creating KV store {payload.kv_name} for {payload.team}"
+            f" [{payload.metadata.as_log_text()}]"
+        )
         return await _execute(create_kv_mount_operation(bitbucket, payload))
 
     # Registered before `/{kv_name}` so a store named `pull-request` cannot shadow it.
@@ -314,11 +354,18 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
             "auth types in a single access list. An upsert: create and replace are the "
             "same call because the file's identity is the team. "
             "Answers 201 with the pull request open for review, or 200 with a null "
-            "pull_request when the file already said exactly this."
+            "pull_request when the file already said exactly this. "
+            "The metadata block is recorded in the pull-request description for "
+            "audit and is never written to the access files. "
+            "Metadata alone is not a change: a request whose grants already match "
+            "still answers 200 without opening a pull request."
         ),
     )
     async def upsert_tashtiot(team: TeamParam, payload: TashtiotAccessUpsert):
-        logger.info(f"Upserting {config.TASHTIOT_DIR} access for {team}")
+        logger.info(
+            f"Upserting {config.TASHTIOT_DIR} access for {team}"
+            f" [{payload.metadata.as_log_text()}]"
+        )
         return await _execute(
             upsert_tashtiot_access_operation(bitbucket, team, payload)
         )
@@ -329,7 +376,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         summary="One team's shared-services grants",
         description="The parsed file, returned as-is. 404 when the team has none.",
     )
-    async def get_tashtiot(team: TeamParam):
+    async def get_tashtiot(team: TeamReadParam):
         return await _read(get_tashtiot_access_operation(bitbucket, team))
 
     @router.delete(
@@ -363,11 +410,16 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
             "mixes both. 409 when the identity is already granted, 404 when the team has "
             "no file yet (use PUT to create it). "
             "The grant is not in effect when this returns; the pull request that adds it "
-            "is open for review."
+            "is open for review. "
+            "The metadata block is recorded in the pull-request description for "
+            "audit and is never written to the access files."
         ),
     )
-    async def add_tashtiot_access(team: TeamParam, payload: AccessEntry):
-        logger.info(f"Adding a {config.TASHTIOT_DIR} grant for {team}")
+    async def add_tashtiot_access(team: TeamParam, payload: AccessEntryRequest):
+        logger.info(
+            f"Adding a {config.TASHTIOT_DIR} grant for {team}"
+            f" [{payload.metadata.as_log_text()}]"
+        )
         return await _execute(
             add_tashtiot_access_entry_operation(bitbucket, team, payload)
         )
@@ -433,11 +485,15 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         description=(
             "Appends one entry to whichever access file its auth_type selects, opens a "
             "pull request and waits for the validation build. A grant already present is "
-            "a 409. The grant is not in effect when this returns - a human merges."
+            "a 409. The grant is not in effect when this returns - a human merges. "
+            "The metadata block is recorded in the pull-request description for "
+            "audit and is never written to the access files."
         ),
     )
-    async def add_access(kv_name: KVNameParam, payload: AccessEntry):
-        logger.info(f"Granting access on {kv_name}")
+    async def add_access(kv_name: KVNameParam, payload: AccessEntryRequest):
+        logger.info(
+            f"Granting access on {kv_name} [{payload.metadata.as_log_text()}]"
+        )
         return await _execute(add_access_entry_operation(bitbucket, kv_name, payload))
 
 
@@ -491,7 +547,7 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
             "owns it."
         ),
     )
-    async def get_kv(kv_name: KVNameParam):
+    async def get_kv(kv_name: KVNameReadParam):
         return await _read(get_kv_store_operation(bitbucket, kv_name))
 
     @router.patch(
@@ -505,11 +561,17 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
             "of it. "
             "Answers 201 with the pull request open for review, or 200 with a null "
             "pull_request when the store already said exactly this - that short circuit "
-            "is what keeps repeat requests from filling the values repo with empty diffs."
+            "is what keeps repeat requests from filling the values repo with empty diffs. "
+            "The metadata block is recorded in the pull-request description for "
+            "audit and is never written to the access files. "
+            "Metadata alone is not a change: a request whose grants already match "
+            "still answers 200 without opening a pull request."
         ),
     )
     async def update_kv(kv_name: KVNameParam, payload: VaultKVUpdate):
-        logger.info(f"Updating KV store {kv_name}")
+        logger.info(
+            f"Updating KV store {kv_name} [{payload.metadata.as_log_text()}]"
+        )
         return await _execute(update_kv_mount_operation(bitbucket, kv_name, payload))
 
     @router.delete(

@@ -78,7 +78,7 @@ def test_create_schema_carries_a_readable_example(client):
     schemas = client.get("/openapi.json").json()["components"]["schemas"]
     create = schemas["VaultKVCreate"]
 
-    assert set(create["example"]) == {"team", "kv_name", "access"}
+    assert set(create["example"]) == {"team", "kv_name", "access", "metadata"}
     assert create["properties"]["kv_name"]["examples"] == ["my-passwords"]
     assert "kv_description" not in create["properties"]
 
@@ -134,12 +134,23 @@ def test_every_documented_example_survives_its_own_validators(client):
         assert model(**schemas[name]["example"]), name
 
 
+# The four entry schemas: the list-element pair and the request-body pair. The bodies of
+# the two `.../access` POSTs are the Request ones; the plain pair only ever appears
+# inside an `access` list.
+ENTRY_SCHEMAS = ("OidcAccessEntry", "K8sAccessEntry",
+                 "OidcAccessEntryRequest", "K8sAccessEntryRequest")
+
+
 def test_the_grant_body_carries_an_example_per_branch(client):
-    """`POST /{kv_name}/access` takes one entry as the whole body. Without a model-level
-    example Swagger builds the box from the field schemas and fills every string with
-    "string" — the field-level `examples` do not reach it."""
+    """`POST /{kv_name}/access` takes one entry as the whole body — the *Request* pair,
+    since the body carries the metadata block too. Without a model-level example Swagger
+    builds the box from the field schemas and fills every string with "string" — the
+    field-level `examples` do not reach it."""
     schemas = client.get("/openapi.json").json()["components"]["schemas"]
 
+    assert schemas["OidcAccessEntryRequest"]["example"]["auth_type"] == "oidc"
+    assert schemas["K8sAccessEntryRequest"]["example"]["auth_type"] == "k8s"
+    # The list-element pair keeps its own, for the grants inside an `access` list.
     assert schemas["OidcAccessEntry"]["example"]["auth_type"] == "oidc"
     assert schemas["K8sAccessEntry"]["example"]["auth_type"] == "k8s"
 
@@ -147,28 +158,86 @@ def test_the_grant_body_carries_an_example_per_branch(client):
 def test_both_grant_examples_default_the_path_to_the_whole_store(client):
     schemas = client.get("/openapi.json").json()["components"]["schemas"]
 
-    for name in ("OidcAccessEntry", "K8sAccessEntry"):
+    for name in ENTRY_SCHEMAS:
         assert schemas[name]["example"]["path"] == "*", name
 
 
 def test_the_grant_examples_are_actually_valid(client):
     """An example the schema would reject is worse than none — and these are two branches
     of a discriminated union, so each has to validate as its own kind."""
-    from app.v1.vault.schemas import K8sAccessEntry, OidcAccessEntry
+    from app.v1.vault.schemas import (
+        K8sAccessEntry,
+        K8sAccessEntryRequest,
+        OidcAccessEntry,
+        OidcAccessEntryRequest,
+    )
 
     schemas = client.get("/openapi.json").json()["components"]["schemas"]
+    models = {
+        "OidcAccessEntry": OidcAccessEntry,
+        "K8sAccessEntry": K8sAccessEntry,
+        "OidcAccessEntryRequest": OidcAccessEntryRequest,
+        "K8sAccessEntryRequest": K8sAccessEntryRequest,
+    }
 
-    assert OidcAccessEntry(**schemas["OidcAccessEntry"]["example"])
-    assert K8sAccessEntry(**schemas["K8sAccessEntry"]["example"])
+    for name in ENTRY_SCHEMAS:
+        assert models[name](**schemas[name]["example"]), name
 
 
 def test_the_entry_models_still_forbid_extra_fields(client):
     """The examples arrive via `model_config`, which is where `extra: forbid` lives too —
-    replacing rather than merging it would silently reopen the models."""
+    replacing rather than merging it would silently reopen the models. The Request pair
+    re-merges the parent's config for exactly that reason."""
     schemas = client.get("/openapi.json").json()["components"]["schemas"]
 
-    for name in ("OidcAccessEntry", "K8sAccessEntry"):
+    for name in ENTRY_SCHEMAS + ("RequestMetadata",):
         assert schemas[name]["additionalProperties"] is False, name
+
+
+# --------------------------------------------------------------------------- #
+# the metadata block in the documented shapes
+# --------------------------------------------------------------------------- #
+METADATA_NAMES = {"project", "network", "region", "space", "environment", "island"}
+
+BODY_SCHEMAS = (
+    "VaultKVCreate",
+    "VaultKVUpdate",
+    "TashtiotAccessUpsert",
+    "OidcAccessEntryRequest",
+    "K8sAccessEntryRequest",
+)
+
+
+@pytest.mark.parametrize("name", BODY_SCHEMAS)
+def test_every_body_example_carries_the_full_metadata_block(client, name):
+    """One shared `_METADATA_EXAMPLE`, so a divergent example is a test failure rather
+    than a lie left in the docs."""
+    example = client.get("/openapi.json").json()["components"]["schemas"][name]["example"]
+
+    assert set(example["metadata"]) == METADATA_NAMES, name
+
+
+@pytest.mark.parametrize("path", ["/{kv_name}/access", "/tashtiot/{team}/access"])
+def test_the_grant_body_schema_is_the_request_entry_pair(client, path):
+    """Not the base pair: reverting to `AccessEntry` would make metadata optional in
+    practice, since the body would no longer declare it."""
+    spec = client.get("/openapi.json").json()
+    body = spec["paths"][f"{config.API_PREFIX}{path}"]["post"]["requestBody"]
+    schema = body["content"]["application/json"]["schema"]
+
+    assert [ref["$ref"].rsplit("/", 1)[-1] for ref in schema["oneOf"]] == [
+        "OidcAccessEntryRequest",
+        "K8sAccessEntryRequest",
+    ]
+    assert schema["discriminator"]["propertyName"] == "auth_type"
+
+
+@pytest.mark.parametrize("name", ["OidcAccessEntry", "K8sAccessEntry"])
+def test_the_list_element_examples_carry_no_metadata(client, name):
+    """A list element that carries metadata is a 422, so its example must not show one."""
+    example = client.get("/openapi.json").json()["components"]["schemas"][name]["example"]
+
+    assert "metadata" not in example, name
 
 
 # --------------------------------------------------------------------------- #

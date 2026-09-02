@@ -14,6 +14,7 @@ from tests.v1.vault.conftest import (
     DN,
     K8S_PATH,
     KV,
+    METADATA,
     OIDC_PATH,
     OTHER_DN,
     STORE_DIR,
@@ -35,6 +36,7 @@ BODY = {
     "access": [
         {"path": "*", "auth_type": "oidc", "dn": DN, "capabilities": ["read", "write"]}
     ],
+    "metadata": METADATA,
 }
 
 
@@ -123,6 +125,10 @@ def test_there_is_no_deploy_build_field(client, auth_headers, bitbucket):
     ("kv_name", "Bad_Name"),
     ("team", "../etc"),
     ("access", []),
+    # An empty or absent metadata block is the same class of error, and must be caught
+    # in the same place: before anything upstream is touched.
+    ("metadata", {}),
+    ("metadata", None),
 ])
 def test_a_malformed_body_is_422_before_any_call(
     client, auth_headers, bitbucket, field, value
@@ -189,7 +195,7 @@ def test_patch_replaces_the_grants(client, auth_headers, bitbucket):
         STORE_URL,
         json={"access": [
             {"path": "*", "auth_type": "oidc", "dn": OTHER_DN, "capabilities": ["read"]}
-        ]},
+        ], "metadata": METADATA},
         headers=auth_headers,
     )
 
@@ -205,7 +211,7 @@ def test_a_no_op_patch_returns_200_with_no_pull_request(client, auth_headers, bi
         json={"access": [
             {"path": "*", "auth_type": "oidc", "dn": DN,
              "capabilities": ["read", "write"]}
-        ]},
+        ], "metadata": METADATA},
         headers=auth_headers,
     )
 
@@ -219,7 +225,7 @@ def test_patch_on_an_unknown_store_is_404(client, auth_headers):
         STORE_URL,
         json={"access": [
             {"path": "*", "auth_type": "oidc", "dn": DN, "capabilities": ["read"]}
-        ]},
+        ], "metadata": METADATA},
         headers=auth_headers,
     )
 
@@ -234,7 +240,8 @@ def test_adding_a_grant_returns_201(client, auth_headers, bitbucket):
 
     response = client.post(
         ACCESS_URL,
-        json={"path": "*", "auth_type": "oidc", "dn": OTHER_DN, "capabilities": ["read"]},
+        json={"path": "*", "auth_type": "oidc", "dn": OTHER_DN,
+              "capabilities": ["read"], "metadata": METADATA},
         headers=auth_headers,
     )
 
@@ -247,7 +254,8 @@ def test_adding_a_duplicate_grant_returns_409(client, auth_headers, bitbucket):
 
     response = client.post(
         ACCESS_URL,
-        json={"path": "*", "auth_type": "oidc", "dn": DN, "capabilities": ["read"]},
+        json={"path": "*", "auth_type": "oidc", "dn": DN,
+              "capabilities": ["read"], "metadata": METADATA},
         headers=auth_headers,
     )
 
@@ -345,7 +353,8 @@ TASHTIOT_BODY = {
         {"path": "+/cloudops/*", "auth_type": "oidc", "dn": DN, "capabilities": ["read"]},
         {"path": "services/+/tyk/*", "auth_type": "k8s", "name": "argocd",
          "namespace": "perimeter", "cluster": "dev", "capabilities": ["read", "write"]},
-    ]
+    ],
+    "metadata": METADATA,
 }
 TASHTIOT_PATH = f"KVs/Tashtiot/{TEAM}.yaml"
 
@@ -376,7 +385,7 @@ def test_the_tashtiot_message_reads_as_an_intent_not_a_past_act(
         TASHTIOT_URL,
         json={"access": [
             {"path": "*", "auth_type": "oidc", "dn": DN, "capabilities": ["read"]}
-        ]},
+        ], "metadata": METADATA},
         headers=auth_headers,
     )
     assert "to update " in updated.json()["message"]
@@ -416,7 +425,7 @@ def test_a_second_tashtiot_upsert_replaces(client, auth_headers, bitbucket):
         TASHTIOT_URL,
         json={"access": [
             {"path": "*", "auth_type": "oidc", "dn": DN, "capabilities": ["read"]}
-        ]},
+        ], "metadata": METADATA},
         headers=auth_headers,
     )
 
@@ -485,7 +494,7 @@ def test_adding_a_tashtiot_grant_appends_to_the_flat_file(client, auth_headers, 
     response = client.post(
         TASHTIOT_ACCESS_URL,
         json={"path": "services/+/redis/*", "auth_type": "oidc", "dn": OTHER_DN,
-              "capabilities": ["read"]},
+              "capabilities": ["read"], "metadata": METADATA},
         headers=auth_headers,
     )
 
@@ -500,7 +509,8 @@ def test_a_tashtiot_grant_can_be_either_kind(client, auth_headers, bitbucket):
     response = client.post(
         TASHTIOT_ACCESS_URL,
         json={"path": "services/+/redis/*", "auth_type": "k8s", "name": "argocd",
-              "namespace": "perimeter", "cluster": "dev", "capabilities": ["read"]},
+              "namespace": "perimeter", "cluster": "dev", "capabilities": ["read"],
+              "metadata": METADATA},
         headers=auth_headers,
     )
 
@@ -515,7 +525,7 @@ def test_adding_a_duplicate_tashtiot_grant_is_409(client, auth_headers, bitbucke
     response = client.post(
         TASHTIOT_ACCESS_URL,
         json={"path": "+/cloudops/*", "auth_type": "oidc", "dn": DN,
-              "capabilities": ["read"]},
+              "capabilities": ["read"], "metadata": METADATA},
         headers=auth_headers,
     )
 
@@ -527,7 +537,8 @@ def test_adding_a_grant_to_a_team_with_no_file_is_404(client, auth_headers, bitb
     a file behind a route that reads as an edit."""
     response = client.post(
         TASHTIOT_ACCESS_URL,
-        json={"path": "*", "auth_type": "oidc", "dn": DN, "capabilities": ["read"]},
+        json={"path": "*", "auth_type": "oidc", "dn": DN,
+              "capabilities": ["read"], "metadata": METADATA},
         headers=auth_headers,
     )
 
@@ -596,7 +607,8 @@ def test_the_tashtiot_grant_routes_do_not_shadow_a_store(client, auth_headers, b
 
     response = client.post(
         ACCESS_URL,
-        json={"path": "*", "auth_type": "oidc", "dn": OTHER_DN, "capabilities": ["read"]},
+        json={"path": "*", "auth_type": "oidc", "dn": OTHER_DN,
+              "capabilities": ["read"], "metadata": METADATA},
         headers=auth_headers,
     )
 
@@ -669,6 +681,85 @@ def test_a_malformed_store_name_in_the_path_is_422(client, auth_headers, bitbuck
 
 
 # --------------------------------------------------------------------------- #
+# capitals on the read routes
+#
+# The values directory is not written only by this service, so it may already hold a
+# capitalised store or team. `_walk_store_dirs` finds those and `_resolve_store` matches
+# names exactly — the lowercase-only path pattern was the only thing making them
+# unreachable, and it failed the request as "malformed" before the walk ever ran.
+# --------------------------------------------------------------------------- #
+def test_a_capitalised_store_is_readable(client, auth_headers, bitbucket):
+    seed_store(bitbucket, team="CloudOps", kv_name="My-Passwords", oidc=[oidc_entry()])
+
+    response = client.get(f"{config.API_PREFIX}/My-Passwords", headers=auth_headers)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["kv_name"] == "My-Passwords"
+    assert body["team"] == "CloudOps"
+    assert [entry["dn"] for entry in body["access"]] == [DN]
+
+
+def test_a_capitalised_team_is_readable(client, auth_headers, bitbucket):
+    from app.helpers import build_access_document, render_values_yaml
+
+    bitbucket.existing_files["KVs/Tashtiot/CloudOps.yaml"] = render_values_yaml(
+        build_access_document([oidc_entry(path="+/cloudops/*")])
+    )
+
+    response = client.get(
+        f"{config.API_PREFIX}/tashtiot/CloudOps", headers=auth_headers
+    )
+
+    assert response.status_code == 200
+    assert [entry["dn"] for entry in response.json()["access"]] == [DN]
+
+
+def test_the_name_is_still_matched_exactly(client, auth_headers, bitbucket):
+    """Accepting capitals is not case-insensitive resolution. `_resolve_store` compares
+    names exactly, so the wrong casing is a 404 — the store really is not there under that
+    spelling — rather than a silently different store."""
+    seed_store(bitbucket, team="CloudOps", kv_name="My-Passwords", oidc=[oidc_entry()])
+
+    response = client.get(f"{config.API_PREFIX}/my-passwords", headers=auth_headers)
+
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "method, url",
+    [
+        ("patch", f"{config.API_PREFIX}/My-Passwords"),
+        ("delete", f"{config.API_PREFIX}/My-Passwords"),
+        ("post", f"{config.API_PREFIX}/My-Passwords/access"),
+        ("delete", f"{config.API_PREFIX}/My-Passwords/access"),
+        ("put", f"{config.API_PREFIX}/tashtiot/CloudOps"),
+        ("delete", f"{config.API_PREFIX}/tashtiot/CloudOps"),
+        ("post", f"{config.API_PREFIX}/tashtiot/CloudOps/access"),
+        ("delete", f"{config.API_PREFIX}/tashtiot/CloudOps/access"),
+    ],
+)
+def test_the_write_routes_still_refuse_a_capitalised_name(
+    client, auth_headers, bitbucket, method, url
+):
+    """Only the reads were widened. Writing to a name this service would never itself
+    create is a separate decision, so these stay 422 and reach no upstream."""
+    response = client.request(method, url, json=BODY, headers=auth_headers)
+
+    assert response.status_code == 422
+    assert bitbucket.calls == []
+
+
+def test_an_underscore_is_still_rejected_on_a_read(client, auth_headers, bitbucket):
+    """Widened to capitals, not opened up. The segment still admits no underscore, no dot
+    and no slash — which is what keeps it a path-traversal guard."""
+    for name in ("Bad_Name", "has.dot", "has space"):
+        response = client.get(f"{config.API_PREFIX}/{name}", headers=auth_headers)
+        assert response.status_code == 422, name
+    assert bitbucket.calls == []
+
+
+# --------------------------------------------------------------------------- #
 # the routes that skipped CI are gone
 #
 # They opened a pull request and returned without watching the build. Without that wait a
@@ -715,7 +806,7 @@ def _write_via_create(client, auth_headers, bitbucket):
             {"path": "*", "auth_type": "oidc", "dn": DN, "capabilities": ["read"]},
             {"path": "*", "auth_type": "k8s", "name": "argocd",
              "namespace": "perimeter", "cluster": "dev", "capabilities": ["read"]},
-        ]},
+        ], "metadata": METADATA},
         headers=auth_headers,
     )
 
@@ -726,7 +817,7 @@ def _write_via_patch(client, auth_headers, bitbucket):
         STORE_URL,
         json={"access": [
             {"path": "*", "auth_type": "oidc", "dn": OTHER_DN, "capabilities": ["read"]}
-        ]},
+        ], "metadata": METADATA},
         headers=auth_headers,
     )
 
@@ -735,7 +826,8 @@ def _write_via_grant(client, auth_headers, bitbucket):
     seed_store(bitbucket, oidc=[oidc_entry()])
     client.post(
         ACCESS_URL,
-        json={"path": "*", "auth_type": "oidc", "dn": OTHER_DN, "capabilities": ["read"]},
+        json={"path": "*", "auth_type": "oidc", "dn": OTHER_DN,
+              "capabilities": ["read"], "metadata": METADATA},
         headers=auth_headers,
     )
 
@@ -783,3 +875,203 @@ def test_every_writing_route_quotes_the_dn(
         for entry in yaml.safe_load(content)["access"]:
             if "dn" in entry:
                 assert f'dn: "{entry["dn"]}"' in content, f"{route} -> {path}"
+
+
+# --------------------------------------------------------------------------- #
+# metadata
+#
+# Required on every body-carrying route, recorded in the pull-request description, and
+# never written to a file. The last of those is the whole point of the block.
+# --------------------------------------------------------------------------- #
+METADATA_NAMES = ("project", "network", "region", "space", "environment", "island")
+
+OIDC_GRANT = {"path": "*", "auth_type": "oidc", "dn": OTHER_DN, "capabilities": ["read"]}
+TASHTIOT_GRANT = {
+    "path": "services/+/redis/*",
+    "auth_type": "oidc",
+    "dn": OTHER_DN,
+    "capabilities": ["read"],
+}
+
+# (id, method, url, body-without-metadata) for each of the five body-carrying routes.
+BODY_ROUTES = [
+    ("POST /", "post", CREATE_URL,
+     {"team": TEAM, "kv_name": KV, "access": [dict(OIDC_GRANT)]}),
+    ("PATCH /{kv_name}", "patch", STORE_URL, {"access": [dict(OIDC_GRANT)]}),
+    ("POST /{kv_name}/access", "post", ACCESS_URL, dict(OIDC_GRANT)),
+    ("PUT /tashtiot/{team}", "put", TASHTIOT_URL, {"access": [dict(TASHTIOT_GRANT)]}),
+    ("POST /tashtiot/{team}/access", "post", TASHTIOT_ACCESS_URL, dict(TASHTIOT_GRANT)),
+]
+
+
+@pytest.mark.parametrize(
+    "method,url,body",
+    [route[1:] for route in BODY_ROUTES],
+    ids=[route[0] for route in BODY_ROUTES],
+)
+def test_every_body_route_is_422_without_metadata(
+    client, auth_headers, bitbucket, method, url, body
+):
+    """All five, one rule — and refused before a single upstream call is made."""
+    response = client.request(method, url, json=body, headers=auth_headers)
+
+    assert response.status_code == 422
+    assert bitbucket.calls == []
+
+
+@pytest.mark.parametrize("name", METADATA_NAMES)
+@pytest.mark.parametrize("route", ["create", "grant"], ids=["POST /", "POST /{kv}/access"])
+def test_an_incomplete_metadata_block_is_422(client, auth_headers, bitbucket, route, name):
+    """Five coordinates do not locate a deployment; a partial block is not a partial answer."""
+    block = {key: value for key, value in METADATA.items() if key != name}
+    if route == "create":
+        response = client.post(
+            CREATE_URL, json={**BODY, "metadata": block}, headers=auth_headers
+        )
+    else:
+        response = client.post(
+            ACCESS_URL, json={**OIDC_GRANT, "metadata": block}, headers=auth_headers
+        )
+
+    assert response.status_code == 422
+    assert bitbucket.calls == []
+
+
+def _drive_create(client, auth_headers, bitbucket):
+    return client.post(CREATE_URL, json=BODY, headers=auth_headers)
+
+
+def _drive_patch(client, auth_headers, bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry()])
+    return client.patch(
+        STORE_URL,
+        json={"access": [dict(OIDC_GRANT)], "metadata": METADATA},
+        headers=auth_headers,
+    )
+
+
+def _drive_grant(client, auth_headers, bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry()])
+    return client.post(
+        ACCESS_URL, json={**OIDC_GRANT, "metadata": METADATA}, headers=auth_headers
+    )
+
+
+def _drive_tashtiot_upsert(client, auth_headers, bitbucket):
+    return client.put(TASHTIOT_URL, json=TASHTIOT_BODY, headers=auth_headers)
+
+
+def _drive_tashtiot_grant(client, auth_headers, bitbucket):
+    _seed_tashtiot(bitbucket, [oidc_entry(path="+/cloudops/*")])
+    return client.post(
+        TASHTIOT_ACCESS_URL,
+        json={**TASHTIOT_GRANT, "metadata": METADATA},
+        headers=auth_headers,
+    )
+
+
+# The create has to run first when they are driven in one sequence: it is the only route
+# that scans for a duplicate name, and seeding a store for the others would collide.
+BODY_DRIVERS = [
+    ("POST /", _drive_create),
+    ("PATCH /{kv_name}", _drive_patch),
+    ("POST /{kv_name}/access", _drive_grant),
+    ("PUT /tashtiot/{team}", _drive_tashtiot_upsert),
+    ("POST /tashtiot/{team}/access", _drive_tashtiot_grant),
+]
+
+
+def test_metadata_never_reaches_the_committed_yaml(client, auth_headers, bitbucket):
+    """The load-bearing test of the whole change.
+
+    Every body-carrying route is driven with a full metadata block, and every file any of
+    them commits must still be the document the deploy pipeline expects: one top-level
+    `access` key, and entries carrying none of the six coordinate names.
+    """
+    # One gate per chain, five chains — the fake's build queue is popped once each.
+    bitbucket.builds = [passing() for _ in BODY_DRIVERS]
+
+    # `committed` is keyed by path, so two routes writing the same file would hide one of
+    # them. Snapshot after each drive instead, and check every route's own bytes.
+    written = []
+    for name, drive in BODY_DRIVERS:
+        bitbucket.committed.clear()
+        assert drive(client, auth_headers, bitbucket).status_code == 201, name
+        assert bitbucket.committed, name
+        written += [(name, path, text) for path, text in bitbucket.committed.items()]
+
+    assert len(written) >= len(BODY_DRIVERS)
+    for name, path, content in written:
+        document = yaml.safe_load(content)
+        assert set(document) == {"access"}, f"{name} -> {path}"
+        for entry in document["access"]:
+            assert "metadata" not in entry, f"{name} -> {path}"
+            assert not set(entry) & set(METADATA_NAMES), f"{name} -> {path}"
+        # And nothing survives as loose text either — these two values appear nowhere in
+        # a legitimate grant, so a leak anywhere in the file shows up here.
+        assert "il-central" not in content, f"{name} -> {path}"
+        assert "island-a" not in content, f"{name} -> {path}"
+
+
+@pytest.mark.parametrize(
+    "drive", [drive for _, drive in BODY_DRIVERS], ids=[name for name, _ in BODY_DRIVERS]
+)
+def test_metadata_appears_in_the_pull_request_description(
+    client, auth_headers, bitbucket, drive
+):
+    """Its only destination besides the log: the pull request a human reviews."""
+    assert drive(client, auth_headers, bitbucket).status_code == 201
+
+    description = bitbucket.descriptions[-1]
+
+    assert "- metadata:" in description
+    for name in METADATA_NAMES:
+        assert f"  - {name}: {METADATA[name]}" in description
+
+
+def test_a_metadata_only_difference_does_not_open_a_pull_request(
+    client, auth_headers, bitbucket
+):
+    """Documented, not a bug: metadata is not state.
+
+    `_unchanged` compares parsed *documents*, and metadata is not in one, so a repeat
+    request whose grants already match still short-circuits. Opening an empty pull request
+    to record a different project name would defeat the guard that keeps the values repo
+    free of empty diffs.
+    """
+    other = {**METADATA, "project": "platform", "island": "island-b"}
+    bitbucket.builds = [passing(), passing()]
+
+    # PATCH: open a real pull request, play the reviewer, then repeat with new metadata.
+    seed_store(bitbucket, oidc=[oidc_entry()])
+    first = client.patch(
+        STORE_URL,
+        json={"access": [dict(OIDC_GRANT)], "metadata": METADATA},
+        headers=auth_headers,
+    )
+    assert first.status_code == 201
+    bitbucket.existing_files[OIDC_PATH] = bitbucket.committed[OIDC_PATH]
+
+    repeat = client.patch(
+        STORE_URL,
+        json={"access": [dict(OIDC_GRANT)], "metadata": other},
+        headers=auth_headers,
+    )
+
+    assert repeat.status_code == 200
+    assert repeat.json()["pull_request"] is None
+
+    # ...and the upsert, which shares the short circuit.
+    assert client.put(
+        TASHTIOT_URL, json=TASHTIOT_BODY, headers=auth_headers
+    ).status_code == 201
+    bitbucket.existing_files[TASHTIOT_PATH] = bitbucket.committed[TASHTIOT_PATH]
+
+    repeat_upsert = client.put(
+        TASHTIOT_URL,
+        json={**TASHTIOT_BODY, "metadata": other},
+        headers=auth_headers,
+    )
+
+    assert repeat_upsert.status_code == 200
+    assert repeat_upsert.json()["pull_request"] is None

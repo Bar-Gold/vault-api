@@ -58,6 +58,9 @@ class FakeBitbucket:
         # Paths removed outright, in order. See `delete_file`.
         self.deleted: List[str] = []
         self.commit_messages: List[str] = []
+        # Every pull-request description, in order. The metadata block's only
+        # destination is here, so it has to be observable.
+        self.descriptions: List[str] = []
         # What put_file received as sourceCommitId, so the edit flow's optimistic-lock
         # handling can be asserted on.
         self.source_commit_ids: List[Optional[str]] = []
@@ -158,6 +161,7 @@ class FakeBitbucket:
         self, title: str, description: str, from_branch: str, to_branch: str, reviewers=None
     ) -> PullRequest:
         self._record("create_pull_request")
+        self.descriptions.append(description)
         pull_request = PullRequest(
             id=self._next_id,
             version=0,
