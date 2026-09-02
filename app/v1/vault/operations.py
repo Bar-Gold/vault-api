@@ -75,6 +75,7 @@ from .schemas import (
     K8sAccessEntry,
     OperationStatus,
     PullRequestInfo,
+    RequestMetadata,
     TashtiotAccessUpsert,
     VaultKVCreate,
     VaultKVUpdate,
@@ -158,6 +159,9 @@ def to_document_entry(entry: Any) -> Dict[str, Any]:
     The single bridge between the request models and the document helpers. It is the only
     place that knows a request's `auth_type` selects which builder to call, which keeps
     every key name in `helpers.py` and every rule in `schemas.py`.
+
+    It reads named fields only, so a request-only field such as `metadata` cannot reach
+    the document even when the payload is an `AccessEntryRequest`.
     """
     capabilities = [capability.value for capability in entry.capabilities]
     if isinstance(entry, K8sAccessEntry):
@@ -616,13 +620,37 @@ def _branch_for(team: str, kv_name: str, branch_suffix: Optional[str]) -> str:
     )
 
 
-def _describe(subject: str, directory: str, entries: List[Dict[str, Any]], change: str) -> str:
+def _describe(
+    subject: str,
+    directory: str,
+    entries: List[Dict[str, Any]],
+    change: str,
+    metadata: Optional[RequestMetadata] = None,
+) -> str:
+    """The pull-request body a reviewer reads.
+
+    `metadata` is the request-only block, and this is its **only** destination besides
+    the log line: it is deliberately not in the committed document, so the audit trail
+    is the pull request. It sits between `change` and `grants` — `grants` stays the
+    trailing open-ended list — and is rendered in declaration order, never sorted, so
+    two pull requests read the same way.
+
+    With `metadata=None` the output is byte-identical to what the routes carrying no
+    body produce today, which is what leaves their descriptions untouched.
+    """
     grants = "\n".join(f"  - {_entry_text(entry)}" for entry in entries)
+    block = ""
+    if metadata is not None:
+        lines = "\n".join(
+            f"  - {name}: {value}" for name, value in metadata.model_dump().items()
+        )
+        block = f"- metadata:\n{lines}\n"
     return (
         f"Automated by vault-api.\n\n"
         f"- location: {directory}\n"
         f"- subject: {subject}\n"
         f"- change: {change}\n"
+        f"{block}"
         f"- grants:\n{grants}\n"
     )
 
@@ -702,7 +730,9 @@ async def create_kv_mount_operation(
         change=change,
         branch=_branch_for(payload.team, payload.kv_name, branch_suffix),
         summary=f"Create KV store {payload.kv_name} for {payload.team}",
-        description=_describe(payload.kv_name, directory, entries, "store created"),
+        description=_describe(
+            payload.kv_name, directory, entries, "store created", metadata=payload.metadata
+        ),
         kv_name=payload.kv_name,
     )
 
@@ -804,7 +834,9 @@ async def update_kv_mount_operation(
         change=change,
         branch=_branch_for(store.team, kv_name, branch_suffix),
         summary=f"Update KV store {kv_name} for {store.team}",
-        description=_describe(kv_name, store.directory, entries, "grants replaced"),
+        description=_describe(
+            kv_name, store.directory, entries, "grants replaced", metadata=payload.metadata
+        ),
         kv_name=kv_name,
     )
 
@@ -910,7 +942,9 @@ async def add_access_entry_operation(
         change=change,
         branch=_branch_for(store.team, kv_name, branch_suffix),
         summary=f"Grant {_entry_text(entry)} on {kv_name}",
-        description=_describe(kv_name, store.directory, [entry], "grant added"),
+        description=_describe(
+            kv_name, store.directory, [entry], "grant added", metadata=payload.metadata
+        ),
         kv_name=kv_name,
     )
 
@@ -1095,7 +1129,10 @@ async def upsert_tashtiot_access_operation(
         change=change,
         branch=_branch_for(config.TASHTIOT_DIR.lower(), team, branch_suffix),
         summary=f"{verb.capitalize()} {config.TASHTIOT_DIR} access for {team}",
-        description=_describe(team, path, entries, f"{config.TASHTIOT_DIR} access {verb}"),
+        description=_describe(
+            team, path, entries, f"{config.TASHTIOT_DIR} access {verb}",
+            metadata=payload.metadata,
+        ),
         kv_name=team,
     )
 
@@ -1228,7 +1265,8 @@ async def add_tashtiot_access_entry_operation(
         branch=_branch_for(config.TASHTIOT_DIR.lower(), team, branch_suffix),
         summary=f"Grant {_entry_text(entry)} to {team} in {config.TASHTIOT_DIR}",
         description=_describe(
-            team, path, [entry], f"{config.TASHTIOT_DIR} grant added"
+            team, path, [entry], f"{config.TASHTIOT_DIR} grant added",
+            metadata=payload.metadata,
         ),
         kv_name=team,
     )

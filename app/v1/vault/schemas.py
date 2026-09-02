@@ -9,6 +9,11 @@ a format change is a change here and in the pipeline, with nothing in between.
 
 What is deliberately absent: there is no `kv_description`. The format defines no home for
 it, and this service does not invent keys.
+
+The mirror has exactly **one** documented exception: `metadata`. It is required on every
+request that carries a body, and it is the one field that never reaches a file — the
+document keeps its single `access` key, and the six coordinates go to the pull-request
+description and the service log instead. See `RequestMetadata`.
 """
 
 from enum import Enum
@@ -19,6 +24,10 @@ from pydantic import BaseModel, Field, field_validator
 # A single name segment: lowercase alphanumerics separated by single dashes.
 _SEGMENT = r"[a-z0-9]+(?:-[a-z0-9]+)*"
 
+# The same segment, case-insensitively. Used **only** on the read routes — see
+# `KV_NAME_READ_PATTERN`.
+_ANY_CASE_SEGMENT = r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*"
+
 # A store's name, and the second segment of its directory (`KVs/<team>/<kv_name>/`). Both
 # a **path-traversal guard** and the address every route but the create uses (`/{kv_name}`):
 # no slash, so no directory can be escaped or created, and `..` cannot match.
@@ -28,6 +37,23 @@ KV_NAME_PATTERN = rf"^{_SEGMENT}$"
 # only ever sent on a create — a store name is unique across the whole values directory, so
 # every other route resolves the team rather than being told it.
 TEAM_PATTERN = rf"^{_SEGMENT}$"
+
+# The store name and team as accepted on the **read** routes (`GET /{kv_name}` and
+# `GET /tashtiot/{team}`), which differ from the patterns above in one way: they accept
+# capitals.
+#
+# A create still writes a lowercase name — `KV_NAME_PATTERN` above is unchanged — but the
+# values directory is not written only by this service, and it may already hold a
+# capitalised store or team. `_walk_store_dirs` finds those perfectly well and
+# `_resolve_store` compares names exactly, so the only thing standing between a caller and
+# a capitalised store was this pattern: the request was rejected as a 422 before the walk
+# ever ran, which read as "malformed name" when the truth was "your store is unreachable".
+#
+# **Still the same path-traversal guard.** One segment, no slash and no dot, so no
+# directory can be escaped or created and `..` cannot match. Case has no bearing on that;
+# it only ever decided which existing names were addressable.
+KV_NAME_READ_PATTERN = rf"^{_ANY_CASE_SEGMENT}$"
+TEAM_READ_PATTERN = rf"^{_ANY_CASE_SEGMENT}$"
 
 # A Vault secret path pattern, e.g. `*`, `services/+/tyk/*`, `+/cloudops/*`.
 #
@@ -130,10 +156,13 @@ class OidcAccessEntry(_AccessEntryBase):
     and the vocabulary is the directory's, not ours.
     """
 
-    # A **model-level** example, not just per-field ones. This is a request body on its own
-    # at `POST /{kv_name}/access`, and without one Swagger synthesises the body from the
-    # field schemas — which fills every string with `"string"` rather than the field's own
-    # example, so the box a user is meant to edit shows nothing usable.
+    # A **model-level** example, not just per-field ones. Without one Swagger synthesises
+    # the shape from the field schemas — which fills every string with `"string"` rather
+    # than the field's own example, so the box a user is meant to edit shows nothing usable.
+    #
+    # It carries **no** `metadata`, deliberately: this model is what goes inside an `access`
+    # list, and a list element carrying metadata is a 422. The body of
+    # `POST /{kv_name}/access` is `OidcAccessEntryRequest`, whose example does carry it.
     model_config = {
         **_AccessEntryBase.model_config,
         "json_schema_extra": {
@@ -195,7 +224,8 @@ class K8sAccessEntry(_AccessEntryBase):
 
     # See `OidcAccessEntry.model_config` — the same reason, and the reason there are two:
     # the body is a `oneOf` on `auth_type`, so Swagger shows one example per branch and the
-    # picker is how a caller switches between them.
+    # picker is how a caller switches between them. No `metadata` here either: this is the
+    # list-element shape, and `K8sAccessEntryRequest` is the body one.
     model_config = {
         **_AccessEntryBase.model_config,
         "json_schema_extra": {
@@ -248,11 +278,12 @@ AccessEntry = Annotated[
     Union[OidcAccessEntry, K8sAccessEntry],
     Field(discriminator="auth_type"),
 ]
-"""One grant, either kind.
+"""One grant, either kind — the **list-element** type.
 
-Used both inside `access` lists and **as a request body on its own** — the sub-resource
-form of an edit posts a single entry rather than the whole list, and needs no wrapper
-object to do it.
+This is what goes inside an `access` list, and nothing else: it carries no `metadata`, so
+a list element that sends one is a 422. The request body of the sub-resource form is
+`AccessEntryRequest` below — the same grant plus the metadata block, still with no
+wrapper object around it.
 """
 
 
@@ -276,6 +307,180 @@ def _validate_access(entries: List[AccessEntry]) -> List[AccessEntry]:
             raise ValueError(f"duplicate access entry: {identity}")
         seen.add(identity)
     return entries
+
+
+# --------------------------------------------------------------------------- #
+# request-only data
+#
+# Everything above this point mirrors the committed document. `metadata` is the single
+# documented exception: required on every request that carries a body, and never written.
+# --------------------------------------------------------------------------- #
+
+# Deployment coordinates the organisation requires on every mutating request. Free-form on
+# purpose, exactly like `dn`: the vocabulary is the deploying team's, not this service's,
+# so any closed set or pattern here would reject a value we do not own. 253 is the same
+# number as K8S_SERVICE_ACCOUNT_MAX_LENGTH and is **not** the same rule — do not collapse
+# them.
+METADATA_MAX_LENGTH = 253
+
+# One dict, spliced into all five body examples. Retyping it would let the docs drift.
+_METADATA_EXAMPLE = {
+    "project": "cloudops",
+    "network": "internal",
+    "region": "il-central",
+    "space": "shared",
+    "environment": "production",
+    "island": "island-a",
+}
+
+
+class RequestMetadata(BaseModel):
+    """Where the caller's deployment lives — audit only, never committed.
+
+    Required on every request that carries a body, and **dropped before anything is
+    written**: `to_document_entry` builds a document entry from named fields, so there is
+    no path by which one of these values can reach an access file. What it does reach is
+    the pull-request description, where a reviewer sees it, and the service log.
+
+    All six values are free-form non-blank strings. That mirrors how `dn` is handled: any
+    pattern tight enough to describe the organisation's vocabulary would reject forms this
+    service does not own. What is refused is only blank/whitespace-only and over-long.
+    """
+
+    model_config = {
+        "extra": "forbid",
+        "json_schema_extra": {"example": _METADATA_EXAMPLE},
+    }
+
+    project: str = Field(
+        ...,
+        min_length=1,
+        max_length=METADATA_MAX_LENGTH,
+        examples=["cloudops"],
+        description="Project the deployment belongs to.",
+    )
+
+    network: str = Field(
+        ...,
+        min_length=1,
+        max_length=METADATA_MAX_LENGTH,
+        examples=["internal"],
+        description="Network the deployment sits on.",
+    )
+
+    region: str = Field(
+        ...,
+        min_length=1,
+        max_length=METADATA_MAX_LENGTH,
+        examples=["il-central"],
+        description="Region the deployment sits in.",
+    )
+
+    space: str = Field(
+        ...,
+        min_length=1,
+        max_length=METADATA_MAX_LENGTH,
+        examples=["shared"],
+        description="Space the deployment belongs to.",
+    )
+
+    environment: str = Field(
+        ...,
+        min_length=1,
+        max_length=METADATA_MAX_LENGTH,
+        examples=["production"],
+        description="Environment the deployment targets.",
+    )
+
+    island: str = Field(
+        ...,
+        min_length=1,
+        max_length=METADATA_MAX_LENGTH,
+        examples=["island-a"],
+        description="Island the deployment lands on.",
+    )
+
+    # The six names are spelled out rather than `"*"`: the explicit list survives someone
+    # later adding a field that is not a string.
+    @field_validator("project", "network", "region", "space", "environment", "island")
+    @classmethod
+    def not_blank(cls, v: str) -> str:
+        """Same rule, same shape, as `OidcAccessEntry.dn`: non-blank, and stripped."""
+        if not v.strip():
+            raise ValueError("must not be blank")
+        return v.strip()
+
+    def as_log_text(self) -> str:
+        """One line for the service log: `project=... network=... ...`, declaration order."""
+        return " ".join(f"{name}={value}" for name, value in self.model_dump().items())
+
+
+_METADATA_FIELD_DESCRIPTION = (
+    "Deployment coordinates, for audit. Recorded in the pull-request description and "
+    "never written to the access files."
+)
+
+
+class OidcAccessEntryRequest(OidcAccessEntry):
+    """`OidcAccessEntry` as a request body on its own: the same grant plus the metadata
+    block.
+
+    The list forms (`access: [...]`) keep the plain entry — metadata is a property of the
+    *request*, not of a grant, so it must not become required on every list element. This
+    subclasses rather than wraps, so a request entry still **is** the entry it extends and
+    `to_document_entry`'s dispatch keeps working untouched.
+    """
+
+    # Merged, not replaced: `extra: "forbid"` lives in the parent's config too, and
+    # overwriting the whole dict would silently reopen the model.
+    model_config = {
+        **OidcAccessEntry.model_config,
+        "json_schema_extra": {
+            "example": {
+                "path": "*",
+                "auth_type": "oidc",
+                "dn": "CN=cloudops,OU=Groups,DC=corp,DC=example,DC=com",
+                "capabilities": ["read", "write"],
+                "metadata": _METADATA_EXAMPLE,
+            }
+        },
+    }
+
+    metadata: RequestMetadata = Field(..., description=_METADATA_FIELD_DESCRIPTION)
+
+
+class K8sAccessEntryRequest(K8sAccessEntry):
+    """The Kubernetes branch of the same body. See `OidcAccessEntryRequest`."""
+
+    model_config = {
+        **K8sAccessEntry.model_config,
+        "json_schema_extra": {
+            "example": {
+                "path": "*",
+                "auth_type": "k8s",
+                "name": "cloudops-external-secrets",
+                "namespace": "cloudops",
+                "cluster": "dev",
+                "capabilities": ["read"],
+                "metadata": _METADATA_EXAMPLE,
+            }
+        },
+    }
+
+    metadata: RequestMetadata = Field(..., description=_METADATA_FIELD_DESCRIPTION)
+
+
+# The union stays at the **top** of the body, which is the only place Swagger's branch
+# picker and the two model-level examples work — a wrapper object would push it under a key
+# and leave one example to describe two shapes.
+AccessEntryRequest = Annotated[
+    Union[OidcAccessEntryRequest, K8sAccessEntryRequest],
+    Field(discriminator="auth_type"),
+]
+"""One grant **as a whole request body**, with its metadata.
+
+`AccessEntry` (no metadata) remains what goes inside an `access` list.
+"""
 
 
 class OperationStatus(str, Enum):
@@ -317,6 +522,7 @@ class VaultKVCreate(BaseModel):
                         "capabilities": ["read"],
                     },
                 ],
+                "metadata": _METADATA_EXAMPLE,
             }
         },
     }
@@ -352,6 +558,10 @@ class VaultKVCreate(BaseModel):
         ),
     )
 
+    # Declared last, so all five bodies read the same way. Request-only: nothing past
+    # `to_document_entry` ever sees it.
+    metadata: RequestMetadata = Field(..., description=_METADATA_FIELD_DESCRIPTION)
+
     @field_validator("access")
     @classmethod
     def valid_access(cls, v: List[AccessEntry]) -> List[AccessEntry]:
@@ -378,7 +588,8 @@ class VaultKVUpdate(BaseModel):
                         "dn": "CN=cloudops,OU=Groups,DC=corp,DC=example,DC=com",
                         "capabilities": ["read"],
                     }
-                ]
+                ],
+                "metadata": _METADATA_EXAMPLE,
             }
         },
     }
@@ -387,6 +598,10 @@ class VaultKVUpdate(BaseModel):
         ...,
         description="The full grant list after the edit. Replaces what is there.",
     )
+
+    # Declared last, so all five bodies read the same way. Request-only: nothing past
+    # `to_document_entry` ever sees it.
+    metadata: RequestMetadata = Field(..., description=_METADATA_FIELD_DESCRIPTION)
 
     @field_validator("access")
     @classmethod
@@ -423,7 +638,8 @@ class TashtiotAccessUpsert(BaseModel):
                         "cluster": "dev",
                         "capabilities": ["read"],
                     },
-                ]
+                ],
+                "metadata": _METADATA_EXAMPLE,
             }
         },
     }
@@ -432,6 +648,10 @@ class TashtiotAccessUpsert(BaseModel):
         ...,
         description="Every grant this team has into the shared services store.",
     )
+
+    # Declared last, so all five bodies read the same way. Request-only: nothing past
+    # `to_document_entry` ever sees it.
+    metadata: RequestMetadata = Field(..., description=_METADATA_FIELD_DESCRIPTION)
 
     @field_validator("access")
     @classmethod

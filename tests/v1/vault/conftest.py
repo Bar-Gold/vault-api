@@ -7,7 +7,7 @@ from app.helpers import (
     build_oidc_access_entry,
     render_values_yaml,
 )
-from app.v1.vault.schemas import OidcAccessEntry, VaultKVCreate
+from app.v1.vault.schemas import OidcAccessEntryRequest, VaultKVCreate
 from tests.fakes import FakeBitbucket
 
 TEAM = "cloudops"
@@ -19,6 +19,17 @@ BRANCH = f"vault-kv/{TEAM}-{KV}-abc123"
 
 DN = "CN=cloudops,OU=Groups,DC=corp,DC=example,DC=com"
 OTHER_DN = "CN=platform,OU=Groups,DC=corp,DC=example,DC=com"
+
+# Required on every request that carries a body, and required *not* to reach a file.
+# One dict, so a test asserting on the pull-request description can name the values.
+METADATA = {
+    "project": "cloudops",
+    "network": "internal",
+    "region": "il-central",
+    "space": "shared",
+    "environment": "production",
+    "island": "island-a",
+}
 
 
 def oidc_entry(path="*", dn=DN, capabilities=("read", "write")):
@@ -75,6 +86,7 @@ def payload():
                 "capabilities": ["read"],
             },
         ],
+        metadata=METADATA,
     )
 
 
@@ -87,6 +99,7 @@ def oidc_only_payload():
         access=[
             {"path": "*", "auth_type": "oidc", "dn": DN, "capabilities": ["read"]}
         ],
+        metadata=METADATA,
     )
 
 
@@ -111,14 +124,24 @@ def k8s_only_payload():
                 "capabilities": ["read"],
             }
         ],
+        metadata=METADATA,
     )
 
 
 @pytest.fixture
 def grant_payload():
-    """One grant to append to an existing store."""
-    return OidcAccessEntry(
-        path="*", auth_type="oidc", dn=OTHER_DN, capabilities=["read"]
+    """One grant to append to an existing store.
+
+    The **request** entry, not the bare one: the body of `POST /{kv_name}/access` is
+    `AccessEntryRequest`, and the operation reads `payload.metadata` for the pull-request
+    description — a plain `OidcAccessEntry` would raise `AttributeError` there.
+    """
+    return OidcAccessEntryRequest(
+        path="*",
+        auth_type="oidc",
+        dn=OTHER_DN,
+        capabilities=["read"],
+        metadata=METADATA,
     )
 
 

@@ -17,15 +17,21 @@ from app.v1.vault.operations import (
     get_kv_store_operation,
     list_kv_stores_operation,
     remove_access_entry_operation,
+    to_document_entry,
     update_kv_mount_operation,
 )
-from app.v1.vault.schemas import K8sAccessEntry, OidcAccessEntry, VaultKVUpdate
+from app.v1.vault.schemas import (
+    K8sAccessEntryRequest,
+    OidcAccessEntryRequest,
+    VaultKVUpdate,
+)
 from app.clients.bitbucket import PullRequest
 from tests.fakes import failing, passing
 from tests.v1.vault.conftest import (
     DN,
     K8S_PATH,
     KV,
+    METADATA,
     OIDC_PATH,
     OTHER_DN,
     STORE_DIR,
@@ -455,7 +461,10 @@ async def test_listing_reports_team_name_and_directory(bitbucket):
 # --------------------------------------------------------------------------- #
 async def _update(bitbucket, access, kv_name=KV):
     return await update_kv_mount_operation(
-        bitbucket, kv_name, VaultKVUpdate(access=access), branch_suffix="abc123"
+        bitbucket,
+        kv_name,
+        VaultKVUpdate(access=access, metadata=METADATA),
+        branch_suffix="abc123",
     )
 
 
@@ -555,9 +564,9 @@ async def test_adding_a_grant_appends_to_the_matching_file(bitbucket, grant_payl
 
 async def test_a_k8s_grant_lands_in_the_k8s_file(bitbucket):
     seed_store(bitbucket, oidc=[oidc_entry()])
-    payload = K8sAccessEntry(
+    payload = K8sAccessEntryRequest(
         path="*", auth_type="k8s", name="sa", namespace="ns",
-        cluster="dev", capabilities=["read"],
+        cluster="dev", capabilities=["read"], metadata=METADATA,
     )
 
     await add_access_entry_operation(bitbucket, KV, payload, branch_suffix="abc123")
@@ -567,8 +576,8 @@ async def test_a_k8s_grant_lands_in_the_k8s_file(bitbucket):
 
 async def test_adding_a_duplicate_grant_is_409(bitbucket):
     seed_store(bitbucket, oidc=[oidc_entry()])
-    payload = OidcAccessEntry(
-        path="*", auth_type="oidc", dn=DN, capabilities=["read"]
+    payload = OidcAccessEntryRequest(
+        path="*", auth_type="oidc", dn=DN, capabilities=["read"], metadata=METADATA
     )
 
     with pytest.raises(VaultOperationError) as error:
@@ -669,3 +678,66 @@ async def test_a_repeat_delete_is_404(bitbucket):
         await delete_kv_store_operation(bitbucket, KV, branch_suffix="def456")
 
     assert error.value.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# metadata: request-only, and the pull-request description is its only home
+# --------------------------------------------------------------------------- #
+def test_to_document_entry_drops_the_metadata():
+    """The single bridge from request model to document dict reads named fields only.
+
+    This is the seam that makes the whole guarantee structural rather than incidental: a
+    request entry carries `metadata`, and nothing downstream ever sees it.
+    """
+    oidc = to_document_entry(
+        OidcAccessEntryRequest(
+            path="*", auth_type="oidc", dn=DN, capabilities=["read"], metadata=METADATA
+        )
+    )
+    k8s = to_document_entry(
+        K8sAccessEntryRequest(
+            path="*", auth_type="k8s", name="sa", namespace="ns", cluster="dev",
+            capabilities=["read"], metadata=METADATA,
+        )
+    )
+
+    assert set(oidc) == {"path", "authType", "dn", "capabilities"}
+    assert set(k8s) == {"path", "authType", "name", "namespace", "cluster", "capabilities"}
+
+
+async def test_a_delete_description_has_no_metadata_block(bitbucket):
+    """The routes that carry no body were left alone, byte for byte.
+
+    `_describe` defaults `metadata` to None, and with None its output is identical to what
+    it produced before the block existed.
+    """
+    seed_store(bitbucket, oidc=[oidc_entry(), oidc_entry(dn=OTHER_DN)])
+
+    await remove_access_entry_operation(
+        bitbucket, KV, oidc_entry(dn=OTHER_DN), branch_suffix="abc123"
+    )
+    assert "- metadata:" not in bitbucket.descriptions[-1]
+
+    bitbucket.builds = [passing()]
+    await delete_kv_store_operation(bitbucket, KV, branch_suffix="abc123")
+    assert "- metadata:" not in bitbucket.descriptions[-1]
+
+
+async def test_a_create_description_carries_the_metadata_block(bitbucket, payload):
+    """Between `change` and `grants`, in declaration order, never sorted."""
+    await _create(bitbucket, payload)
+
+    description = bitbucket.descriptions[-1]
+    block = (
+        "- metadata:\n"
+        "  - project: cloudops\n"
+        "  - network: internal\n"
+        "  - region: il-central\n"
+        "  - space: shared\n"
+        "  - environment: production\n"
+        "  - island: island-a\n"
+    )
+
+    assert block in description
+    assert description.index("- change:") < description.index("- metadata:")
+    assert description.index("- metadata:") < description.index("- grants:")

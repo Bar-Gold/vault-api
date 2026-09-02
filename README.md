@@ -127,6 +127,14 @@ for them to settle (`CI_PIPELINE_TIMEOUT_SECONDS`).
 ```jsonc
 POST /api/vault/v1/kv/
 {
+  "metadata": {                    // required; audit only, never written to a file
+    "project": "cloudops",
+    "network": "internal",
+    "region": "il-central",
+    "space": "shared",
+    "environment": "production",
+    "island": "island-a"
+  },
   "team": "cloudops",              // first directory segment; ^[a-z0-9]+(-[a-z0-9]+)*$
   "kv_name": "my-passwords",       // second segment, and unique across ALL teams
   "access": [                      // required: at least one grant
@@ -148,11 +156,19 @@ POST /api/vault/v1/kv/
 }
 ```
 
-**Three fields, and the body mirrors the committed document.** A caller sends the same
+**Four fields, and the body mirrors the committed document.** A caller sends the same
 `access` entries that land in the file, so `path` and `capabilities` are expressible — a
 translated shape could express neither. There is **no** `kv_description`: the format defines
 no home for it, and this service does not invent keys. Sending an unknown field (or one from
 an older revision, like `file` or `roles`) is a `422`, not a silent drop.
+
+**`metadata` is the exception that proves the rule: it is the one field that never reaches a
+file.** Six required non-blank strings — `project`, `network`, `region`, `space`,
+`environment`, `island` — required on the five routes that carry a body (this create, both
+list-replacing writes, and the two one-grant adds). They are free-form on purpose: the
+vocabulary belongs to the deploying team, not this service. The committed document keeps its
+single `access` key; the coordinates go to the **pull-request description**, where a reviewer
+sees them, and to the service log. The `DELETE` and `GET` routes take none.
 
 `team` and `kv_name` are the only values that reach a filesystem path, and their pattern
 blocks `..` and slashes, so a request can never escape the values directory. `path` is a
@@ -214,6 +230,8 @@ The second layout, and the only one that is not a directory:
 ```jsonc
 PUT /api/vault/v1/kv/tashtiot/cloudops
 {
+  "metadata": {"project": "cloudops", "network": "internal", "region": "il-central",
+               "space": "shared", "environment": "production", "island": "island-a"},
   "access": [
     {"path": "+/cloudops/*", "auth_type": "oidc", "dn": "CN=cloudops,...",
      "capabilities": ["read"]},
@@ -239,9 +257,8 @@ something returns `201`.
 |-------|-------|
 | `GET /stores` | every store: team, name, directory. Lists directories, reads no file |
 | `GET /{kv_name}` | one store, found by name alone — whichever team owns it |
-| `PATCH /{kv_name}` | replaces the grant list wholesale |
-| `GET /{kv_name}/access` | just the grants; an empty list is a `200`, not a `404` |
-| `POST /{kv_name}/access` | append one grant; the `auth_type` picks the file |
+| `PATCH /{kv_name}` | replaces the grant list wholesale; takes `metadata` |
+| `POST /{kv_name}/access` | append one grant; the `auth_type` picks the file; takes `metadata` |
 | `DELETE /{kv_name}/access?auth_type=…&path=…` | revoke one grant |
 | `GET`/`DELETE /tashtiot/{team}` | read or remove one team's shared-services file |
 
