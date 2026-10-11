@@ -13,12 +13,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **CLAUDE.md (this file) — decisions and traps.** Only what the code cannot tell you: why
   something is the way it is, and what breaks if you "fix" it. If a fact is discoverable by
   reading one file, it belongs in that file's comments, not here.
-- **`notes_and_bugs.txt` — untracked scratch backlog.** Open items at last read: what to do
-  about a duplicate KV name, and defaulting `path` / `auth_type` on `POST /{kv_name}/access`
-  in the Swagger box.
+- **`todo.txt` — untracked scratch backlog.** Terse and the user's own; read it
+  for what is currently open rather than trusting a summary here.
 
 Templates for the two untracked config files are committed: `.env.example` and
-`uv.toml.example`. `.claude/agents/` holds two project subagents.
+`uv.toml.example`. `.claude/agents/` holds two project subagents; `.claude/skills/run-project`
+is the verified start/stop/status recipe for the local server — use it rather than improvising.
 
 ## What this is
 
@@ -91,7 +91,7 @@ uv-managed (Python 3.12). Package indexes come from `uv.toml` (internal Artifact
 ```bash
 uv sync --group dev                 # install deps into .venv — ON-PREM ONLY, see below
 uv run --no-sync python -m app.main # serves on 0.0.0.0:5000 (--host/--port override)
-uv run --no-sync pytest             # everything under tests/ (456 tests, ~31s)
+uv run --no-sync pytest             # everything under tests/ (460 tests, ~40s)
 uv run --no-sync pytest tests/v1/vault                                            # one suite
 uv run --no-sync pytest tests/v1/vault/test_operations.py::test_create_call_order # one test
 docker build -t vault-api . && docker run -p 5000:5000 --env-file .env vault-api
@@ -150,10 +150,10 @@ There are **no `__init__.py` files anywhere** — implicit namespace packages, w
 
 | File | Lines | What it owns |
 |---|---:|---|
-| `app/v1/vault/operations.py` | 1319 | the chain: every `*_operation`, both PR helpers, rollbacks |
+| `app/v1/vault/operations.py` | 1357 | the chain: every `*_operation`, both PR helpers, rollbacks |
 | `app/clients/bitbucket.py` | 635 | branch / file / PR REST, and the build-status gate |
-| `app/v1/vault/routes.py` | 533 | route decorators, `_execute`/`_read`, `_revoked_entry` |
-| `app/v1/vault/schemas.py` | 511 | request models, every validation pattern |
+| `app/v1/vault/routes.py` | 627 | route decorators, `_execute`/`_read`, `_revoked_entry` |
+| `app/v1/vault/schemas.py` | 764 | request models, every validation pattern |
 | `app/helpers.py` | 431 | pure: paths, entries, transforms, YAML rendering |
 | `app/clients/git.py` | 208 | the one non-REST operation (deleting a path) |
 | `app/main.py` | 112 | `create_app()` — the single wiring point |
@@ -162,7 +162,7 @@ There are **no `__init__.py` files anywhere** — implicit namespace packages, w
 
 `app/v1/vault/` is the same four-file split the reference API uses. **Stores, grants and the
 Tashtiot file all live in those four files**; there is no `app/v1/tashtiot/`. They write the
-same document shape and share `_open_pull_request` / `_commit_via_pull_request` /
+same document shape and share `_open_pull_request` / `_open_and_validate` /
 `VaultOperationResponse`, so splitting them would either duplicate that spine or turn it into
 a cross-package import.
 
@@ -296,6 +296,22 @@ Field-level `examples=[…]` do not reach it — without one, every string in th
 the config is **merged** with the base's (`**_AccessEntryBase.model_config`), not replaced:
 `extra: "forbid"` lives there too, and replacing it would silently reopen both models
 (`test_the_entry_models_still_forbid_extra_fields`).
+
+**One pair of models, two routes, two prefills.** The models' own example sets `path` to
+`"*"`, which is what `POST /{kv_name}/access` shows — a store grant covering that whole
+store is the usual case. `POST /tashtiot/{team}/access` overrides it to `"+/team/*"`,
+because that file grants a team access *into* the shared services store and its paths are
+scoped in practice, so a prefilled `*` nudges towards the wrong shape. `team` there is a
+literal placeholder: an OpenAPI example is static and cannot be templated from the URL.
+**Examples, not defaults** — `path` stays required on both routes.
+
+The override is `openapi_extra=` on the route decorator, and that spelling is
+load-bearing. The obvious alternative, `Body(openapi_examples=…)` on the payload, replaces
+the discriminated union's generated schema with a bare `anyOf` — which loses the `oneOf`
+and the discriminator that Swagger's branch picker is built from, invisibly unless you go
+looking for the dropdown. FastAPI **deep-merges** `openapi_extra` (`deep_dict_update`, in
+`fastapi/openapi/utils.py`), so it adds the examples and leaves the schema untouched.
+`test_the_tashtiot_examples_did_not_cost_the_branch_picker` pins the difference.
 
 **Validation lives where the rule comes from** — the patterns are in `schemas.py` with
 comments; what matters across them:
@@ -620,7 +636,7 @@ open pull requests too.
 
 ## Tests
 
-456 of them. `tests/test_helpers.py` (pure, no library import — the document model and the
+460 of them. `tests/test_helpers.py` (pure, no library import — the document model and the
 exact committed bytes), `tests/clients/` (the Bitbucket client and `http.py`'s error mapping
 against the real REST shapes via respx, plus `test_git.py` running **real git against a real
 bare repo** in a temp dir), `tests/v1/vault/` (schemas, the chain + rollbacks with duck-typed

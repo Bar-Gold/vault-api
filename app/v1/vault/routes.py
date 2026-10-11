@@ -50,6 +50,8 @@ from .schemas import (
     KV_NAME_PATTERN,
     KV_NAME_READ_PATTERN,
     TEAM_PATTERN,
+    TASHTIOT_K8S_ENTRY_EXAMPLE,
+    TASHTIOT_OIDC_ENTRY_EXAMPLE,
     TEAM_READ_PATTERN,
     VAULT_PATH_MAX_LENGTH,
     VAULT_PATH_PATTERN,
@@ -404,6 +406,36 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         tags=config.API_TASHTIOT_TAGS,
         response_model=VaultOperationResponse,
         status_code=201,
+        # Swagger prefills its editable box from these rather than from the shared models'
+        # own `"*"`: one pair of models, two routes that want different starting points,
+        # since a Tashtiot grant reaches *into* the shared services store and is scoped in
+        # practice. Examples only — `path` stays required and omitting it is still a 422.
+        #
+        # Declared as `openapi_extra` rather than `Body(openapi_examples=...)` on the
+        # payload **on purpose**. Annotating the payload replaces the discriminated union's
+        # generated schema with a bare `anyOf`, which loses the `oneOf` + discriminator that
+        # Swagger's branch picker is built from — and
+        # `test_the_grant_body_schema_is_the_request_entry_pair` fails when it does.
+        # FastAPI deep-merges `openapi_extra`, so this adds the examples and leaves the
+        # schema untouched.
+        openapi_extra={
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "examples": {
+                            "oidc": {
+                                "summary": "An OIDC group, scoped to one team's subtree",
+                                "value": TASHTIOT_OIDC_ENTRY_EXAMPLE,
+                            },
+                            "k8s": {
+                                "summary": "A Kubernetes service account, same scoping",
+                                "value": TASHTIOT_K8S_ENTRY_EXAMPLE,
+                            },
+                        }
+                    }
+                }
+            }
+        },
         summary="Open a validated pull request adding one shared-services grant",
         description=(
             "Appends one entry to the team's flat file, either auth type - the file "
