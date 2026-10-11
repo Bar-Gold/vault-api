@@ -7,7 +7,13 @@ from app.helpers import (
     build_oidc_access_entry,
     render_values_yaml,
 )
-from app.v1.vault.schemas import OidcAccessEntryRequest, VaultKVCreate
+from app.v1.vault.schemas import (
+    DeleteRequest,
+    K8sAccessRevoke,
+    OidcAccessEntryRequest,
+    OidcAccessRevoke,
+    VaultKVCreate,
+)
 from tests.fakes import FakeBitbucket
 
 TEAM = "cloudops"
@@ -20,7 +26,7 @@ BRANCH = f"vault-kv/{TEAM}-{KV}-abc123"
 DN = "CN=cloudops,OU=Groups,DC=corp,DC=example,DC=com"
 OTHER_DN = "CN=platform,OU=Groups,DC=corp,DC=example,DC=com"
 
-# Required on every request that carries a body, and required *not* to reach a file.
+# Required on every route but the reads, and required *not* to reach a file.
 # One dict, so a test asserting on the pull-request description can name the values.
 METADATA = {
     "project": "cloudops",
@@ -44,6 +50,29 @@ def k8s_entry(
     capabilities=("read",),
 ):
     return build_k8s_access_entry(path, name, namespace, cluster, list(capabilities))
+
+
+def oidc_revoke(path="*", dn=DN):
+    """A revoke body as an operation receives it: the grant's identity plus metadata."""
+    return OidcAccessRevoke(path=path, auth_type="oidc", dn=dn, metadata=METADATA)
+
+
+def k8s_revoke(
+    path="*", name="cloudops-external-secrets", namespace="cloudops", cluster="dev"
+):
+    return K8sAccessRevoke(
+        path=path,
+        auth_type="k8s",
+        name=name,
+        namespace=namespace,
+        cluster=cluster,
+        metadata=METADATA,
+    )
+
+
+def delete_request():
+    """The body of a store or Tashtiot delete: the metadata block and nothing else."""
+    return DeleteRequest(metadata=METADATA)
 
 
 def seed_store(bitbucket, team=TEAM, kv_name=KV, oidc=(), k8s=()):

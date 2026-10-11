@@ -14,16 +14,20 @@ and a store may be called `pull-request` with nothing to collide with.
 **Path parameters are pattern-validated**, not just body fields. Starlette's path convertor
 is `[^/]+`, so nothing is exploitable without them, but a malformed name would otherwise
 surface as an opaque Bitbucket 404 two calls later rather than a 422 here.
+
+**No route takes query parameters, and every route but the reads takes a JSON body** that
+carries the metadata block — the `DELETE`s included. A revoke's identity is in its body,
+and a store or Tashtiot delete sends a body holding the metadata alone.
+`test_no_mutating_route_takes_a_query_parameter` pins the rule against the OpenAPI schema.
 """
 
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Path, Query
+from fastapi import APIRouter, Path
 from loguru import logger
 from starlette.responses import JSONResponse
 from tashtiot_apis_library.connectors import ExternalServiceError
 
-from ...helpers import build_k8s_access_entry, build_oidc_access_entry
 from .conf import config
 from .operations import (
     VaultOperationError,
@@ -41,22 +45,17 @@ from .operations import (
     upsert_tashtiot_access_operation,
 )
 from .schemas import (
-    K8S_CLUSTER_MAX_LENGTH,
-    K8S_CLUSTER_PATTERN,
-    K8S_NAMESPACE_MAX_LENGTH,
-    K8S_NAMESPACE_PATTERN,
-    K8S_SERVICE_ACCOUNT_MAX_LENGTH,
-    K8S_SERVICE_ACCOUNT_PATTERN,
     KV_NAME_PATTERN,
     KV_NAME_READ_PATTERN,
     TEAM_PATTERN,
     TASHTIOT_K8S_ENTRY_EXAMPLE,
+    TASHTIOT_K8S_REVOKE_EXAMPLE,
     TASHTIOT_OIDC_ENTRY_EXAMPLE,
+    TASHTIOT_OIDC_REVOKE_EXAMPLE,
     TEAM_READ_PATTERN,
-    VAULT_PATH_MAX_LENGTH,
-    VAULT_PATH_PATTERN,
     AccessEntryRequest,
-    AuthType,
+    AccessRevokeRequest,
+    DeleteRequest,
     OperationStatus,
     TashtiotAccessUpsert,
     VaultKVCreate,
@@ -120,118 +119,8 @@ TeamReadParam = Annotated[
     ),
 ]
 
-# Revoking a grant carries its identity as **query parameters**, not a request body: DELETE
-# bodies are widely dropped by proxies and clients. Which parameters are required depends on
-# `auth_type` — an OIDC grant is identified by (path, dn) and a Kubernetes one by
-# (path, name, namespace, cluster) — so they are validated together in `_revoked_entry`
-# rather than by the signature alone.
-AuthTypeQuery = Annotated[
-    AuthType,
-    Query(description="Which kind of grant to revoke: oidc or k8s."),
-]
-
-PathQuery = Annotated[
-    str,
-    Query(
-        max_length=VAULT_PATH_MAX_LENGTH,
-        pattern=VAULT_PATH_PATTERN,
-        examples=["*"],
-        description="Secret path pattern of the grant to revoke.",
-    ),
-]
-
-DnQuery = Annotated[
-    Optional[str],
-    Query(
-        max_length=512,
-        examples=["CN=cloudops,OU=Groups,DC=corp,DC=example,DC=com"],
-        description="OIDC only: distinguished name of the grant to revoke.",
-    ),
-]
-
-ServiceAccountQuery = Annotated[
-    Optional[str],
-    Query(
-        max_length=K8S_SERVICE_ACCOUNT_MAX_LENGTH,
-        pattern=K8S_SERVICE_ACCOUNT_PATTERN,
-        examples=["cloudops-external-secrets"],
-        description="k8s only: service account name of the grant to revoke.",
-    ),
-]
-
-NamespaceQuery = Annotated[
-    Optional[str],
-    Query(
-        max_length=K8S_NAMESPACE_MAX_LENGTH,
-        pattern=K8S_NAMESPACE_PATTERN,
-        examples=["cloudops"],
-        description="k8s only: namespace of the grant to revoke.",
-    ),
-]
-
-ClusterQuery = Annotated[
-    Optional[str],
-    Query(
-        max_length=K8S_CLUSTER_MAX_LENGTH,
-        pattern=K8S_CLUSTER_PATTERN,
-        examples=["dev"],
-        description="k8s only: OpenShift cluster suffix of the grant to revoke.",
-    ),
-]
-
-
 def _json(body: VaultOperationResponse, status_code: int) -> JSONResponse:
     return JSONResponse(body.model_dump(mode="json"), status_code=status_code)
-
-
-def _revoked_entry(
-    auth_type: AuthType,
-    path: str,
-    dn: Optional[str],
-    name: Optional[str],
-    namespace: Optional[str],
-    cluster: Optional[str],
-):
-    """Rebuild the identity of the grant being revoked from the query parameters.
-
-    Raises `VaultOperationError` with a 422 when the parameters do not match the
-    `auth_type`: a partial identity would otherwise resolve to *some* entry, and revoking
-    the wrong grant is worse than refusing an ambiguous request. Capabilities are not taken
-    — they are not part of an entry's identity, so asking for them would invite a caller to
-    think a partial revoke was possible.
-    """
-    if auth_type == AuthType.K8S:
-        missing = [
-            field
-            for field, value in (
-                ("name", name), ("namespace", namespace), ("cluster", cluster)
-            )
-            if not value
-        ]
-        if missing:
-            raise VaultOperationError(
-                f"auth_type=k8s needs {', '.join(missing)}",
-                status_code=422,
-            )
-        if dn:
-            raise VaultOperationError("auth_type=k8s does not take dn", status_code=422)
-        # Capabilities play no part in identity; [] keeps the builder's shape.
-        return build_k8s_access_entry(path, name, namespace, cluster, [])
-
-    if not dn:
-        raise VaultOperationError("auth_type=oidc needs dn", status_code=422)
-    extra = [
-        field
-        for field, value in (
-            ("name", name), ("namespace", namespace), ("cluster", cluster)
-        )
-        if value
-    ]
-    if extra:
-        raise VaultOperationError(
-            f"auth_type=oidc does not take {', '.join(extra)}", status_code=422
-        )
-    return build_oidc_access_entry(path, dn, [])
 
 
 async def _execute(operation: Any) -> Any:
@@ -389,12 +278,19 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         summary="Open a validated pull request removing a team's shared-services grants",
         description=(
             "The file is still there when this returns; the pull request that removes it "
-            "is open for review."
+            "is open for review. "
+            "The body is the metadata block alone, recorded in the pull-request "
+            "description for audit."
         ),
     )
-    async def delete_tashtiot(team: TeamParam):
-        logger.info(f"Deleting {config.TASHTIOT_DIR} access for {team}")
-        return await _execute(delete_tashtiot_access_operation(bitbucket, team))
+    async def delete_tashtiot(team: TeamParam, payload: DeleteRequest):
+        logger.info(
+            f"Deleting {config.TASHTIOT_DIR} access for {team}"
+            f" [{payload.metadata.as_log_text()}]"
+        )
+        return await _execute(
+            delete_tashtiot_access_operation(bitbucket, team, payload)
+        )
 
     # One grant at a time, the same pair the store sub-resource has. `PUT /tashtiot/{team}`
     # replaces the whole list, which is the wrong tool for adding one principal to a file
@@ -461,31 +357,45 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         tags=config.API_TASHTIOT_TAGS,
         response_model=VaultOperationResponse,
         status_code=201,
+        # The same prefill as the add above, minus capabilities: revoking is usually undoing
+        # a grant someone added here, and the same `openapi_extra` spelling keeps the
+        # branch picker for the same reason.
+        openapi_extra={
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "examples": {
+                            "oidc": {
+                                "summary": "An OIDC group, scoped to one team's subtree",
+                                "value": TASHTIOT_OIDC_REVOKE_EXAMPLE,
+                            },
+                            "k8s": {
+                                "summary": "A Kubernetes service account, same scoping",
+                                "value": TASHTIOT_K8S_REVOKE_EXAMPLE,
+                            },
+                        }
+                    }
+                }
+            }
+        },
         summary="Open a validated pull request revoking one shared-services grant",
         description=(
-            "The grant's identity travels as query parameters, exactly as it does for a "
-            "store: oidc needs path and dn; k8s needs path, name, namespace and cluster. "
-            "A mismatched set is a 422. Revoking the team's last grant removes the file. "
+            "The grant's identity is the JSON body, exactly as it is for a store: oidc "
+            "needs path and dn; k8s needs path, name, namespace and cluster. A missing or "
+            "mismatched field is a 422. Revoking the team's last grant removes the file. "
             "The grant is still in effect when this returns; the pull request that "
-            "revokes it is open for review."
+            "revokes it is open for review. "
+            "The metadata block is recorded in the pull-request description for "
+            "audit and is never written to the access files."
         ),
     )
-    async def delete_tashtiot_access(
-        team: TeamParam,
-        auth_type: AuthTypeQuery,
-        path: PathQuery,
-        dn: DnQuery = None,
-        name: ServiceAccountQuery = None,
-        namespace: NamespaceQuery = None,
-        cluster: ClusterQuery = None,
-    ):
-        try:
-            entry = _revoked_entry(auth_type, path, dn, name, namespace, cluster)
-        except VaultOperationError as invalid:
-            return _json(invalid.to_response(), invalid.status_code)
-        logger.info(f"Revoking a {config.TASHTIOT_DIR} grant from {team}")
+    async def delete_tashtiot_access(team: TeamParam, payload: AccessRevokeRequest):
+        logger.info(
+            f"Revoking a {config.TASHTIOT_DIR} grant from {team}"
+            f" [{payload.metadata.as_log_text()}]"
+        )
         return await _execute(
-            remove_tashtiot_access_entry_operation(bitbucket, team, entry)
+            remove_tashtiot_access_entry_operation(bitbucket, team, payload)
         )
 
     # ---------------------------------------------------------------- #
@@ -539,29 +449,23 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
         status_code=201,
         summary="Open a validated pull request revoking one grant",
         description=(
-            "The grant's identity travels as query parameters, since DELETE bodies are "
-            "widely dropped. oidc needs path and dn; k8s needs path, name, namespace and "
-            "cluster. A mismatched set is a 422, not a wrong-grant revoke. Capabilities "
-            "are not taken - they are not part of a grant's identity. "
+            "The grant's identity is the JSON body: oidc needs path and dn; k8s needs "
+            "path, name, namespace and cluster. A missing or mismatched field is a 422, "
+            "not a wrong-grant revoke. Capabilities are not taken - they are not part of "
+            "a grant's identity, and sending them is a 422. "
             "The grant is still in effect when this returns; the pull request that "
-            "revokes it is open for review."
+            "revokes it is open for review. "
+            "The metadata block is recorded in the pull-request description for "
+            "audit and is never written to the access files."
         ),
     )
-    async def delete_access(
-        kv_name: KVNameParam,
-        auth_type: AuthTypeQuery,
-        path: PathQuery,
-        dn: DnQuery = None,
-        name: ServiceAccountQuery = None,
-        namespace: NamespaceQuery = None,
-        cluster: ClusterQuery = None,
-    ):
-        try:
-            entry = _revoked_entry(auth_type, path, dn, name, namespace, cluster)
-        except VaultOperationError as invalid:
-            return _json(invalid.to_response(), invalid.status_code)
-        logger.info(f"Revoking access on {kv_name}")
-        return await _execute(remove_access_entry_operation(bitbucket, kv_name, entry))
+    async def delete_access(kv_name: KVNameParam, payload: AccessRevokeRequest):
+        logger.info(
+            f"Revoking access on {kv_name} [{payload.metadata.as_log_text()}]"
+        )
+        return await _execute(
+            remove_access_entry_operation(bitbucket, kv_name, payload)
+        )
 
 
     # ---------------------------------------------------------------- #
@@ -617,11 +521,15 @@ def get_v1_vault_router(bitbucket: Any) -> APIRouter:
             "for the validation build. "
             "**The store is not deleted when this returns** - the pull request that "
             "deletes it is open for review. A repeat call is a 404 only once that pull "
-            "request has been merged."
+            "request has been merged. "
+            "The body is the metadata block alone, recorded in the pull-request "
+            "description for audit."
         ),
     )
-    async def delete_kv(kv_name: KVNameParam):
-        logger.info(f"Deleting KV store {kv_name}")
-        return await _execute(delete_kv_store_operation(bitbucket, kv_name))
+    async def delete_kv(kv_name: KVNameParam, payload: DeleteRequest):
+        logger.info(
+            f"Deleting KV store {kv_name} [{payload.metadata.as_log_text()}]"
+        )
+        return await _execute(delete_kv_store_operation(bitbucket, kv_name, payload))
 
     return router

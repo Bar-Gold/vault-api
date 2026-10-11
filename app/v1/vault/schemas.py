@@ -11,7 +11,7 @@ What is deliberately absent: there is no `kv_description`. The format defines no
 it, and this service does not invent keys.
 
 The mirror has exactly **one** documented exception: `metadata`. It is required on every
-request that carries a body, and it is the one field that never reaches a file — the
+route but the reads, and it is the one field that never reaches a file — the
 document keeps its single `access` key, and the six coordinates go to the pull-request
 description and the service log instead. See `RequestMetadata`.
 """
@@ -105,8 +105,13 @@ def _validate_capabilities(values: List[Capability]) -> List[Capability]:
     return values
 
 
-class _AccessEntryBase(BaseModel):
-    """Fields both kinds of grant carry."""
+class _GrantPathBase(BaseModel):
+    """The one field every grant model carries, the entries and the revokes alike.
+
+    Split out of `_AccessEntryBase` so a revoke can share `path` and its validator without
+    inheriting `capabilities`: a revoke identifies a grant, and capabilities are not part of
+    its identity.
+    """
 
     model_config = {"extra": "forbid"}
 
@@ -120,17 +125,6 @@ class _AccessEntryBase(BaseModel):
             "'services/+/tyk/*' scopes it, where '+' matches one segment."
         ),
     )
-
-    capabilities: List[Capability] = Field(
-        ...,
-        examples=[["read", "write"]],
-        description="What the principal may do on that path. At least one, no repeats.",
-    )
-
-    @field_validator("capabilities")
-    @classmethod
-    def valid_capabilities(cls, v: List[Capability]) -> List[Capability]:
-        return _validate_capabilities(v)
 
     @field_validator("path")
     @classmethod
@@ -146,6 +140,32 @@ class _AccessEntryBase(BaseModel):
         if ".." in v:
             raise ValueError("path must not contain '..'")
         return v
+
+
+class _AccessEntryBase(_GrantPathBase):
+    """Fields both kinds of grant carry."""
+
+    capabilities: List[Capability] = Field(
+        ...,
+        examples=[["read", "write"]],
+        description="What the principal may do on that path. At least one, no repeats.",
+    )
+
+    @field_validator("capabilities")
+    @classmethod
+    def valid_capabilities(cls, v: List[Capability]) -> List[Capability]:
+        return _validate_capabilities(v)
+
+
+DN_MAX_LENGTH = 512
+
+
+def _validate_dn(value: str) -> str:
+    """Non-blank, and stripped. Shared by the grant and the revoke, so a DN sent with a
+    stray space identifies the same grant it was added as."""
+    if not value.strip():
+        raise ValueError("dn must not be blank")
+    return value.strip()
 
 
 class OidcAccessEntry(_AccessEntryBase):
@@ -183,7 +203,7 @@ class OidcAccessEntry(_AccessEntryBase):
     dn: str = Field(
         ...,
         min_length=1,
-        max_length=512,
+        max_length=DN_MAX_LENGTH,
         examples=["CN=svc-athena,OU=ServiceAccounts,DC=corp,DC=example,DC=com"],
         description="Distinguished Name of the group being granted access.",
     )
@@ -191,9 +211,7 @@ class OidcAccessEntry(_AccessEntryBase):
     @field_validator("dn")
     @classmethod
     def not_blank(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("dn must not be blank")
-        return v.strip()
+        return _validate_dn(v)
 
 
 # Kubernetes' own rules, not ours — a looser pattern would let a request pass here and fail
@@ -313,7 +331,7 @@ def _validate_access(entries: List[AccessEntry]) -> List[AccessEntry]:
 # request-only data
 #
 # Everything above this point mirrors the committed document. `metadata` is the single
-# documented exception: required on every request that carries a body, and never written.
+# documented exception: required on every route but the reads, and never written.
 # --------------------------------------------------------------------------- #
 
 # Deployment coordinates the organisation requires on every mutating request. Free-form on
@@ -323,7 +341,7 @@ def _validate_access(entries: List[AccessEntry]) -> List[AccessEntry]:
 # them.
 METADATA_MAX_LENGTH = 253
 
-# One dict, spliced into all five body examples. Retyping it would let the docs drift.
+# One dict, spliced into every body example. Retyping it would let the docs drift.
 _METADATA_EXAMPLE = {
     "project": "cloudops",
     "network": "internal",
@@ -337,9 +355,10 @@ _METADATA_EXAMPLE = {
 class RequestMetadata(BaseModel):
     """Where the caller's deployment lives — audit only, never committed.
 
-    Required on every request that carries a body, and **dropped before anything is
-    written**: `to_document_entry` builds a document entry from named fields, so there is
-    no path by which one of these values can reach an access file. What it does reach is
+    Required on every route but the reads — every one of them takes a JSON body, the
+    `DELETE`s included — and **dropped before anything is written**: `to_document_entry`
+    and `to_revoked_entry` build a document entry from named fields, so there is no path by
+    which one of these values can reach an access file. What it does reach is
     the pull-request description, where a reviewer sees it, and the service log.
 
     All six values are free-form non-blank strings. That mirrors how `dn` is handled: any
@@ -516,6 +535,146 @@ AccessEntryRequest = Annotated[
 """
 
 
+# --------------------------------------------------------------------------- #
+# the DELETE bodies
+#
+# Every route but the reads takes a JSON body, and no route takes query parameters — the
+# `DELETE`s included. So a revoke carries the grant's identity in its body rather than in
+# `?auth_type=&path=&…`, and a store or Tashtiot delete carries a body holding nothing but
+# the metadata block, which is what makes the deletions auditable like every other change.
+# --------------------------------------------------------------------------- #
+class OidcAccessRevoke(_GrantPathBase):
+    """An OIDC grant's **identity**, as the body of a revoke: `path` and `dn`.
+
+    No `capabilities`, and `extra: "forbid"` (from `_GrantPathBase`) makes sending them a
+    422: they are not part of an entry's identity, so asking for them would invite a caller
+    to think a partial revoke was possible. The same rule refuses a k8s field here, which
+    is how a mixed identity — one that would resolve to *some* entry — is refused before any
+    upstream call.
+    """
+
+    model_config = {
+        **_GrantPathBase.model_config,
+        "json_schema_extra": {
+            "example": {
+                "path": "*",
+                "auth_type": "oidc",
+                "dn": "CN=cloudops,OU=Groups,DC=corp,DC=example,DC=com",
+                "metadata": _METADATA_EXAMPLE,
+            }
+        },
+    }
+
+    auth_type: Literal[AuthType.OIDC] = Field(
+        ...,
+        description="oidc — the grant to revoke is a directory group's.",
+    )
+
+    dn: str = Field(
+        ...,
+        min_length=1,
+        max_length=DN_MAX_LENGTH,
+        examples=["CN=cloudops,OU=Groups,DC=corp,DC=example,DC=com"],
+        description="Distinguished Name of the grant to revoke.",
+    )
+
+    metadata: RequestMetadata = Field(..., description=_METADATA_FIELD_DESCRIPTION)
+
+    @field_validator("dn")
+    @classmethod
+    def not_blank(cls, v: str) -> str:
+        return _validate_dn(v)
+
+
+class K8sAccessRevoke(_GrantPathBase):
+    """A Kubernetes grant's identity: `path` plus all three scalars. See `OidcAccessRevoke`.
+
+    All three are required — the same account in two namespaces or two clusters is two
+    principals, so a revoke missing one is ambiguous, and revoking the wrong grant is worse
+    than refusing the request.
+    """
+
+    model_config = {
+        **_GrantPathBase.model_config,
+        "json_schema_extra": {
+            "example": {
+                "path": "*",
+                "auth_type": "k8s",
+                "name": "cloudops-external-secrets",
+                "namespace": "cloudops",
+                "cluster": "dev",
+                "metadata": _METADATA_EXAMPLE,
+            }
+        },
+    }
+
+    auth_type: Literal[AuthType.K8S] = Field(
+        ...,
+        description="k8s — the grant to revoke is a service account's.",
+    )
+
+    name: str = Field(
+        ...,
+        max_length=K8S_SERVICE_ACCOUNT_MAX_LENGTH,
+        pattern=K8S_SERVICE_ACCOUNT_PATTERN,
+        examples=["cloudops-external-secrets"],
+        description="Service account name of the grant to revoke.",
+    )
+
+    namespace: str = Field(
+        ...,
+        max_length=K8S_NAMESPACE_MAX_LENGTH,
+        pattern=K8S_NAMESPACE_PATTERN,
+        examples=["cloudops"],
+        description="Namespace of the grant to revoke.",
+    )
+
+    cluster: str = Field(
+        ...,
+        max_length=K8S_CLUSTER_MAX_LENGTH,
+        pattern=K8S_CLUSTER_PATTERN,
+        examples=["dev"],
+        description="OpenShift cluster suffix of the grant to revoke.",
+    )
+
+    metadata: RequestMetadata = Field(..., description=_METADATA_FIELD_DESCRIPTION)
+
+
+# Discriminated, at the top of the body, for the same reasons as `AccessEntryRequest`: a
+# wrong field is reported by name, and Swagger's branch picker works.
+AccessRevokeRequest = Annotated[
+    Union[OidcAccessRevoke, K8sAccessRevoke],
+    Field(discriminator="auth_type"),
+]
+"""The body of both revoke routes: one grant's identity, plus the metadata block."""
+
+
+# The Tashtiot revoke box prefills the same scoped path its add box does — revoking is
+# usually undoing a grant someone added there.
+TASHTIOT_OIDC_REVOKE_EXAMPLE = {
+    key: value for key, value in TASHTIOT_OIDC_ENTRY_EXAMPLE.items() if key != "capabilities"
+}
+
+TASHTIOT_K8S_REVOKE_EXAMPLE = {
+    key: value for key, value in TASHTIOT_K8S_ENTRY_EXAMPLE.items() if key != "capabilities"
+}
+
+
+class DeleteRequest(BaseModel):
+    """The body of `DELETE /{kv_name}` and `DELETE /tashtiot/{team}`: the metadata block alone.
+
+    The path already says what is deleted; the body exists so a deletion is recorded in its
+    pull-request description like every other change.
+    """
+
+    model_config = {
+        "extra": "forbid",
+        "json_schema_extra": {"example": {"metadata": _METADATA_EXAMPLE}},
+    }
+
+    metadata: RequestMetadata = Field(..., description=_METADATA_FIELD_DESCRIPTION)
+
+
 class OperationStatus(str, Enum):
     SUCCEEDED = "Succeeded"
     FAILED = "Failed"
@@ -591,7 +750,7 @@ class VaultKVCreate(BaseModel):
         ),
     )
 
-    # Declared last, so all five bodies read the same way. Request-only: nothing past
+    # Declared last, so every body reads the same way. Request-only: nothing past
     # `to_document_entry` ever sees it.
     metadata: RequestMetadata = Field(..., description=_METADATA_FIELD_DESCRIPTION)
 
@@ -632,7 +791,7 @@ class VaultKVUpdate(BaseModel):
         description="The full grant list after the edit. Replaces what is there.",
     )
 
-    # Declared last, so all five bodies read the same way. Request-only: nothing past
+    # Declared last, so every body reads the same way. Request-only: nothing past
     # `to_document_entry` ever sees it.
     metadata: RequestMetadata = Field(..., description=_METADATA_FIELD_DESCRIPTION)
 
@@ -682,7 +841,7 @@ class TashtiotAccessUpsert(BaseModel):
         description="Every grant this team has into the shared services store.",
     )
 
-    # Declared last, so all five bodies read the same way. Request-only: nothing past
+    # Declared last, so every body reads the same way. Request-only: nothing past
     # `to_document_entry` ever sees it.
     metadata: RequestMetadata = Field(..., description=_METADATA_FIELD_DESCRIPTION)
 

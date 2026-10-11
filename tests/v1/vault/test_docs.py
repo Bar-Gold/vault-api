@@ -205,6 +205,9 @@ BODY_SCHEMAS = (
     "TashtiotAccessUpsert",
     "OidcAccessEntryRequest",
     "K8sAccessEntryRequest",
+    "OidcAccessRevoke",
+    "K8sAccessRevoke",
+    "DeleteRequest",
 )
 
 
@@ -299,6 +302,76 @@ def test_the_list_element_examples_carry_no_metadata(client, name):
 
 
 # --------------------------------------------------------------------------- #
+# JSON bodies, never query parameters
+#
+# Only a GET may take query parameters, and none does today. Every other route takes a
+# required JSON body carrying the metadata block — the DELETEs included, which is why a
+# revoke's identity is in its body and a store delete sends `{"metadata": {...}}`.
+# --------------------------------------------------------------------------- #
+def _body_properties(spec, body):
+    """Every property a request body can carry, across a `oneOf`'s branches too."""
+    schema = body["content"]["application/json"]["schema"]
+    refs = [branch["$ref"] for branch in schema.get("oneOf", [schema])]
+    schemas = spec["components"]["schemas"]
+    return [set(schemas[ref.rsplit("/", 1)[-1]]["properties"]) for ref in refs]
+
+
+def test_no_mutating_route_takes_a_query_parameter(client):
+    """The rule itself, read off the whole OpenAPI document so a new route is covered the
+    moment it is registered."""
+    spec = client.get("/openapi.json").json()
+    checked = []
+
+    for path, operations in spec["paths"].items():
+        for method, operation in operations.items():
+            if method == "get":
+                continue
+            name = f"{method.upper()} {path}"
+            checked.append(name)
+
+            query = [p["name"] for p in operation.get("parameters", []) if p["in"] == "query"]
+            assert not query, f"{name} takes query parameters {query}"
+
+            body = operation.get("requestBody")
+            assert body and body.get("required"), f"{name} has no required JSON body"
+            for properties in _body_properties(spec, body):
+                assert "metadata" in properties, f"{name} does not carry metadata"
+
+    assert len(checked) == 9, checked
+
+
+@pytest.mark.parametrize("path", ["/{kv_name}/access", "/tashtiot/{team}/access"])
+def test_the_revoke_body_schema_is_the_revoke_pair(client, path):
+    """A discriminated `oneOf`, like the grant's, so Swagger offers the same branch picker."""
+    spec = client.get("/openapi.json").json()
+    body = spec["paths"][f"{config.API_PREFIX}{path}"]["delete"]["requestBody"]
+    schema = body["content"]["application/json"]["schema"]
+
+    assert [ref["$ref"].rsplit("/", 1)[-1] for ref in schema["oneOf"]] == [
+        "OidcAccessRevoke",
+        "K8sAccessRevoke",
+    ]
+    assert schema["discriminator"]["propertyName"] == "auth_type"
+
+
+def test_the_tashtiot_revoke_box_is_prefilled_with_a_scoped_path(client):
+    """Same prefill as the Tashtiot add, minus capabilities — and still valid bodies."""
+    from app.v1.vault.schemas import K8sAccessRevoke, OidcAccessRevoke
+
+    operation = client.get("/openapi.json").json()["paths"][
+        f"{config.API_PREFIX}/tashtiot/{{team}}/access"
+    ]["delete"]
+    examples = operation["requestBody"]["content"]["application/json"]["examples"]
+
+    assert {name: value["value"]["path"] for name, value in examples.items()} == {
+        "oidc": "+/team/*",
+        "k8s": "+/team/*",
+    }
+    assert OidcAccessRevoke(**examples["oidc"]["value"]).path == "+/team/*"
+    assert K8sAccessRevoke(**examples["k8s"]["value"]).path == "+/team/*"
+
+
+# --------------------------------------------------------------------------- #
 # documentation sections
 # --------------------------------------------------------------------------- #
 def test_tashtiot_has_its_own_section(client):
@@ -349,6 +422,7 @@ RETIRED_CLAIMS = (
     "merges, then",
     "runs the full chain",
     "point of no return",
+    "query parameter",
 )
 
 

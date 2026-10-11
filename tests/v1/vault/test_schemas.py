@@ -15,10 +15,13 @@ from app.v1.vault.schemas import (
     TEAM_PATTERN,
     VAULT_PATH_PATTERN,
     Capability,
+    DeleteRequest,
     K8sAccessEntry,
     K8sAccessEntryRequest,
+    K8sAccessRevoke,
     OidcAccessEntry,
     OidcAccessEntryRequest,
+    OidcAccessRevoke,
     RequestMetadata,
     TashtiotAccessUpsert,
     VaultKVCreate,
@@ -340,14 +343,25 @@ METADATA_NAMES = ("project", "network", "region", "space", "environment", "islan
 
 
 def _body_without_metadata(model):
-    """The smallest valid body for each of the five models, minus the metadata block."""
+    """The smallest valid body for each body model, minus the metadata block."""
     if model is VaultKVCreate:
         return {"team": "cloudops", "kv_name": "my-passwords", "access": [OIDC]}
     if model in (VaultKVUpdate, TashtiotAccessUpsert):
         return {"access": [OIDC]}
     if model is OidcAccessEntryRequest:
         return dict(OIDC)
+    if model is OidcAccessRevoke:
+        return _identity(OIDC)
+    if model is K8sAccessRevoke:
+        return _identity(K8S)
+    if model is DeleteRequest:
+        return {}
     return dict(K8S)
+
+
+def _identity(entry):
+    """A grant minus its capabilities: what a revoke body names."""
+    return {key: value for key, value in entry.items() if key != "capabilities"}
 
 
 @pytest.mark.parametrize("model", [
@@ -356,9 +370,12 @@ def _body_without_metadata(model):
     TashtiotAccessUpsert,
     OidcAccessEntryRequest,
     K8sAccessEntryRequest,
+    OidcAccessRevoke,
+    K8sAccessRevoke,
+    DeleteRequest,
 ])
 def test_metadata_is_required_on_every_body_model(model):
-    """All five bodies, one rule — an omitted block is a 422, never a default."""
+    """Every body, one rule — an omitted block is a 422, never a default."""
     with pytest.raises(ValidationError):
         model(**_body_without_metadata(model))
 
@@ -463,3 +480,56 @@ def test_the_metadata_log_line_keeps_declaration_order():
     text = RequestMetadata(**METADATA).as_log_text()
 
     assert text == " ".join(f"{name}={METADATA[name]}" for name in METADATA_NAMES)
+
+
+# --------------------------------------------------------------------------- #
+# the DELETE bodies — a revoke names a grant's identity, a delete names nothing
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("model,entry", [(OidcAccessRevoke, OIDC), (K8sAccessRevoke, K8S)])
+def test_a_revoke_is_the_identity_plus_metadata(model, entry):
+    revoke = model(**_identity(entry), metadata=METADATA)
+
+    assert revoke.path == "*"
+    assert revoke.metadata.project == "cloudops"
+
+
+@pytest.mark.parametrize("model,entry", [(OidcAccessRevoke, OIDC), (K8sAccessRevoke, K8S)])
+def test_a_revoke_refuses_capabilities(model, entry):
+    """Capabilities are not part of identity; taking them would suggest a partial revoke."""
+    with pytest.raises(ValidationError):
+        model(**entry, metadata=METADATA)
+
+
+@pytest.mark.parametrize("missing", ["name", "namespace", "cluster", "path"])
+def test_a_k8s_revoke_needs_its_whole_identity(missing):
+    """The same account in two namespaces or two clusters is two principals."""
+    values = {key: value for key, value in _identity(K8S).items() if key != missing}
+
+    with pytest.raises(ValidationError):
+        K8sAccessRevoke(**values, metadata=METADATA)
+
+
+def test_an_oidc_revoke_refuses_a_k8s_field():
+    """A mixed identity would resolve to *some* entry; refusing it is the safe answer."""
+    with pytest.raises(ValidationError):
+        OidcAccessRevoke(**_identity(OIDC), namespace="cloudops", metadata=METADATA)
+
+
+def test_a_revoke_dn_is_stripped_like_a_grant_dn():
+    """Shared validator: a DN sent with a stray space names the grant it was added as."""
+    revoke = OidcAccessRevoke(**{**_identity(OIDC), "dn": f"  {DN} "}, metadata=METADATA)
+
+    assert revoke.dn == DN
+
+
+def test_a_revoke_path_obeys_the_grant_path_rules():
+    """`path` and its validator come from the same base as the entries'."""
+    with pytest.raises(ValidationError):
+        OidcAccessRevoke(**{**_identity(OIDC), "path": "a/../b"}, metadata=METADATA)
+
+
+def test_a_delete_body_is_the_metadata_alone():
+    assert set(DeleteRequest.model_fields) == {"metadata"}
+
+    with pytest.raises(ValidationError):
+        DeleteRequest(metadata=METADATA, kv_name="my-passwords")

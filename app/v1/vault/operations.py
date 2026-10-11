@@ -72,7 +72,9 @@ from ...helpers import (
 from .conf import config
 from .schemas import (
     BuildInfo,
+    DeleteRequest,
     K8sAccessEntry,
+    K8sAccessRevoke,
     OperationStatus,
     PullRequestInfo,
     RequestMetadata,
@@ -169,6 +171,22 @@ def to_document_entry(entry: Any) -> Dict[str, Any]:
             entry.path, entry.name, entry.namespace, entry.cluster, capabilities
         )
     return build_oidc_access_entry(entry.path, entry.dn, capabilities)
+
+
+def to_revoked_entry(revoke: Any) -> Dict[str, Any]:
+    """A validated revoke body as the identity of the entry it removes.
+
+    The second bridge, beside `to_document_entry`: same builders, same named-fields-only
+    reading, so `metadata` cannot reach the document from here either. Which fields an
+    `auth_type` needs is not checked here — the revoke models are a discriminated union and
+    forbid extras, so a partial or mixed identity is a 422 before this runs. Capabilities
+    play no part in identity; `[]` keeps the builder's shape.
+    """
+    if isinstance(revoke, K8sAccessRevoke):
+        return build_k8s_access_entry(
+            revoke.path, revoke.name, revoke.namespace, revoke.cluster, []
+        )
+    return build_oidc_access_entry(revoke.path, revoke.dn, [])
 
 
 def _entry_text(entry: Dict[str, Any]) -> str:
@@ -625,7 +643,8 @@ def _describe(
     directory: str,
     entries: List[Dict[str, Any]],
     change: str,
-    metadata: Optional[RequestMetadata] = None,
+    *,
+    metadata: RequestMetadata,
 ) -> str:
     """The pull-request body a reviewer reads.
 
@@ -635,16 +654,14 @@ def _describe(
     trailing open-ended list — and is rendered in declaration order, never sorted, so
     two pull requests read the same way.
 
-    With `metadata=None` the output is byte-identical to what the routes carrying no
-    body produce today, which is what leaves their descriptions untouched.
+    **Required**, because every route that opens a pull request requires the block: an
+    operation that forgot to pass it is a `TypeError` here rather than an unaudited PR.
     """
     grants = "\n".join(f"  - {_entry_text(entry)}" for entry in entries)
-    block = ""
-    if metadata is not None:
-        lines = "\n".join(
-            f"  - {name}: {value}" for name, value in metadata.model_dump().items()
-        )
-        block = f"- metadata:\n{lines}\n"
+    lines = "\n".join(
+        f"  - {name}: {value}" for name, value in metadata.model_dump().items()
+    )
+    block = f"- metadata:\n{lines}\n"
     return (
         f"Automated by vault-api.\n\n"
         f"- location: {directory}\n"
@@ -965,10 +982,11 @@ async def add_access_entry_operation(
 async def remove_access_entry_operation(
     bitbucket: Any,
     kv_name: str,
-    entry: Dict[str, Any],
+    payload: Any,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
     """Open a validated pull request that revokes one grant."""
+    entry = to_revoked_entry(payload)
     store, change, _ = await _prepare_access_change(bitbucket, kv_name, entry, removing=True)
 
     pull_request, validation = await _open_and_validate(
@@ -976,7 +994,9 @@ async def remove_access_entry_operation(
         change=change,
         branch=_branch_for(store.team, kv_name, branch_suffix),
         summary=f"Revoke {_entry_text(entry)} on {kv_name}",
-        description=_describe(kv_name, store.directory, [entry], "grant removed"),
+        description=_describe(
+            kv_name, store.directory, [entry], "grant removed", metadata=payload.metadata
+        ),
         kv_name=kv_name,
     )
 
@@ -1013,6 +1033,7 @@ async def _prepare_delete(bitbucket: Any, kv_name: str) -> ResolvedStore:
 async def delete_kv_store_operation(
     bitbucket: Any,
     kv_name: str,
+    payload: DeleteRequest,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
     """Open a validated pull request that deletes the store's directory.
@@ -1029,7 +1050,9 @@ async def delete_kv_store_operation(
         change=Change(writes=[], removes=[store.directory]),
         branch=_branch_for(store.team, kv_name, branch_suffix),
         summary=f"Delete KV store {kv_name} from {store.team}",
-        description=_describe(kv_name, store.directory, store.access, "store deleted"),
+        description=_describe(
+            kv_name, store.directory, store.access, "store deleted", metadata=payload.metadata
+        ),
         kv_name=kv_name,
     )
 
@@ -1153,6 +1176,7 @@ async def upsert_tashtiot_access_operation(
 async def delete_tashtiot_access_operation(
     bitbucket: Any,
     team: str,
+    payload: DeleteRequest,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
     """Open a validated pull request that removes one team's Tashtiot file."""
@@ -1164,7 +1188,11 @@ async def delete_tashtiot_access_operation(
         branch=_branch_for(config.TASHTIOT_DIR.lower(), team, branch_suffix),
         summary=f"Delete {config.TASHTIOT_DIR} access for {team}",
         description=_describe(
-            team, path, read_access_entries(document), f"{config.TASHTIOT_DIR} access deleted"
+            team,
+            path,
+            read_access_entries(document),
+            f"{config.TASHTIOT_DIR} access deleted",
+            metadata=payload.metadata,
         ),
         kv_name=team,
     )
@@ -1288,10 +1316,11 @@ async def add_tashtiot_access_entry_operation(
 async def remove_tashtiot_access_entry_operation(
     bitbucket: Any,
     team: str,
-    entry: Dict[str, Any],
+    payload: Any,
     branch_suffix: Optional[str] = None,
 ) -> VaultOperationResponse:
     """Open a validated pull request revoking one grant from a team's Tashtiot file."""
+    entry = to_revoked_entry(payload)
     path, change = await _prepare_tashtiot_access_change(
         bitbucket, team, entry, removing=True
     )
@@ -1302,7 +1331,11 @@ async def remove_tashtiot_access_entry_operation(
         branch=_branch_for(config.TASHTIOT_DIR.lower(), team, branch_suffix),
         summary=f"Revoke {_entry_text(entry)} from {team} in {config.TASHTIOT_DIR}",
         description=_describe(
-            team, path, [entry], f"{config.TASHTIOT_DIR} grant removed"
+            team,
+            path,
+            [entry],
+            f"{config.TASHTIOT_DIR} grant removed",
+            metadata=payload.metadata,
         ),
         kv_name=team,
     )
