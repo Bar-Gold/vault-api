@@ -341,7 +341,8 @@ There is no FastAPI `Depends` for connectors — the factory closure is the inje
 
 - **`app/global_conf.py`** (`global_config`) — cross-cutting: `BITBUCKET_*`,
   `HTTP_TIMEOUT_SECONDS`, `VERIFY_SSL`. No CI-server settings: the gates read Bitbucket.
-- **`app/v1/vault/conf.py`** (`config`) — the module's own: `API_PREFIX`, `API_TAGS`, the values
+- **`app/v1/vault/conf.py`** (`config`) — the module's own: `API_PREFIX`, the docs sections
+  (`API_TAGS`, `API_TASHTIOT_TAGS`, and `API_TAG_GROUP`, the heading drawn over both), the values
   repo layout, PR shaping and the `CI_*` timeouts.
 
 `AUTH_*` / `AUTH_SSO_*` are **not** declared in either — the library reads those from the

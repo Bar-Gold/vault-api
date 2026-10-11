@@ -14,7 +14,7 @@ class VaultApiStaticSettings(BaseSettings):
 
     API_TITLE: str = Field(
         description="API title for the swagger",
-        default="Vault API",
+        default="CloudOps API",
     )
 
     APP_VERSION: str = Field(

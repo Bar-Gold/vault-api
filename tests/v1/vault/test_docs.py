@@ -395,6 +395,25 @@ def test_no_route_appears_in_both_sections(client):
             assert len(operation["tags"]) == 1, f"{method.upper()} {path}"
 
 
+def test_the_two_sections_are_ordered_first(client):
+    """Declared as top-level tags, so Swagger renders them ahead of the library's own
+    `default` section and the grouped heading sits at the top of the page."""
+    tags = [tag["name"] for tag in client.get("/openapi.json").json()["tags"]]
+
+    assert tags == config.API_TAGS + config.API_TASHTIOT_TAGS
+
+
+def test_the_docs_draw_one_heading_over_both_sections(client):
+    """Swagger UI has no nested tags, so the heading is drawn by an inline stylesheet that
+    finds each section by its `data-tag`. A renamed tag the CSS no longer names would
+    silently fall out of the group, so both names are checked against the config."""
+    body = client.get(DOCS).text
+
+    assert f'content: "{config.API_TAG_GROUP}"' in body
+    for tag in config.API_TAGS + config.API_TASHTIOT_TAGS:
+        assert f'h3.opblock-tag[data-tag="{tag}"]' in body
+
+
 def test_the_store_routes_keep_the_original_section(client):
     paths = client.get("/openapi.json").json()["paths"]
 
