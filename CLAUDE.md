@@ -91,7 +91,7 @@ uv-managed (Python 3.12). Package indexes come from `uv.toml` (internal Artifact
 ```bash
 uv sync --group dev                 # install deps into .venv — ON-PREM ONLY, see below
 uv run --no-sync python -m app.main # serves on 0.0.0.0:5000 (--host/--port override)
-uv run --no-sync pytest             # everything under tests/ (499 tests, ~30s)
+uv run --no-sync pytest             # everything under tests/ (501 tests, ~30s)
 uv run --no-sync pytest tests/v1/vault                                            # one suite
 uv run --no-sync pytest tests/v1/vault/test_operations.py::test_create_call_order # one test
 docker build -t vault-api . && docker run -p 5000:5000 --env-file .env vault-api
@@ -156,7 +156,7 @@ There are **no `__init__.py` files anywhere** — implicit namespace packages, w
 | `app/v1/vault/schemas.py` | 923 | request models (grants, revokes, deletes), every validation pattern |
 | `app/helpers.py` | 431 | pure: paths, entries, transforms, YAML rendering |
 | `app/clients/git.py` | 208 | the one non-REST operation (deleting a path) |
-| `app/main.py` | 112 | `create_app()` — the single wiring point |
+| `app/main.py` | 163 | `create_app()` — the single wiring point; the `/docs` override |
 | `app/v1/vault/conf.py` / `app/global_conf.py` | 121 / 53 | the two settings layers |
 | `app/clients/http.py` | 71 | the single funnel raising `ExternalServiceError` |
 
@@ -250,6 +250,18 @@ Four routes that no longer exist, so you do not re-add them:
 **concatenates** a router's tags with a route's, so a router default would put every Tashtiot
 route in both documentation sections. `test_no_route_appears_in_both_sections` pins that no
 operation has more than one tag. Docs grouping only — registration order is untouched.
+
+**The two sections render as sub-headings of one `API_TAG_GROUP` heading ("Vault"), and
+that heading is CSS, not spec.** Swagger UI has no nested tags and ignores Redoc's
+`x-tagGroups`, so `_tag_group_css` in `main.py` injects an inline stylesheet into `/docs`
+that draws the heading with `::before` and indents each section it finds by
+`h3.opblock-tag[data-tag=…]` via `:has()`. Two consequences. First, a section whose tag the
+CSS does not name falls out of the group silently, which is why the CSS is generated from
+the same `API_TAGS` / `API_TASHTIOT_TAGS` config (and
+`test_the_docs_draw_one_heading_over_both_sections` checks both). Second, the grouping is
+pure decoration: a browser without `:has()` shows the sections ungrouped. The sections render
+*first*, ahead of the library's own `default` (its root route), because `create_app` passes
+them as `openapi_tags`, and Swagger orders declared tags before undeclared ones.
 
 ### The request mirrors the document
 
@@ -654,7 +666,7 @@ open pull requests too.
 
 ## Tests
 
-499 of them. `tests/test_helpers.py` (pure, no library import — the document model and the
+501 of them. `tests/test_helpers.py` (pure, no library import — the document model and the
 exact committed bytes), `tests/clients/` (the Bitbucket client and `http.py`'s error mapping
 against the real REST shapes via respx, plus `test_git.py` running **real git against a real
 bare repo** in a temp dir), `tests/v1/vault/` (schemas, the chain + rollbacks with duck-typed

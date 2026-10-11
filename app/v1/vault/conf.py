@@ -22,7 +22,7 @@ class VaultV1StaticSettings(BaseSettings):
 
     API_TAGS: List[str] = Field(
         description="Tags used for OpenAPI documentation grouping",
-        default_factory=lambda: ["v1 - Vault KV Operations"],
+        default_factory=lambda: ["Operations"],
     )
 
     # The Tashtiot file is a different resource — per-team, one flat file, no directory —
@@ -32,7 +32,14 @@ class VaultV1StaticSettings(BaseSettings):
     # route in both sections.
     API_TASHTIOT_TAGS: List[str] = Field(
         description="Tags grouping the Tashtiot per-team routes in the OpenAPI docs",
-        default_factory=lambda: ["v1 - Tashtiot Shared-Services Access"],
+        default_factory=lambda: ["Tashtiot Services"],
+    )
+
+    # The two sections above are sub-headings of this one on the docs page. Swagger UI has
+    # no nested tags, so the heading is drawn by the stylesheet `app/main.py` injects.
+    API_TAG_GROUP: str = Field(
+        description="Heading the docs page draws over both route sections",
+        default="Vault",
     )
 
     # --- The GitOps repo holding the Vault values files ---

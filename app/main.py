@@ -1,8 +1,11 @@
 import argparse
+import json
+from typing import List
 
 import uvicorn
 from fastapi import FastAPI
 from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import HTMLResponse
 from tashtiot_apis_library import general_create_app
 from tashtiot_apis_library.fastapi_template._internal.utils import settings as library_settings
 from tashtiot_apis_library.fastapi_template.utils import BaseAPI
@@ -14,6 +17,37 @@ from .v1.vault.conf import config as vault_config
 from .v1.vault.routes import get_v1_vault_router
 
 DOCS_PATH = "/docs"
+
+# How far the grouped sections sit in from the heading drawn over them.
+_GROUP_INDENT = "24px"
+
+
+def _tag_group_css(heading: str, tags: List[str]) -> str:
+    """One heading over several Swagger sections, which then read as its sub-headings.
+
+    Swagger UI has no nested tags (and ignores Redoc's `x-tagGroups`), so this is drawn
+    rather than declared: a `::before` on the first grouped section carries the heading,
+    and every grouped section is indented beneath it with a smaller title. Each section is
+    `.opblock-tag-section > h3.opblock-tag[data-tag=…]`, found with `:has()`.
+
+    Pure decoration: a browser without `:has()` simply shows the sections ungrouped, and
+    nothing about the spec or the routes depends on it. `json.dumps` quotes the names, which
+    is also a valid CSS string for the plain text a tag is.
+    """
+    sections = [
+        f".opblock-tag-section:has(> h3.opblock-tag[data-tag={json.dumps(tag)}])"
+        for tag in tags
+    ]
+    return (
+        f"{', '.join(sections)} {{ padding-left: {_GROUP_INDENT}; }}\n"
+        f"{', '.join(f'{s} > h3.opblock-tag' for s in sections)} {{ font-size: 20px; }}\n"
+        f"{sections[0]}::before {{\n"
+        f"  content: {json.dumps(heading)}; display: block;\n"
+        f"  margin: 32px 0 8px -{_GROUP_INDENT}; padding-bottom: 8px;\n"
+        f"  border-bottom: 1px solid rgba(59, 65, 81, .3);\n"
+        f"  font-family: sans-serif; font-size: 30px; font-weight: 700; color: #3b4151;\n"
+        f"}}\n"
+    )
 
 
 def _replace_docs_route(app: FastAPI) -> None:
@@ -35,11 +69,18 @@ def _replace_docs_route(app: FastAPI) -> None:
     in registration order and takes the first hit, so instead of reaching into the library's
     internals we register ours and move it to the front, where it wins outright. That holds
     however the library chooses to nest things.
+
+    Being our route, it also carries the stylesheet that groups the two route sections under
+    one heading — see `_tag_group_css`. Inline, so the page stays self-contained.
     """
+    group_css = _tag_group_css(
+        vault_config.API_TAG_GROUP,
+        vault_config.API_TAGS + vault_config.API_TASHTIOT_TAGS,
+    )
 
     @app.get(DOCS_PATH, include_in_schema=False)
     async def swagger_ui_without_validator():
-        return get_swagger_ui_html(
+        page = get_swagger_ui_html(
             title="Swagger UI",
             swagger_js_url=f"{library_settings.SWAGGER_STATIC_FILES}/swagger-ui-bundle.js",
             swagger_css_url=f"{library_settings.SWAGGER_STATIC_FILES}/swagger-ui.css",
@@ -47,6 +88,10 @@ def _replace_docs_route(app: FastAPI) -> None:
             openapi_url=library_settings.SWAGGER_OPENAPI_JSON_URL,
             swagger_ui_parameters={"validatorUrl": None},
         )
+        html = page.body.decode().replace(
+            "</head>", f"<style>\n{group_css}</style>\n</head>", 1
+        )
+        return HTMLResponse(html)
 
     app.router.routes.insert(0, app.router.routes.pop())
 
@@ -59,6 +104,12 @@ def create_app() -> FastAPI:
         enable_auth=True,
         title=global_config.API_TITLE,
         version=global_config.APP_VERSION,
+        # Declaring the two sections orders them first, ahead of the library's own
+        # `default` (its root route), so the grouped heading sits at the top of the page.
+        openapi_tags=[
+            {"name": tag}
+            for tag in vault_config.API_TAGS + vault_config.API_TASHTIOT_TAGS
+        ],
     )
 
     # Must run after general_create_app, which is what registers the route being replaced.
