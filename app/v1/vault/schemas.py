@@ -470,6 +470,39 @@ class K8sAccessEntryRequest(K8sAccessEntry):
     metadata: RequestMetadata = Field(..., description=_METADATA_FIELD_DESCRIPTION)
 
 
+# Swagger's editable box for the **Tashtiot** sub-resource, which wants a different starting
+# point from the store's. That file grants a team access *into* the shared services store,
+# so its paths are scoped in practice (`+/cloudops/*`, `services/+/tyk/*`) and a prefilled
+# `*` — every secret in the store — is the wrong shape to nudge a caller towards. `+` matches
+# a single path segment, so `+/team/*` reads "any service, that team's subtree, everything
+# under it", with `team` standing in for the team in the URL.
+#
+# These are **examples, not defaults**: `path` stays required on both routes, because a
+# grant silently landing on a path the caller never typed is exactly the mistake worth a
+# 422. The store's `/access` route keeps the models' own `"*"`, which is why this lives
+# beside the models rather than on them — one shared pair of models, two routes that want
+# different prefills.
+TASHTIOT_PATH_EXAMPLE = "+/team/*"
+
+TASHTIOT_OIDC_ENTRY_EXAMPLE = {
+    "path": TASHTIOT_PATH_EXAMPLE,
+    "auth_type": "oidc",
+    "dn": "CN=cloudops,OU=Groups,DC=corp,DC=example,DC=com",
+    "capabilities": ["read"],
+    "metadata": _METADATA_EXAMPLE,
+}
+
+TASHTIOT_K8S_ENTRY_EXAMPLE = {
+    "path": TASHTIOT_PATH_EXAMPLE,
+    "auth_type": "k8s",
+    "name": "cloudops-external-secrets",
+    "namespace": "cloudops",
+    "cluster": "dev",
+    "capabilities": ["read"],
+    "metadata": _METADATA_EXAMPLE,
+}
+
+
 # The union stays at the **top** of the body, which is the only place Swagger's branch
 # picker and the two model-level examples work — a wrapper object would push it under a key
 # and leave one example to describe two shapes.

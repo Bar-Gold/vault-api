@@ -232,6 +232,64 @@ def test_the_grant_body_schema_is_the_request_entry_pair(client, path):
     assert schema["discriminator"]["propertyName"] == "auth_type"
 
 
+def test_the_tashtiot_grant_box_is_prefilled_with_a_scoped_path(client):
+    """The Tashtiot sub-resource prefills `+/team/*`, not the models' own `*`.
+
+    That file grants a team access *into* the shared services store, so its paths are
+    scoped in practice and a prefilled `*` nudges towards the wrong shape.
+    """
+    spec = client.get("/openapi.json").json()
+    body = spec["paths"][f"{config.API_PREFIX}/tashtiot/{{team}}/access"]["post"]
+    examples = body["requestBody"]["content"]["application/json"]["examples"]
+
+    assert {name: value["value"]["path"] for name, value in examples.items()} == {
+        "oidc": "+/team/*",
+        "k8s": "+/team/*",
+    }
+    assert examples["oidc"]["value"]["auth_type"] == "oidc"
+    assert examples["k8s"]["value"]["auth_type"] == "k8s"
+
+
+def test_the_tashtiot_examples_are_actually_valid(client):
+    """Same rule the model-level examples follow: an example the schema would reject is
+    worse than none. `+/team/*` has to survive VAULT_PATH_PATTERN and `no_parent_segments`,
+    and each branch has to validate as its own kind."""
+    from app.v1.vault.schemas import K8sAccessEntryRequest, OidcAccessEntryRequest
+
+    body = client.get("/openapi.json").json()["paths"][
+        f"{config.API_PREFIX}/tashtiot/{{team}}/access"
+    ]["post"]
+    examples = body["requestBody"]["content"]["application/json"]["examples"]
+
+    assert OidcAccessEntryRequest(**examples["oidc"]["value"]).path == "+/team/*"
+    assert K8sAccessEntryRequest(**examples["k8s"]["value"]).path == "+/team/*"
+
+
+def test_the_store_grant_box_still_prefills_a_bare_star(client):
+    """Only the Tashtiot route was given its own examples. The store's `/access` keeps the
+    models' `*` — a store grant covers that store, so everything in it is the usual case."""
+    spec = client.get("/openapi.json").json()
+    body = spec["paths"][f"{config.API_PREFIX}/{{kv_name}}/access"]["post"]
+
+    assert "examples" not in body["requestBody"]["content"]["application/json"]
+    for name in ("OidcAccessEntryRequest", "K8sAccessEntryRequest"):
+        assert spec["components"]["schemas"][name]["example"]["path"] == "*"
+
+
+def test_the_tashtiot_examples_did_not_cost_the_branch_picker(client):
+    """`Body(openapi_examples=...)` on the payload would have replaced the discriminated
+    union's schema with a bare `anyOf`, losing the picker. `openapi_extra` deep-merges, so
+    the examples arrive and the schema does not move — pinned because the failure is
+    invisible in the rendered box until you go looking for the dropdown."""
+    spec = client.get("/openapi.json").json()
+    schema = spec["paths"][f"{config.API_PREFIX}/tashtiot/{{team}}/access"]["post"][
+        "requestBody"
+    ]["content"]["application/json"]["schema"]
+
+    assert "anyOf" not in schema
+    assert schema["discriminator"]["propertyName"] == "auth_type"
+
+
 @pytest.mark.parametrize("name", ["OidcAccessEntry", "K8sAccessEntry"])
 def test_the_list_element_examples_carry_no_metadata(client, name):
     """A list element that carries metadata is a 422, so its example must not show one."""
