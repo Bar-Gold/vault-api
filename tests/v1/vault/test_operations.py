@@ -18,6 +18,7 @@ from app.v1.vault.operations import (
     list_kv_stores_operation,
     remove_access_entry_operation,
     to_document_entry,
+    to_revoked_entry,
     update_kv_mount_operation,
 )
 from app.v1.vault.schemas import (
@@ -36,8 +37,11 @@ from tests.v1.vault.conftest import (
     OTHER_DN,
     STORE_DIR,
     TEAM,
+    delete_request,
     k8s_entry,
+    k8s_revoke,
     oidc_entry,
+    oidc_revoke,
     seed_store,
 )
 
@@ -591,7 +595,7 @@ async def test_removing_a_grant_drops_it(bitbucket):
     seed_store(bitbucket, oidc=[oidc_entry(), oidc_entry(dn=OTHER_DN)])
 
     await remove_access_entry_operation(
-        bitbucket, KV, oidc_entry(dn=OTHER_DN), branch_suffix="abc123"
+        bitbucket, KV, oidc_revoke(dn=OTHER_DN), branch_suffix="abc123"
     )
 
     assert [e["dn"] for e in _committed(bitbucket, OIDC_PATH)["access"]] == [DN]
@@ -600,7 +604,7 @@ async def test_removing_a_grant_drops_it(bitbucket):
 async def test_removing_the_last_grant_of_a_kind_removes_its_file(bitbucket):
     seed_store(bitbucket, oidc=[oidc_entry()], k8s=[k8s_entry()])
 
-    await remove_access_entry_operation(bitbucket, KV, k8s_entry(), branch_suffix="abc123")
+    await remove_access_entry_operation(bitbucket, KV, k8s_revoke(), branch_suffix="abc123")
 
     assert bitbucket.deleted == [K8S_PATH]
 
@@ -610,19 +614,18 @@ async def test_removing_a_grant_that_is_not_there_is_404(bitbucket):
 
     with pytest.raises(VaultOperationError) as error:
         await remove_access_entry_operation(
-            bitbucket, KV, oidc_entry(dn=OTHER_DN), branch_suffix="abc123"
+            bitbucket, KV, oidc_revoke(dn=OTHER_DN), branch_suffix="abc123"
         )
 
     assert error.value.status_code == 404
 
 
 async def test_capabilities_do_not_affect_which_grant_is_revoked(bitbucket):
-    """A caller revoking a grant need not know what it currently permits."""
+    """A caller revoking a grant need not know what it currently permits — a revoke
+    carries no capabilities at all."""
     seed_store(bitbucket, oidc=[oidc_entry(capabilities=["read", "write"])])
 
-    await remove_access_entry_operation(
-        bitbucket, KV, oidc_entry(capabilities=[]), branch_suffix="abc123"
-    )
+    await remove_access_entry_operation(bitbucket, KV, oidc_revoke(), branch_suffix="abc123")
 
     assert bitbucket.deleted == [OIDC_PATH]
 
@@ -634,7 +637,7 @@ async def test_delete_removes_the_whole_directory(bitbucket):
     """Both files go with it — a store is a directory, and git rm -r takes it whole."""
     seed_store(bitbucket, oidc=[oidc_entry()], k8s=[k8s_entry()])
 
-    result = await delete_kv_store_operation(bitbucket, KV, branch_suffix="abc123")
+    result = await delete_kv_store_operation(bitbucket, KV, delete_request(), branch_suffix="abc123")
 
     assert bitbucket.deleted == [STORE_DIR]
     assert bitbucket.committed == {}
@@ -645,7 +648,7 @@ async def test_delete_needs_no_optimistic_lock_token(bitbucket):
     """Git resolves the path from the branch it fetched; the token is Bitbucket's."""
     seed_store(bitbucket, oidc=[oidc_entry()])
 
-    await delete_kv_store_operation(bitbucket, KV, branch_suffix="abc123")
+    await delete_kv_store_operation(bitbucket, KV, delete_request(), branch_suffix="abc123")
 
     assert "get_last_commit" not in bitbucket.calls
 
@@ -654,14 +657,14 @@ async def test_delete_leaves_another_store_alone(bitbucket):
     seed_store(bitbucket, oidc=[oidc_entry()])
     seed_store(bitbucket, team="platform", kv_name="secrets", oidc=[oidc_entry()])
 
-    await delete_kv_store_operation(bitbucket, KV, branch_suffix="abc123")
+    await delete_kv_store_operation(bitbucket, KV, delete_request(), branch_suffix="abc123")
 
     assert bitbucket.deleted == [STORE_DIR]
 
 
 async def test_delete_of_an_unknown_store_is_404(bitbucket):
     with pytest.raises(VaultOperationError) as error:
-        await delete_kv_store_operation(bitbucket, "nope", branch_suffix="abc123")
+        await delete_kv_store_operation(bitbucket, "nope", delete_request(), branch_suffix="abc123")
 
     assert error.value.status_code == 404
     assert "create_branch" not in bitbucket.calls
@@ -670,12 +673,12 @@ async def test_delete_of_an_unknown_store_is_404(bitbucket):
 async def test_a_repeat_delete_is_404(bitbucket):
     """The state is idempotent; the status code says which call did the work."""
     seed_store(bitbucket, oidc=[oidc_entry()])
-    await delete_kv_store_operation(bitbucket, KV, branch_suffix="abc123")
+    await delete_kv_store_operation(bitbucket, KV, delete_request(), branch_suffix="abc123")
     # Simulate the merge landing the removal on the base branch.
     del bitbucket.existing_files[OIDC_PATH]
 
     with pytest.raises(VaultOperationError) as error:
-        await delete_kv_store_operation(bitbucket, KV, branch_suffix="def456")
+        await delete_kv_store_operation(bitbucket, KV, delete_request(), branch_suffix="def456")
 
     assert error.value.status_code == 404
 
@@ -705,22 +708,29 @@ def test_to_document_entry_drops_the_metadata():
     assert set(k8s) == {"path", "authType", "name", "namespace", "cluster", "capabilities"}
 
 
-async def test_a_delete_description_has_no_metadata_block(bitbucket):
-    """The routes that carry no body were left alone, byte for byte.
+def test_to_revoked_entry_drops_the_metadata():
+    """The second bridge reads named fields only, exactly like the first — and builds the
+    identity with no capabilities, since a revoke carries none."""
+    oidc = to_revoked_entry(oidc_revoke())
+    k8s = to_revoked_entry(k8s_revoke())
 
-    `_describe` defaults `metadata` to None, and with None its output is identical to what
-    it produced before the block existed.
-    """
+    assert oidc == oidc_entry(capabilities=())
+    assert k8s == k8s_entry(capabilities=())
+
+
+async def test_a_revoke_and_a_delete_description_carry_the_metadata_block(bitbucket):
+    """Every route but the reads takes the block, the `DELETE`s included, so the pull
+    requests they open are audited like every other."""
     seed_store(bitbucket, oidc=[oidc_entry(), oidc_entry(dn=OTHER_DN)])
 
     await remove_access_entry_operation(
-        bitbucket, KV, oidc_entry(dn=OTHER_DN), branch_suffix="abc123"
+        bitbucket, KV, oidc_revoke(dn=OTHER_DN), branch_suffix="abc123"
     )
-    assert "- metadata:" not in bitbucket.descriptions[-1]
+    assert "  - island: island-a\n" in bitbucket.descriptions[-1]
 
     bitbucket.builds = [passing()]
-    await delete_kv_store_operation(bitbucket, KV, branch_suffix="abc123")
-    assert "- metadata:" not in bitbucket.descriptions[-1]
+    await delete_kv_store_operation(bitbucket, KV, delete_request(), branch_suffix="abc123")
+    assert "  - island: island-a\n" in bitbucket.descriptions[-1]
 
 
 async def test_a_create_description_carries_the_metadata_block(bitbucket, payload):

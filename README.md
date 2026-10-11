@@ -164,11 +164,14 @@ an older revision, like `file` or `roles`) is a `422`, not a silent drop.
 
 **`metadata` is the exception that proves the rule: it is the one field that never reaches a
 file.** Six required non-blank strings — `project`, `network`, `region`, `space`,
-`environment`, `island` — required on the five routes that carry a body (this create, both
-list-replacing writes, and the two one-grant adds). They are free-form on purpose: the
-vocabulary belongs to the deploying team, not this service. The committed document keeps its
-single `access` key; the coordinates go to the **pull-request description**, where a reviewer
-sees them, and to the service log. The `DELETE` and `GET` routes take none.
+`environment`, `island` — required on **every route except the three `GET`s**: this create,
+both list-replacing writes, the two one-grant adds, the two revokes and the two deletes. They
+are free-form on purpose: the vocabulary belongs to the deploying team, not this service. The
+committed document keeps its single `access` key; the coordinates go to the **pull-request
+description**, where a reviewer sees them, and to the service log.
+
+**No route takes query parameters.** Every route except the `GET`s takes a JSON body, the
+`DELETE`s included.
 
 `team` and `kv_name` are the only values that reach a filesystem path, and their pattern
 blocks `..` and slashes, so a request can never escape the values directory. `path` is a
@@ -259,8 +262,10 @@ something returns `201`.
 | `GET /{kv_name}` | one store, found by name alone — whichever team owns it |
 | `PATCH /{kv_name}` | replaces the grant list wholesale; takes `metadata` |
 | `POST /{kv_name}/access` | append one grant; the `auth_type` picks the file; takes `metadata` |
-| `DELETE /{kv_name}/access?auth_type=…&path=…` | revoke one grant |
-| `GET`/`DELETE /tashtiot/{team}` | read or remove one team's shared-services file |
+| `DELETE /{kv_name}/access` | revoke one grant; the body is its identity plus `metadata` |
+| `GET /tashtiot/{team}` | read one team's shared-services file |
+| `DELETE /tashtiot/{team}` | remove one team's shared-services file; body is `{metadata}` |
+| `POST`/`DELETE /tashtiot/{team}/access` | add or revoke one grant in the team's flat file; takes `metadata` |
 
 **There is no `/pull-request` variant of anything.** Routes that opened a pull request
 without waiting for CI were removed: without the wait a caller could not know the change
@@ -270,10 +275,23 @@ was green, which is the one guarantee left once the service stopped merging.
 enforces it — so a caller never has to remember who owns theirs. `team` appears on the create
 and nowhere else.
 
-**Revoking takes query parameters, not a body**, since DELETE bodies are widely dropped by
-proxies. oidc needs `path` and `dn`; k8s needs `path`, `name`, `namespace` and `cluster`. A
-mismatched set is a `422`, not a wrong-grant revoke — a partial identity would otherwise
-resolve to *some* entry.
+**A revoke's body is the grant's identity**: oidc needs `path` and `dn`; k8s needs `path`,
+`name`, `namespace` and `cluster`; both need `metadata`. A missing or mismatched field is a
+`422` naming that field, not a wrong-grant revoke, because a partial identity would otherwise
+resolve to *some* entry. `capabilities` is refused too.
+
+```jsonc
+// DELETE /api/vault/v1/kv/my-passwords/access
+{
+  "path": "*", "auth_type": "oidc", "dn": "CN=cloudops,...",
+  "metadata": {"project": "cloudops", "network": "internal", "region": "il-central",
+               "space": "shared", "environment": "production", "island": "island-a"}
+}
+```
+
+Some proxies and HTTP clients drop the body of a `DELETE`; when that happens, the symptom is a
+`422` saying the body is missing. With Python's `httpx`, use
+`client.request("DELETE", url, json=…)`, since `.delete()` cannot send a body.
 
 **Capabilities are not part of a grant's identity.** Granting `read` and later `read`+`write`
 to the same principal on the same path is an edit of one entry, so a duplicate is a `409` and
@@ -283,6 +301,8 @@ a revoke does not need to know what the grant currently permits.
 
 ```jsonc
 // DELETE /api/vault/v1/kv/my-passwords
+{"metadata": {"project": "cloudops", "network": "internal", "region": "il-central",
+              "space": "shared", "environment": "production", "island": "island-a"}}
 // -> 201 {"status":"Succeeded","message":"Opened pull request 43 to delete my-passwords. ..."}
 //        the store is still there: the pull request that removes it is open for review.
 ```

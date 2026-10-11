@@ -39,6 +39,25 @@ BODY = {
     "metadata": METADATA,
 }
 
+# The body of a store or Tashtiot delete: the metadata block and nothing else.
+DELETE_BODY = {"metadata": METADATA}
+
+
+def _delete(client, url, body, headers):
+    """A DELETE carrying a JSON body — httpx's `.delete()` cannot send one."""
+    return client.request("DELETE", url, json=body, headers=headers)
+
+
+def _revoke(**identity):
+    """A revoke body: the grant's identity plus the metadata block every non-GET needs."""
+    return {**identity, "metadata": METADATA}
+
+
+def _invalid_fields(response):
+    """The field names a 422 complains about, so a test can say *why* it was refused —
+    a revoke missing its whole body is also a 422, and must not pass for the wrong one."""
+    return {error["loc"][-1] for error in response.json()["detail"]}
+
 
 # --------------------------------------------------------------------------- #
 # auth
@@ -265,8 +284,8 @@ def test_adding_a_duplicate_grant_returns_409(client, auth_headers, bitbucket):
 def test_revoking_a_grant_returns_201(client, auth_headers, bitbucket):
     seed_store(bitbucket, oidc=[oidc_entry(), oidc_entry(dn=OTHER_DN)])
 
-    response = client.delete(
-        f"{ACCESS_URL}?auth_type=oidc&path=*&dn={OTHER_DN}", headers=auth_headers
+    response = _delete(
+        client, ACCESS_URL, _revoke(path="*", auth_type="oidc", dn=OTHER_DN), auth_headers
     )
 
     assert response.status_code == 201
@@ -276,10 +295,12 @@ def test_revoking_a_grant_returns_201(client, auth_headers, bitbucket):
 def test_revoking_a_k8s_grant_takes_all_three_scalars(client, auth_headers, bitbucket):
     seed_store(bitbucket, oidc=[oidc_entry()], k8s=[k8s_entry()])
 
-    response = client.delete(
-        f"{ACCESS_URL}?auth_type=k8s&path=*&name=cloudops-external-secrets"
-        f"&namespace=cloudops&cluster=dev",
-        headers=auth_headers,
+    response = _delete(
+        client,
+        ACCESS_URL,
+        _revoke(path="*", auth_type="k8s", name="cloudops-external-secrets",
+                namespace="cloudops", cluster="dev"),
+        auth_headers,
     )
 
     assert response.status_code == 201
@@ -289,8 +310,8 @@ def test_revoking_a_k8s_grant_takes_all_three_scalars(client, auth_headers, bitb
 def test_revoking_a_grant_that_is_not_there_is_404(client, auth_headers, bitbucket):
     seed_store(bitbucket, oidc=[oidc_entry()])
 
-    response = client.delete(
-        f"{ACCESS_URL}?auth_type=oidc&path=*&dn={OTHER_DN}", headers=auth_headers
+    response = _delete(
+        client, ACCESS_URL, _revoke(path="*", auth_type="oidc", dn=OTHER_DN), auth_headers
     )
 
     assert response.status_code == 404
@@ -300,31 +321,76 @@ def test_a_k8s_revoke_missing_a_scalar_is_422(client, auth_headers, bitbucket):
     """A partial identity would resolve to *some* entry; revoking the wrong one is worse."""
     seed_store(bitbucket, oidc=[oidc_entry()], k8s=[k8s_entry()])
 
-    response = client.delete(
-        f"{ACCESS_URL}?auth_type=k8s&path=*&name=sa", headers=auth_headers
+    response = _delete(
+        client, ACCESS_URL, _revoke(path="*", auth_type="k8s", name="sa"), auth_headers
     )
 
     assert response.status_code == 422
-    assert "create_branch" not in bitbucket.calls
+    assert _invalid_fields(response) == {"namespace", "cluster"}
+    assert bitbucket.calls == []
 
 
 def test_an_oidc_revoke_without_a_dn_is_422(client, auth_headers, bitbucket):
     seed_store(bitbucket, oidc=[oidc_entry()])
 
-    response = client.delete(f"{ACCESS_URL}?auth_type=oidc&path=*", headers=auth_headers)
+    response = _delete(client, ACCESS_URL, _revoke(path="*", auth_type="oidc"), auth_headers)
 
     assert response.status_code == 422
+    assert _invalid_fields(response) == {"dn"}
 
 
 def test_mixing_the_two_identities_is_422(client, auth_headers, bitbucket):
     seed_store(bitbucket, oidc=[oidc_entry()])
 
-    response = client.delete(
-        f"{ACCESS_URL}?auth_type=oidc&path=*&dn={DN}&namespace=cloudops",
-        headers=auth_headers,
+    response = _delete(
+        client,
+        ACCESS_URL,
+        _revoke(path="*", auth_type="oidc", dn=DN, namespace="cloudops"),
+        auth_headers,
     )
 
     assert response.status_code == 422
+    assert _invalid_fields(response) == {"namespace"}
+
+
+def test_a_k8s_revoke_may_not_send_a_dn(client, auth_headers, bitbucket):
+    """The mixed identity from the other side: `extra: forbid` on the k8s branch."""
+    response = _delete(
+        client,
+        ACCESS_URL,
+        _revoke(path="*", auth_type="k8s", name="sa", namespace="ns", cluster="dev", dn=DN),
+        auth_headers,
+    )
+
+    assert response.status_code == 422
+    assert _invalid_fields(response) == {"dn"}
+
+
+def test_a_revoke_may_not_send_capabilities(client, auth_headers, bitbucket):
+    """Not part of a grant's identity — accepting them would suggest a partial revoke."""
+    response = _delete(
+        client,
+        ACCESS_URL,
+        _revoke(path="*", auth_type="oidc", dn=DN, capabilities=["write"]),
+        auth_headers,
+    )
+
+    assert response.status_code == 422
+    assert _invalid_fields(response) == {"capabilities"}
+    assert bitbucket.calls == []
+
+
+def test_a_revoke_by_query_parameters_is_refused(client, auth_headers, bitbucket):
+    """The old spelling. The identity is the body now, so the query string is ignored and
+    the missing body is a 422 — before a single upstream call."""
+    seed_store(bitbucket, oidc=[oidc_entry(), oidc_entry(dn=OTHER_DN)])
+
+    response = client.delete(
+        f"{ACCESS_URL}?auth_type=oidc&path=*&dn={OTHER_DN}", headers=auth_headers
+    )
+
+    assert response.status_code == 422
+    assert bitbucket.calls == []
 
 
 # --------------------------------------------------------------------------- #
@@ -333,14 +399,14 @@ def test_mixing_the_two_identities_is_422(client, auth_headers, bitbucket):
 def test_delete_returns_201_and_removes_the_directory(client, auth_headers, bitbucket):
     seed_store(bitbucket, oidc=[oidc_entry()], k8s=[k8s_entry()])
 
-    response = client.delete(STORE_URL, headers=auth_headers)
+    response = _delete(client, STORE_URL, DELETE_BODY, auth_headers)
 
     assert response.status_code == 201
     assert bitbucket.deleted == [STORE_DIR]
 
 
 def test_delete_of_an_unknown_store_is_404(client, auth_headers):
-    assert client.delete(STORE_URL, headers=auth_headers).status_code == 404
+    assert _delete(client, STORE_URL, DELETE_BODY, auth_headers).status_code == 404
 
 
 # --------------------------------------------------------------------------- #
@@ -460,14 +526,14 @@ def test_reading_a_missing_tashtiot_file_is_404(client, auth_headers):
 def test_deleting_tashtiot_removes_the_file(client, auth_headers, bitbucket):
     bitbucket.existing_files[TASHTIOT_PATH] = "access: []\n"
 
-    response = client.delete(TASHTIOT_URL, headers=auth_headers)
+    response = _delete(client, TASHTIOT_URL, DELETE_BODY, auth_headers)
 
     assert response.status_code == 201
     assert bitbucket.deleted == [TASHTIOT_PATH]
 
 
 def test_deleting_a_missing_tashtiot_file_is_404(client, auth_headers):
-    assert client.delete(TASHTIOT_URL, headers=auth_headers).status_code == 404
+    assert _delete(client, TASHTIOT_URL, DELETE_BODY, auth_headers).status_code == 404
 
 
 # --------------------------------------------------------------------------- #
@@ -552,9 +618,11 @@ def test_revoking_a_tashtiot_grant_leaves_the_others(client, auth_headers, bitbu
         [oidc_entry(path="+/cloudops/*"), oidc_entry(path="+/cloudops/*", dn=OTHER_DN)],
     )
 
-    response = client.delete(
-        f"{TASHTIOT_ACCESS_URL}?auth_type=oidc&path=%2B/cloudops/*&dn={OTHER_DN}",
-        headers=auth_headers,
+    response = _delete(
+        client,
+        TASHTIOT_ACCESS_URL,
+        _revoke(path="+/cloudops/*", auth_type="oidc", dn=OTHER_DN),
+        auth_headers,
     )
 
     assert response.status_code == 201
@@ -567,9 +635,11 @@ def test_revoking_the_last_tashtiot_grant_removes_the_file(client, auth_headers,
     write — the same rule the store's access files follow."""
     _seed_tashtiot(bitbucket, [oidc_entry(path="+/cloudops/*")])
 
-    response = client.delete(
-        f"{TASHTIOT_ACCESS_URL}?auth_type=oidc&path=%2B/cloudops/*&dn={DN}",
-        headers=auth_headers,
+    response = _delete(
+        client,
+        TASHTIOT_ACCESS_URL,
+        _revoke(path="+/cloudops/*", auth_type="oidc", dn=DN),
+        auth_headers,
     )
 
     assert response.status_code == 201
@@ -580,23 +650,29 @@ def test_revoking_the_last_tashtiot_grant_removes_the_file(client, auth_headers,
 def test_revoking_a_tashtiot_grant_that_is_not_there_is_404(client, auth_headers, bitbucket):
     _seed_tashtiot(bitbucket, [oidc_entry(path="+/cloudops/*")])
 
-    response = client.delete(
-        f"{TASHTIOT_ACCESS_URL}?auth_type=oidc&path=%2B/cloudops/*&dn={OTHER_DN}",
-        headers=auth_headers,
+    response = _delete(
+        client,
+        TASHTIOT_ACCESS_URL,
+        _revoke(path="+/cloudops/*", auth_type="oidc", dn=OTHER_DN),
+        auth_headers,
     )
 
     assert response.status_code == 404
 
 
 def test_a_mismatched_tashtiot_revoke_identity_is_422(client, auth_headers, bitbucket):
-    """`_revoked_entry` is shared with the store route, so the rule cannot drift apart."""
+    """One revoke body serves both routes, so the rule cannot drift apart."""
     _seed_tashtiot(bitbucket, [oidc_entry(path="+/cloudops/*")])
 
-    response = client.delete(
-        f"{TASHTIOT_ACCESS_URL}?auth_type=k8s&path=*&name=argocd", headers=auth_headers
+    response = _delete(
+        client,
+        TASHTIOT_ACCESS_URL,
+        _revoke(path="*", auth_type="k8s", name="argocd"),
+        auth_headers,
     )
 
     assert response.status_code == 422
+    assert _invalid_fields(response) == {"namespace", "cluster"}
     assert bitbucket.calls == []
 
 
@@ -834,8 +910,8 @@ def _write_via_grant(client, auth_headers, bitbucket):
 
 def _write_via_revoke(client, auth_headers, bitbucket):
     seed_store(bitbucket, oidc=[oidc_entry(), oidc_entry(dn=OTHER_DN)])
-    client.delete(
-        f"{ACCESS_URL}?auth_type=oidc&path=*&dn={OTHER_DN}", headers=auth_headers
+    _delete(
+        client, ACCESS_URL, _revoke(path="*", auth_type="oidc", dn=OTHER_DN), auth_headers
     )
 
 
@@ -880,8 +956,8 @@ def test_every_writing_route_quotes_the_dn(
 # --------------------------------------------------------------------------- #
 # metadata
 #
-# Required on every body-carrying route, recorded in the pull-request description, and
-# never written to a file. The last of those is the whole point of the block.
+# Required on every route but the reads — the `DELETE`s included — recorded in the
+# pull-request description, and never written to a file. The last of those is the whole point of the block.
 # --------------------------------------------------------------------------- #
 METADATA_NAMES = ("project", "network", "region", "space", "environment", "island")
 
@@ -893,7 +969,11 @@ TASHTIOT_GRANT = {
     "capabilities": ["read"],
 }
 
-# (id, method, url, body-without-metadata) for each of the five body-carrying routes.
+# The identity half of a revoke body, for each layout.
+OIDC_IDENTITY = {"path": "*", "auth_type": "oidc", "dn": OTHER_DN}
+TASHTIOT_IDENTITY = {"path": "services/+/redis/*", "auth_type": "oidc", "dn": OTHER_DN}
+
+# (id, method, url, body-without-metadata) for each of the nine routes that are not reads.
 BODY_ROUTES = [
     ("POST /", "post", CREATE_URL,
      {"team": TEAM, "kv_name": KV, "access": [dict(OIDC_GRANT)]}),
@@ -901,6 +981,10 @@ BODY_ROUTES = [
     ("POST /{kv_name}/access", "post", ACCESS_URL, dict(OIDC_GRANT)),
     ("PUT /tashtiot/{team}", "put", TASHTIOT_URL, {"access": [dict(TASHTIOT_GRANT)]}),
     ("POST /tashtiot/{team}/access", "post", TASHTIOT_ACCESS_URL, dict(TASHTIOT_GRANT)),
+    ("DELETE /{kv_name}", "delete", STORE_URL, {}),
+    ("DELETE /{kv_name}/access", "delete", ACCESS_URL, dict(OIDC_IDENTITY)),
+    ("DELETE /tashtiot/{team}", "delete", TASHTIOT_URL, {}),
+    ("DELETE /tashtiot/{team}/access", "delete", TASHTIOT_ACCESS_URL, dict(TASHTIOT_IDENTITY)),
 ]
 
 
@@ -912,8 +996,24 @@ BODY_ROUTES = [
 def test_every_body_route_is_422_without_metadata(
     client, auth_headers, bitbucket, method, url, body
 ):
-    """All five, one rule — and refused before a single upstream call is made."""
+    """All nine, one rule — and refused before a single upstream call is made."""
     response = client.request(method, url, json=body, headers=auth_headers)
+
+    assert response.status_code == 422
+    assert bitbucket.calls == []
+
+
+@pytest.mark.parametrize(
+    "url", [STORE_URL, ACCESS_URL, TASHTIOT_URL, TASHTIOT_ACCESS_URL],
+    ids=["DELETE /{kv_name}", "DELETE /{kv_name}/access",
+         "DELETE /tashtiot/{team}", "DELETE /tashtiot/{team}/access"],
+)
+def test_a_delete_without_a_body_is_422(client, auth_headers, bitbucket, url):
+    """No `DELETE` is body-less any more: even the two that name everything in the path
+    carry the metadata block."""
+    seed_store(bitbucket, oidc=[oidc_entry(), oidc_entry(dn=OTHER_DN)])
+
+    response = client.delete(url, headers=auth_headers)
 
     assert response.status_code == 422
     assert bitbucket.calls == []
@@ -970,37 +1070,71 @@ def _drive_tashtiot_grant(client, auth_headers, bitbucket):
     )
 
 
-# The create has to run first when they are driven in one sequence: it is the only route
-# that scans for a duplicate name, and seeding a store for the others would collide.
-BODY_DRIVERS = [
+def _drive_revoke(client, auth_headers, bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry(), oidc_entry(dn=OTHER_DN)])
+    return _delete(client, ACCESS_URL, _revoke(**OIDC_IDENTITY), auth_headers)
+
+
+def _drive_tashtiot_revoke(client, auth_headers, bitbucket):
+    _seed_tashtiot(
+        bitbucket,
+        [oidc_entry(path="+/cloudops/*"), oidc_entry(path="services/+/redis/*", dn=OTHER_DN)],
+    )
+    return _delete(client, TASHTIOT_ACCESS_URL, _revoke(**TASHTIOT_IDENTITY), auth_headers)
+
+
+def _drive_delete(client, auth_headers, bitbucket):
+    seed_store(bitbucket, oidc=[oidc_entry()])
+    return _delete(client, STORE_URL, DELETE_BODY, auth_headers)
+
+
+def _drive_tashtiot_delete(client, auth_headers, bitbucket):
+    _seed_tashtiot(bitbucket, [oidc_entry(path="+/cloudops/*")])
+    return _delete(client, TASHTIOT_URL, DELETE_BODY, auth_headers)
+
+
+# The routes that commit a file. The create has to run first when they are driven in one
+# sequence: it is the only route that scans for a duplicate name, and seeding a store for
+# the others would collide. Each revoke leaves a grant behind, so it rewrites its file
+# rather than removing it.
+COMMITTING_DRIVERS = [
     ("POST /", _drive_create),
     ("PATCH /{kv_name}", _drive_patch),
     ("POST /{kv_name}/access", _drive_grant),
+    ("DELETE /{kv_name}/access", _drive_revoke),
     ("PUT /tashtiot/{team}", _drive_tashtiot_upsert),
     ("POST /tashtiot/{team}/access", _drive_tashtiot_grant),
+    ("DELETE /tashtiot/{team}/access", _drive_tashtiot_revoke),
+]
+
+# Every route but the reads: the two whole-resource deletes commit nothing, but their pull
+# requests still carry the block.
+BODY_DRIVERS = COMMITTING_DRIVERS + [
+    ("DELETE /{kv_name}", _drive_delete),
+    ("DELETE /tashtiot/{team}", _drive_tashtiot_delete),
 ]
 
 
 def test_metadata_never_reaches_the_committed_yaml(client, auth_headers, bitbucket):
     """The load-bearing test of the whole change.
 
-    Every body-carrying route is driven with a full metadata block, and every file any of
-    them commits must still be the document the deploy pipeline expects: one top-level
-    `access` key, and entries carrying none of the six coordinate names.
+    Every route that commits a file is driven with a full metadata block, and every file
+    any of them commits must still be the document the deploy pipeline expects: one
+    top-level `access` key, and entries carrying none of the six coordinate names.
     """
-    # One gate per chain, five chains — the fake's build queue is popped once each.
-    bitbucket.builds = [passing() for _ in BODY_DRIVERS]
+    # One gate per chain — the fake's build queue is popped once each.
+    bitbucket.builds = [passing() for _ in COMMITTING_DRIVERS]
 
     # `committed` is keyed by path, so two routes writing the same file would hide one of
     # them. Snapshot after each drive instead, and check every route's own bytes.
     written = []
-    for name, drive in BODY_DRIVERS:
+    for name, drive in COMMITTING_DRIVERS:
         bitbucket.committed.clear()
         assert drive(client, auth_headers, bitbucket).status_code == 201, name
         assert bitbucket.committed, name
         written += [(name, path, text) for path, text in bitbucket.committed.items()]
 
-    assert len(written) >= len(BODY_DRIVERS)
+    assert len(written) >= len(COMMITTING_DRIVERS)
     for name, path, content in written:
         document = yaml.safe_load(content)
         assert set(document) == {"access"}, f"{name} -> {path}"

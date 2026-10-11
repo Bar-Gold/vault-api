@@ -91,7 +91,7 @@ uv-managed (Python 3.12). Package indexes come from `uv.toml` (internal Artifact
 ```bash
 uv sync --group dev                 # install deps into .venv — ON-PREM ONLY, see below
 uv run --no-sync python -m app.main # serves on 0.0.0.0:5000 (--host/--port override)
-uv run --no-sync pytest             # everything under tests/ (460 tests, ~40s)
+uv run --no-sync pytest             # everything under tests/ (499 tests, ~30s)
 uv run --no-sync pytest tests/v1/vault                                            # one suite
 uv run --no-sync pytest tests/v1/vault/test_operations.py::test_create_call_order # one test
 docker build -t vault-api . && docker run -p 5000:5000 --env-file .env vault-api
@@ -150,10 +150,10 @@ There are **no `__init__.py` files anywhere** — implicit namespace packages, w
 
 | File | Lines | What it owns |
 |---|---:|---|
-| `app/v1/vault/operations.py` | 1357 | the chain: every `*_operation`, both PR helpers, rollbacks |
+| `app/v1/vault/operations.py` | 1390 | the chain: every `*_operation`, both PR helpers, rollbacks |
 | `app/clients/bitbucket.py` | 635 | branch / file / PR REST, and the build-status gate |
-| `app/v1/vault/routes.py` | 627 | route decorators, `_execute`/`_read`, `_revoked_entry` |
-| `app/v1/vault/schemas.py` | 764 | request models, every validation pattern |
+| `app/v1/vault/routes.py` | 535 | route decorators, `_execute`/`_read` |
+| `app/v1/vault/schemas.py` | 923 | request models (grants, revokes, deletes), every validation pattern |
 | `app/helpers.py` | 431 | pure: paths, entries, transforms, YAML rendering |
 | `app/clients/git.py` | 208 | the one non-REST operation (deleting a path) |
 | `app/main.py` | 112 | `create_app()` — the single wiring point |
@@ -177,14 +177,14 @@ a cross-package import.
 | `GET /stores` | — | every store: `{team, kv_name, directory}`. Lists directories, reads no file |
 | `GET /{kv_name}` | — | one store: team, directory and every grant, both kinds, oidc first |
 | `PATCH /{kv_name}` | `{metadata, access}` | replaces the grant list wholesale; 201 (200 if unchanged) |
-| `DELETE /{kv_name}` | — | **removes the store's directory**, both files with it; 201 |
+| `DELETE /{kv_name}` | `{metadata}` | **removes the store's directory**, both files with it; 201 |
 | `POST /{kv_name}/access` | one entry + `metadata` | appends one grant to whichever file its `auth_type` selects; 201 |
-| `DELETE /{kv_name}/access` | `?auth_type=&path=&…` | revokes one grant; 201 |
+| `DELETE /{kv_name}/access` | one identity + `metadata` | revokes one grant; 201 |
 | `PUT /tashtiot/{team}` | `{metadata, access}` | create-or-replace a team's shared-services grants; 201 (200 if unchanged) |
 | `GET /tashtiot/{team}` | — | that team's file, parsed and returned as-is |
-| `DELETE /tashtiot/{team}` | — | removes the team's file; 201 |
+| `DELETE /tashtiot/{team}` | `{metadata}` | removes the team's file; 201 |
 | `POST /tashtiot/{team}/access` | one entry + `metadata` | appends one grant to the team's flat file; 201 |
-| `DELETE /tashtiot/{team}/access` | `?auth_type=&path=&…` | revokes one; removes the file if it was the last; 201 |
+| `DELETE /tashtiot/{team}/access` | one identity + `metadata` | revokes one; removes the file if it was the last; 201 |
 
 **A store is addressed by name alone.** A store name is unique across the whole values
 directory — the create enforces exactly that — so the name *is* the address, and a caller
@@ -212,12 +212,25 @@ in `routes.py`, and `KVNameReadParam` / `TeamReadParam` on the two `GET`s, which
 capitals as well (see the validation section). Starlette's convertor is `[^/]+` so nothing was exploitable without them, but a
 malformed name would surface as an opaque Bitbucket 404 two calls later instead of a 422.
 
-**The revoke identity travels as query parameters**, not a body: DELETE bodies are widely
-dropped by proxies and clients. Which parameters are required depends on `auth_type` — oidc
-needs `path`+`dn`, k8s needs `path`+`name`+`namespace`+`cluster` — and a mismatched set is a
-**422**, not a wrong-grant revoke. `_revoked_entry` is the single place that rule lives.
-Capabilities are not taken: not part of identity, and asking would suggest a partial revoke is
-possible.
+**No route takes query parameters; every route but the three `GET`s takes a required JSON
+body carrying `metadata` — the `DELETE`s included.** A revoke's identity is its body,
+`AccessRevokeRequest` (a discriminated union over `OidcAccessRevoke` / `K8sAccessRevoke`); a
+store or Tashtiot delete sends `DeleteRequest`, which is `{metadata}` alone.
+`test_no_mutating_route_takes_a_query_parameter` reads the rule off the OpenAPI document, so a
+new route is covered the moment it is registered.
+
+This **reverses a deliberate earlier choice**: revokes used query parameters because DELETE
+bodies are sometimes dropped by proxies and HTTP clients. That risk is now accepted. Its
+symptom is a 422 saying the body is missing, so if one appears, check what sits in front of
+the service before the code. Python's httpx `.delete()` cannot send a body at all; use
+`.request("DELETE", url, json=…)`, as the tests do.
+
+**Which fields an `auth_type` needs lives in the schema**, not in code: the discriminator, the
+required fields and `extra: "forbid"` make a partial or mixed identity (oidc needs
+`path`+`dn`, k8s needs `path`+`name`+`namespace`+`cluster`) a **422** that names the field,
+not a wrong-grant revoke. That 422 is FastAPI's standard `{"detail": […]}`, like every other
+body error. Capabilities are refused the same way: not part of identity, and accepting them
+would suggest a partial revoke is possible.
 
 Four routes that no longer exist, so you do not re-add them:
 
@@ -250,7 +263,7 @@ translated shape (the old `roles` mapping) could express neither.
 
 **`metadata` is the one field that never reaches a file.** Six required non-blank strings —
 `project`, `network`, `region`, `space`, `environment`, `island` — demanded by the deploying
-team on every request that carries a body. They are free-form on purpose, exactly like `dn`:
+team on every route but the reads. They are free-form on purpose, exactly like `dn`:
 the vocabulary is the deploying team's, so any closed set or pattern here would reject a
 value this service does not own. `RequestMetadata` in `schemas.py` is the only place they
 are described.
@@ -258,15 +271,19 @@ are described.
 It is **request-only**, and that is the whole point of it: the committed document keeps its
 single `access` key, and the six coordinates go to the **pull-request description** (via
 `_describe`, between `- change:` and `- grants:`) and the service log instead. Nothing else
-carries them — they are not echoed in `VaultOperationResponse`, and `to_document_entry`
-builds from named fields so there is no path by which one can reach an access file.
-`test_metadata_never_reaches_the_committed_yaml` drives all five routes and pins that;
-`tests/test_helpers.py` needing an edit is the signal that something leaked.
+carries them — they are not echoed in `VaultOperationResponse`, and `to_document_entry` /
+`to_revoked_entry` build from named fields so there is no path by which one can reach an
+access file. `test_metadata_never_reaches_the_committed_yaml` drives the seven routes that
+commit a file and pins that; `tests/test_helpers.py` needing an edit is the signal that
+something leaked.
 
-It is required on the **five body-carrying routes only** — the create, both list-replacing
-writes, and the two one-grant adds. The three `DELETE`s and four `GET`s take none: a revoke's
-identity still travels as query parameters and a read changes nothing, so there is no
-provenance to record.
+It is required on **all nine routes that are not reads**: the create, both list-replacing
+writes, the two one-grant adds, the two revokes and the two whole-resource deletes. A delete
+names everything it needs in its path, so its body is the metadata block and nothing else;
+that body exists so a deletion is audited in its pull request like any other change. The
+three `GET`s take none, since a read changes nothing. `_describe` takes `metadata` as a
+**required** keyword, so an operation that forgot to pass it fails with a `TypeError` instead
+of opening an unaudited PR.
 
 **Metadata alone is not a change.** `PATCH /{kv_name}` and `PUT /tashtiot/{team}` still
 short-circuit to 200 with a null `pull_request` when the grants already match, because
@@ -370,8 +387,9 @@ The format is the pipeline's, so each decision has exactly one home:
 
 **Nothing outside `helpers.py`/`schemas.py` knows a document key name** — `operations.py`
 reaches identity through `access_entry_identity` and kind through `auth_type_of` rather than
-indexing `entry["authType"]`. `to_document_entry` is the single bridge from a validated request
-model to a document dict. **Keep it that way.**
+indexing `entry["authType"]`. `to_document_entry` (a grant) and `to_revoked_entry` (a revoke's
+identity, with `[]` capabilities) are the only bridges from a validated request model to a
+document dict. Both call the `build_*_access_entry` builders. **Keep it that way.**
 
 ## Architecture
 
@@ -636,7 +654,7 @@ open pull requests too.
 
 ## Tests
 
-460 of them. `tests/test_helpers.py` (pure, no library import — the document model and the
+499 of them. `tests/test_helpers.py` (pure, no library import — the document model and the
 exact committed bytes), `tests/clients/` (the Bitbucket client and `http.py`'s error mapping
 against the real REST shapes via respx, plus `test_git.py` running **real git against a real
 bare repo** in a temp dir), `tests/v1/vault/` (schemas, the chain + rollbacks with duck-typed
@@ -686,7 +704,7 @@ Three conftest details to respect:
   mutating route declares 201; the only 200s are the no-op short circuits and the reads.
   `_execute` owns that downgrade, so no route has to know it. Then **409** duplicate store name
   or grant; **404** unknown store, grant or Tashtiot file; **502** build/transport failure;
-  **504** build or upstream timeout; **422** request, path- or query-parameter validation.
+  **504** build or upstream timeout; **422** request-body or path-parameter validation.
 - **`routes.py` has two funnels, not one.** `_execute` is for mutations; the `GET`s go through
   **`_read`**, which differs in both directions: an upstream **404 stays a 404** (a missing
   store is the caller's mistake, not a bad gateway), and its failure body is a bare
